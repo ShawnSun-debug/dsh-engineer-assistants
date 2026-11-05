@@ -83,9 +83,10 @@ function fakeCtx({
   stateOf,
   catalogNames = ['read', 'edit'],
   memoryEnabled = false,
+  panelEnabled = false,
   storageDomain,
 } = {}) {
-  const state = { enabled, memoryEnabled }
+  const state = { enabled, memoryEnabled, panelEnabled }
   const projections = []
   const tools = []
   const handlers = new Map()
@@ -104,10 +105,29 @@ function fakeCtx({
       catalog = next
     },
   }
+  // The provided services, keyed by service name. `provide` is what the real
+  // ctx exposes; the master panel endpoint is registered through it.
+  const services = new Map()
   const ctx = {
     sessionProjections: {
-      register: (projection) => projections.push(projection),
+      // A real registration is a thenable that resolves to a handle; the master
+      // panel endpoint awaits exactly that handle and calls stateOf on it.
+      register: (projection) => {
+        projections.push(projection)
+        const handle = { stateOf: (session) => stateOf?.(session) }
+        const ready = Promise.resolve(handle)
+        return Object.assign(() => {}, {
+          then: (onFulfilled, onRejected) => ready.then(onFulfilled, onRejected),
+          catch: (onRejected) => ready.catch(onRejected),
+          finally: (onFinally) => ready.finally(onFinally),
+          stateOf: handle.stateOf,
+        })
+      },
       stateOf,
+    },
+    provide(name, value) {
+      services.set(name, value)
+      return () => services.delete(name)
     },
     tools: {
       register(tool) {
@@ -126,7 +146,7 @@ function fakeCtx({
     },
     storageDomain,
     agents: agents ?? { get: () => undefined },
-    sessions: sessions ?? { get: () => undefined, flush: async () => true },
+    sessions: sessions ?? { get: () => undefined, list: () => [], flush: async () => true },
     effect(fn, label) {
       const dispose = fn()
       effects.push({ label, dispose })
@@ -156,6 +176,7 @@ function fakeCtx({
     superviseMaxNoticesPerChild: { get: () => 3 },
     superviseNotifyOnNoProgress: { get: () => false },
     masterMemoryEnabled: { get: () => state.memoryEnabled },
+    masterPanelEnabled: { get: () => state.panelEnabled },
     toolCatalog: catalogRef,
   }
   return {
@@ -171,6 +192,7 @@ function fakeCtx({
     effects,
     sections,
     storageDomain,
+    services,
     logs,
     emitted,
     catalogNames,
@@ -1055,6 +1077,32 @@ test('the master status projection is registered host-only and folds a worker ro
 
   const done = master.apply(working, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
   assert.deepEqual(done.workers[0], { id: 'w-1', role: 'worker', state: 'Completed', summary: '' })
+})
+
+test('the master panel endpoint is provided and folds live sessions behind its switch', async () => {
+  const session = { header: { id: 'w-2' } }
+  const harness = start({
+    panelEnabled: true,
+    sessions: { get: () => undefined, list: () => [session], flush: async () => true },
+    stateOf: (target) => ({
+      workers: [{ id: target.header.id, role: 'worker', state: 'Working', summary: 'panel' }],
+    }),
+  })
+  const service = harness.services.get('orchestratorMaster')
+  assert.ok(service, 'the read-only endpoint service is provided')
+  assert.equal(typeof service.masterState, 'function')
+
+  const on = await service.masterState()
+  assert.equal(on.enabled, true)
+  assert.equal(on.byState.Working, 1)
+  assert.deepEqual(on.workers, [{ id: 'w-2', role: 'worker', state: 'Working', summary: 'panel' }])
+
+  // The switch is read per call: no reload, and no worker data leave the host.
+  harness.state.panelEnabled = false
+  const off = await service.masterState()
+  assert.equal(off.enabled, false)
+  assert.equal(off.byState.Working, 0)
+  assert.deepEqual(off.workers, [])
 })
 
 test('a host without a usable storage domain degrades explicitly and injects nothing', async () => {

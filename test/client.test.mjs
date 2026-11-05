@@ -314,7 +314,7 @@ test('saveRoute surfaces a rejected write and a write that did not land', async 
   assert.equal(await T.saveRoute(dropped, T.MAIN.fields, { provider: 'p', model: 'm', effort: '' }, t), 'route.saveFailed')
 })
 
-test('apply puts the toggle in the left slot and the picker in input.right', () => {
+test('apply puts the toggle in the left slot, the picker and the master panel in input.right', () => {
   const regs = []
   const ctx = {
     effect: (fn) => fn(),
@@ -327,10 +327,16 @@ test('apply puts the toggle in the left slot and the picker in input.right', () 
   assert.deepEqual(regs.map((r) => [r.opts.name, r.opts.id, r.opts.order]), [
     ['conversation.input.left', 'orchestrator-plan-toggle', 20],
     ['conversation.input.right', 'orchestrator-route-picker', 11],
+    ['conversation.input.right', 'orchestrator-master-panel', 12],
   ])
   const props = regs[1].opts.inject('S1')
   assert.deepEqual([props.scopes.main.ns, props.scopes.worker.ns, props.scopes.orch.ns], ['agent-default-model', 'orchestrator', 'orchestrator'])
   assert.equal(props.setPlan, undefined)
+  // The master panel gets the same config scope plus one loader; it owns no writer.
+  const master = regs[2].opts.inject('S1')
+  assert.equal(master.orch.ns, 'orchestrator')
+  assert.equal(typeof master.loadState, 'function')
+  assert.equal(master.setPlan, undefined)
   assert.deepEqual(plain(mod.inject), ['slots', 'locale', 'remote', 'remote.commands', 'remote.session', 'configForms'])
 })
 
@@ -1109,5 +1115,111 @@ test('the panel shows a review route row and the last verdict', async () => {
   assert.match(text, /route\.lastReview/, 'the last verdict line must be rendered')
   assert.match(text, /BLOCK/, 'the verdict itself must be visible')
   assert.match(text, /verify/, 'the reviewed field must be visible')
+  view.unmount()
+})
+
+test('masterGroups keeps the six-state order, counts every group and filters rows by state', () => {
+  const { MASTER_STATES, masterGroups } = mod.__test
+  assert.deepEqual(plain(MASTER_STATES), ['Working', 'Needs input', 'Idle', 'Completed', 'Failed', 'Stopped'])
+  const groups = masterGroups({
+    byState: { Working: 2, Idle: 1 },
+    workers: [
+      { id: 'a', role: 'worker', state: 'Working', summary: 'one' },
+      { id: 'b', role: 'worker', state: 'Idle', summary: '' },
+      { id: 'c', role: 'worker', state: 'Working', summary: 'two' },
+    ],
+  })
+  assert.deepEqual(plain(groups.map((group) => [group.state, group.count, group.workers.map((worker) => worker.id)])), [
+    ['Working', 2, ['a', 'c']],
+    ['Needs input', 0, []],
+    ['Idle', 1, ['b']],
+    ['Completed', 0, []],
+    ['Failed', 0, []],
+    ['Stopped', 0, []],
+  ])
+  // A missing or malformed snapshot is the empty six-state shape, never a crash.
+  assert.equal(masterGroups(null).length, 6)
+  assert.equal(masterGroups({ byState: null, workers: null }).every((group) => group.count === 0), true)
+})
+
+test('the master panel renders nothing and makes no request while its switch is off', () => {
+  const { MasterPanel } = mod.__test
+  const scope = fakeScope({ initial: { masterPanelEnabled: false } })
+  let loads = 0
+  const view = mount(MasterPanel, {
+    t,
+    orch: scope,
+    loadState: () => {
+      loads += 1
+      return Promise.resolve({ enabled: true, byState: {}, workers: [] })
+    },
+  })
+  assert.equal(view.tree, null)
+  assert.equal(loads, 0)
+  view.unmount()
+})
+
+test('the master panel shows its empty state when the endpoint has no workers', async () => {
+  const { MasterPanel } = mod.__test
+  const scope = fakeScope({ initial: { masterPanelEnabled: true } })
+  const view = mount(MasterPanel, {
+    t,
+    orch: scope,
+    loadState: async () => ({ enabled: true, byState: { Working: 0 }, workers: [] }),
+  })
+  for (let i = 0; i < 5; i += 1) await Promise.resolve()
+  const trigger = nodes(view.tree).find((node) => node.type === 'button')
+  assert.ok(trigger, 'the panel renders its trigger once enabled')
+  trigger.props.onClick()
+  assert.ok(
+    nodes(view.tree).some((node) => node.props?.['data-testid'] === 'orchestrator-master-empty'),
+    'the empty state is a visible element, not an error',
+  )
+  assert.equal(nodes(view.tree).some((node) => node.props?.role === 'alert'), false)
+  view.unmount()
+})
+
+test('the master panel groups worker rows under their state with the projection summary', async () => {
+  const { MasterPanel } = mod.__test
+  const scope = fakeScope({ initial: { masterPanelEnabled: true } })
+  const view = mount(MasterPanel, {
+    t,
+    orch: scope,
+    loadState: async () => ({
+      enabled: true,
+      byState: { Working: 1, 'Needs input': 1 },
+      workers: [
+        { id: 'w-1234567890', role: 'worker', state: 'Working', summary: 'build the panel' },
+        { id: 'w2', role: 'worker', state: 'Needs input', summary: '' },
+      ],
+    }),
+  })
+  for (let i = 0; i < 5; i += 1) await Promise.resolve()
+  nodes(view.tree).find((node) => node.type === 'button').props.onClick()
+  const text = textOf(view.tree)
+  assert.match(text, /Working · 1/)
+  assert.match(text, /Needs input · 1/)
+  assert.match(text, /build the panel/)
+  assert.match(text, /w-123456/)
+  assert.match(text, /master\.summaryEmpty/)
+  view.unmount()
+})
+
+test('a failed master read shows an alert instead of crashing the toolbar', async () => {
+  const { MasterPanel } = mod.__test
+  const scope = fakeScope({ initial: { masterPanelEnabled: true } })
+  const view = mount(MasterPanel, {
+    t,
+    orch: scope,
+    loadState: async () => {
+      throw new Error('remote down')
+    },
+  })
+  for (let i = 0; i < 5; i += 1) await Promise.resolve()
+  nodes(view.tree).find((node) => node.type === 'button').props.onClick()
+  const alert = nodes(view.tree).find((node) => node.props?.role === 'alert')
+  assert.ok(alert, 'the failure is shown as an alert')
+  assert.match(textOf(alert), /master\.failed/)
+  assert.match(textOf(alert), /remote down/)
   view.unmount()
 })
