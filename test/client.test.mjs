@@ -1142,6 +1142,18 @@ test('masterGroups keeps the six-state order, counts every group and filters row
   assert.equal(masterGroups({ byState: null, workers: null }).every((group) => group.count === 0), true)
 })
 
+test('the master contribution declares its result as an src-json codec', () => {
+  const { MASTER_CONTRIBUTION } = mod.__test
+  const [descriptor] = MASTER_CONTRIBUTION.descriptors
+  // The host validates every mounted result codec: `src-json` returns before the
+  // create() check, while a strict codec must carry its own create() factory, which a
+  // hand-written plugin contribution cannot supply. Declaring strict makes $mount throw
+  // "strict codec has no create() factory" and the panel never reads its state.
+  assert.deepEqual(plain(descriptor.result), { mode: 'src-json' })
+  assert.equal('typeSymbol' in descriptor.result, false)
+  assert.equal('create' in descriptor.result, false)
+})
+
 test('the master panel renders nothing and makes no request while its switch is off', () => {
   const { MasterPanel } = mod.__test
   const scope = fakeScope({ initial: { masterPanelEnabled: false } })
