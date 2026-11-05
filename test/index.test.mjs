@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { registerHooks } from 'node:module'
 import test from 'node:test'
 import { denyGuard } from '../lib/gate.js'
+import { MAX_MESSAGE_BYTES, MAX_MESSAGE_QUEUE, checkInbound, composeMessage, deliverMessage } from '../lib/master-messaging.js'
 import { MEMORY_DOMAIN_NAME, MEMORY_INDEX_SECTION, MEMORY_SECTION_ORDER } from '../lib/memory.js'
 import { MASTER_SESSION_ID } from '../lib/master-session.js'
 
@@ -1238,4 +1239,62 @@ test('a host without the agent registry degrades with a warning instead of throw
   await settle()
   assert.ok(harness.logs.warn.length > 0)
   assert.match(harness.logs.warn.join('\n'), /master/i)
+})
+
+// ---- Cross-session messaging (ticket 06): switch read, protocol exported, no tool ------
+
+test('the messaging switch is read live with the module constants as its ceiling', () => {
+  // apply registers nothing for messaging: the ticket asks for the protocol, so the
+  // switch is read wherever a delivery starts, not captured at load time.
+  let enabled = false
+  let policy = 'accept'
+  const config = {
+    masterMessagingEnabled: { get: () => enabled },
+    masterInboundPolicy: { get: () => policy },
+  }
+
+  assert.deepEqual(mod.masterMessagingSettings(config), {
+    enabled: false,
+    policy: 'accept',
+    maxBytes: MAX_MESSAGE_BYTES,
+    maxQueue: MAX_MESSAGE_QUEUE,
+  })
+
+  enabled = true
+  policy = 'hold'
+  assert.deepEqual(mod.masterMessagingSettings(config), {
+    enabled: true,
+    policy: 'hold',
+    maxBytes: MAX_MESSAGE_BYTES,
+    maxQueue: MAX_MESSAGE_QUEUE,
+  })
+})
+
+test('the messaging protocol is exported from the plugin entry and registers no tool', () => {
+  assert.equal(mod.composeMessage, composeMessage)
+  assert.equal(mod.checkInbound, checkInbound)
+  assert.equal(mod.deliverMessage, deliverMessage)
+
+  const harness = start({})
+  const names = harness.tools.map(({ name }) => name)
+  assert.equal(
+    names.some((name) => /messag/i.test(name)),
+    false,
+    'a message entry tool is out of scope for ticket 06 and must not appear meanwhile',
+  )
+})
+
+test('a switch-off host refuses a message without touching any agent', async () => {
+  const settings = mod.masterMessagingSettings({
+    masterMessagingEnabled: { get: () => false },
+    masterInboundPolicy: { get: () => 'accept' },
+  })
+  let looked = 0
+  const result = await deliverMessage(
+    { agents: { get: () => { looked += 1; return undefined } }, sessions: { flush: async () => true }, queue: undefined },
+    { toSessionId: 'worker-1', text: 'x' },
+    { ...settings, loadLlm: async () => ({ createUserMessage: (input) => input }) },
+  )
+  assert.deepEqual(result, { decision: 'refuse', reason: 'disabled' })
+  assert.equal(looked, 0)
 })
