@@ -1037,6 +1037,26 @@ test('the master memory switch opens the domain and injects a labelled live inde
   assert.equal(memory.closes(), 1)
 })
 
+test('the master status projection is registered host-only and folds a worker row', () => {
+  const { projections } = start()
+  const master = projections.find((projection) => projection.key === 'orchestrator-master')
+  assert.ok(master, 'the master projection must be registered')
+  assert.equal(master.wire, undefined, 'a host-only unit declares no client view')
+  assert.equal(master.stateVersion, 1)
+
+  const init = master.init({ id: 'w-1', origin: 'subagent', delegationDepth: 1 }, 0)
+  assert.deepEqual(init.workers, [{ id: 'w-1', role: 'worker', state: 'Idle', summary: '' }])
+
+  const working = master.apply(init, { type: 'turn/start', data: { turn: 1 } })
+  assert.equal(working.workers[0].state, 'Working')
+
+  // An event the unit does not own keeps the reference, so no downstream work runs.
+  assert.equal(master.apply(working, { type: 'step/start', data: { turn: 1, step: 1 } }), working)
+
+  const done = master.apply(working, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+  assert.deepEqual(done.workers[0], { id: 'w-1', role: 'worker', state: 'Completed', summary: '' })
+})
+
 test('a host without a usable storage domain degrades explicitly and injects nothing', async () => {
   const missing = start({ memoryEnabled: true })
   await settle()
