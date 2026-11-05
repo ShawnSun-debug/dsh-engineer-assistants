@@ -3,6 +3,7 @@ import { registerHooks } from 'node:module'
 import test from 'node:test'
 import { denyGuard } from '../lib/gate.js'
 import { MEMORY_DOMAIN_NAME, MEMORY_INDEX_SECTION, MEMORY_SECTION_ORDER } from '../lib/memory.js'
+import { MASTER_SESSION_ID } from '../lib/master-session.js'
 
 /**
  * `lib/index.js` is the DSH plugin entry, and it imports three packages the host
@@ -84,9 +85,10 @@ function fakeCtx({
   catalogNames = ['read', 'edit'],
   memoryEnabled = false,
   panelEnabled = false,
+  masterEnabled = false,
   storageDomain,
 } = {}) {
-  const state = { enabled, memoryEnabled, panelEnabled }
+  const state = { enabled, memoryEnabled, panelEnabled, masterEnabled }
   const projections = []
   const tools = []
   const handlers = new Map()
@@ -177,6 +179,7 @@ function fakeCtx({
     superviseNotifyOnNoProgress: { get: () => false },
     masterMemoryEnabled: { get: () => state.memoryEnabled },
     masterPanelEnabled: { get: () => state.panelEnabled },
+    masterSessionEnabled: { get: () => state.masterEnabled },
     toolCatalog: catalogRef,
   }
   return {
@@ -1120,4 +1123,119 @@ test('a host without a usable storage domain degrades explicitly and injects not
   assert.equal(failed.sections.length, 1, 'the section registration survives, it is empty')
   assert.equal(failed.sections[0].text(), '')
   assert.match(failed.logs.warn.join('\n'), /backend-not-found/)
+})
+
+// ---- Persistent master session (ticket 05): opt-in lifecycle ----------------------------
+
+/**
+ * A fake `ctx.agents` registry. The plugin only reads `get`, `resume` and `create`,
+ * and every call is recorded so the discovery order is inspectable.
+ */
+function fakeAgentRegistry({ resume, create } = {}) {
+  const calls = []
+  const live = new Map()
+  const remember = (handle) => {
+    if (handle?.agent !== undefined) live.set(handle.agent.id, handle.agent)
+    return handle
+  }
+  return {
+    calls,
+    get: (id) => live.get(id),
+    async resume(options) {
+      calls.push(['resume', options])
+      return remember(await resume(options))
+    },
+    async create(options) {
+      calls.push(['create', options])
+      return remember(await create(options))
+    },
+  }
+}
+
+const fakeMasterAgent = (id = MASTER_SESSION_ID) => ({ id, session: { id } })
+
+test('the master session switch is off by default: no session is found, created or owned', async () => {
+  const agents = fakeAgentRegistry({
+    resume: async () => {
+      throw new Error('must not be called while the switch is off')
+    },
+    create: async () => {
+      throw new Error('must not be called while the switch is off')
+    },
+  })
+  const sessions = { get: () => undefined, list: () => [], flush: async () => true }
+  const harness = start({ agents, sessions })
+  await settle()
+
+  assert.equal(agents.calls.length, 0)
+  assert.equal(
+    harness.effects.some(({ label }) => label.startsWith('orchestrator: master session')),
+    false,
+    'an off switch owns nothing',
+  )
+})
+
+test('the master session switch resumes the fixed root session and owns a flush-then-dispose cleanup', async () => {
+  const order = []
+  const agent = fakeMasterAgent()
+  const agents = fakeAgentRegistry({
+    resume: async () => ({ agent, dispose: async () => order.push('dispose') }),
+    create: async () => {
+      throw new Error('a found session must not be replaced')
+    },
+  })
+  const sessions = {
+    get: () => undefined,
+    list: () => [],
+    async flush(session) {
+      order.push('flush')
+      assert.equal(session, agent.session)
+      return true
+    },
+  }
+  const harness = start({ masterEnabled: true, agents, sessions })
+  await settle()
+
+  assert.deepEqual(agents.calls.map(([name]) => name), ['resume'])
+  assert.equal(agents.calls[0][1].resumeSessionId, MASTER_SESSION_ID)
+
+  // The found session is checkpointed at start, so its file exists before any turn.
+  assert.deepEqual(order, ['flush'])
+
+  const owned = harness.effects.find(({ label }) => label === 'orchestrator: master session')
+  assert.ok(owned, 'the master lifecycle is owned by an effect')
+  await owned.dispose()
+  assert.deepEqual(order, ['flush', 'flush', 'dispose'], 'the unload path flushes before it disposes')
+})
+
+test('a master that cannot start is reported and never breaks the rest of the plugin', async () => {
+  const agents = fakeAgentRegistry({
+    resume: async () => {
+      throw new Error('session not found')
+    },
+    create: async () => {
+      throw new Error('the persistence backend is read-only')
+    },
+  })
+  const sessions = { get: () => undefined, list: () => [], flush: async () => true }
+  const harness = start({ masterEnabled: true, agents, sessions })
+  await settle()
+
+  assert.equal(
+    harness.effects.some(({ label }) => label === 'orchestrator: master session'),
+    false,
+    'a failed start owns no lifecycle',
+  )
+  assert.ok(
+    harness.tools.some(({ name }) => name === 'dispatch'),
+    'the dispatch entry survives a broken master',
+  )
+  assert.match(harness.logs.warn.join('\n'), /master/)
+})
+
+test('a host without the agent registry degrades with a warning instead of throwing', async () => {
+  const harness = start({ masterEnabled: true, agents: {} })
+  await settle()
+  assert.ok(harness.logs.warn.length > 0)
+  assert.match(harness.logs.warn.join('\n'), /master/i)
 })
