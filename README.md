@@ -85,12 +85,12 @@ DSH 客户端自带了 `subagent` / `workflow`，官方也有 `@deepseek-ai/dsh-
 
 ### 6. Master 层：AI 记忆、状态索引与跨会话消息（默认关闭）
 
-这一层是附加功能，四个开关默认全关；关着时插件的行为与之前完全一致。打开后多了四样东西：
+这一层是附加功能，四个开关默认全关；关着时四个 master 功能都不产生用户可见输出。不过一个 host-only 的状态投影单元和一个只读端点始终注册（端点关闭时不返回任何 worker 数据），理由见 ADR 0008 的「后果」。打开后多了四样东西：
 
 - **AI 记忆（`masterMemoryEnabled`）**：插件在自己的存储域 `orchestrator_memory` 里累积条目，并在每个会话注入一段带「AI 记忆，非用户指令」标注的紧凑索引（首行标注 + 一行计数 + 每条一行）。上限 **200 条 / 索引 25 KiB**，先到者为准；写超限直接报错并要求先精简，不静默截断。它与 `~/.dsh` 下你手写的 `AGENTS.md`、`memory/topics` 完全分离——插件只读引用你的记忆树，从不写它。
   > 当前版本只接线了「存储域 + 索引注入」，还没有记忆的写入/检索工具，模型侧入口待后续票；此时打开开关看到的是空索引。
 - **Master 状态面板（`masterPanelEnabled`）**：输入框右侧的「Master 状态」按钮，按六态（Working / Needs input / Idle / Completed / Failed / Stopped）分组列出 worker 与会话标题摘要，只读、可收起；没有 worker 时显示「暂无 worker」，开关关闭时按钮不渲染。
-- **常驻 master 会话（`masterSessionEnabled`）**：以固定 id `orchestrator-master` 建一个**无 cwd** 的根会话，落盘在 `sessions/_no-cwd/` 下，重启时按 resume 复用同一个，不会越开越多；通知经 `followup` 投喂、投喂后立即 flush，卸载时先 flush 再 dispose（否则缓冲的事件会静默丢掉）。
+- **常驻 master 会话（`masterSessionEnabled`）**：以固定 id `orchestrator-master` 建一个**无 cwd** 的根会话，落盘在 `sessions/_no-cwd/` 下（该路径来自 spike 在 `DSH_HOME` 重定向下的验证；真实宿主目录尚未验证，见 ADR 0008），重启时按 resume 复用同一个，不会越开越多；通知经 `followup` 投喂、投喂后立即 flush，卸载时先 flush 再 dispose（否则缓冲的事件会静默丢掉）。
   > 当前版本没有调用方给它投通知：会话与契约已就绪，接线待后续票。
 - **跨会话消息（`masterMessagingEnabled` / `masterInboundPolicy`）**：纯文本信封 `{ id, from, to, text, createdAt }`，**不带发送方历史**（额外塞进去的 `history` / `files` 会被丢弃）；单条 ≤ **8192 字节**、接收方排队 ≤ **16 条**，越界报错；入站策略 `accept` 直接投递、`hold` 停进队列、`refuse` 丢弃。接收方空闲时开一轮新回合，运行中则投在两次 step 之间，投完立即 flush。
   > 当前版本没有发消息的工具，`hold` 也还没有投递触发点，消息会停在队列里等后续接上。

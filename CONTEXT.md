@@ -101,4 +101,4 @@ _Avoid_: 把状态索引说成「会话阶段」或「面板数据」——面�
 
 **跨会话消息**：
 会话与会话之间的纯文本投递：信封只有 `{ id, from, to, text, createdAt }`，不带发送方历史；单条 ≤ 8 KiB、接收方排队 ≤ 16 条；入站策略 `accept` / `hold` / `refuse`。
-_Avoid_: 把它与巡检通知混为一谈——两者共用来源 kind，但 `form` 不同（`message` / `notice`）。
+_Avoid_: 把它与巡检通知混为一谈——巡检通知是另一个 source kind（`orchestrator-supervision`）；插件另有 master 通知（kind `orchestrator-master` + `form: 'notice'`，当前未接线），跨会话消息共用 master kind，但 `form` 是 `'relay'`。

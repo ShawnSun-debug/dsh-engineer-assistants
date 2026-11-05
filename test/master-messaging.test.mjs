@@ -229,11 +229,15 @@ test('an idle receiver opens a new turn with followup carrying the plugin messag
   assert.equal(result.via, 'followup')
   assert.equal(agent.calls.length, 1, 'an idle agent gets one waking delivery, not a second inject')
   assert.equal(agent.calls[0][0], 'followup')
-  assert.deepEqual(agent.calls[0][1].source, {
+  // A message another agent addressed to this one is the host's 'relay' form (dsh-llm
+  // ContextFormed): 'message' is not in that union, and relay needs no extra field.
+  const source = agent.calls[0][1].source
+  assert.deepEqual(source, {
     kind: MESSAGE_SOURCE_KIND,
-    form: 'message',
+    form: 'relay',
     senderSessionId: 'orchestrator-master',
   })
+  assert.equal('summary' in source, false, 'only a notice carries a summary')
   assert.equal(agent.calls[0][1].content[0].text, '从 master 来的消息')
   assert.deepEqual(order, ['followup', 'flush'], 'the checkpoint follows the delivery')
   assert.equal(llm.created.length, 1)

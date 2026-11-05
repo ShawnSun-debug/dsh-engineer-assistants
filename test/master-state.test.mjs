@@ -54,6 +54,23 @@ test('a pending human question is Needs input until its result lands', () => {
   }
 })
 
+test("another tool's result in the same step does not clear a pending question", () => {
+  // The model may call ask_user_question and another tool in one step; the other
+  // result must not turn Needs input back into Working before the answer lands.
+  const asked = fold([turnStart(), call('ask_user_question')])
+  assert.equal(asked.pending, 'c1', 'the blocking call is remembered by id')
+  const unrelated = makeEvent('tool/result', { message: { role: 'tool', toolCallId: 'c2' } })
+  assert.equal(row(reduceMasterState(asked, unrelated)).state, 'Needs input')
+  assert.equal(row(reduceMasterState(asked, result())).state, 'Working')
+})
+
+test('a restored Needs-input row without a call id still clears on any result', () => {
+  // Older checkpoints did not record the id; refusing every result would leave the row
+  // stuck forever, so an untracked wait keeps the previous behaviour.
+  const restored = { workers: [{ id: 'w-1', role: 'worker', state: 'Needs input', summary: '' }] }
+  assert.equal(row(reduceMasterState(restored, result())).state, 'Working')
+})
+
 test('turn/end maps the recorded reason onto the six states', () => {
   assert.equal(row(fold([turnStart(), turnEnd({ kind: 'completed' })])).state, 'Idle')
   assert.equal(row(fold([turnStart(), turnEnd({ kind: 'aborted', reason: { kind: 'user' } })])).state, 'Stopped')

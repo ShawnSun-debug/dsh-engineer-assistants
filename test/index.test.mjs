@@ -47,6 +47,7 @@ const STUBS = {
       node.int = () => node
       node.nonnegative = () => node
       node.strict = () => node
+      node.optional = () => node
       return node
     }
     const z = {
@@ -111,6 +112,9 @@ function fakeCtx({
   // The provided services, keyed by service name. `provide` is what the real
   // ctx exposes; the master panel endpoint is registered through it.
   const services = new Map()
+  // The paths every optional host service is resolved through in production:
+  // optionalService() tries ctx.get(name) before the direct property.
+  const getCalls = []
   const ctx = {
     sessionProjections: {
       // A real registration is a thenable that resolves to a handle; the master
@@ -139,6 +143,10 @@ function fakeCtx({
       },
       // The context-global view the catalog reads: names plus an empty visible map.
       view: () => ({ knownNames: new Set(catalogNames), visible: new Map() }),
+    },
+    get(name) {
+      getCalls.push(name)
+      return name in ctx ? ctx[name] : undefined
     },
     subagents: {},
     systemPrompt: {
@@ -197,6 +205,7 @@ function fakeCtx({
     sections,
     storageDomain,
     services,
+    getCalls,
     logs,
     emitted,
     catalogNames,
@@ -248,6 +257,16 @@ function start(options) {
   const created = harness.handlers.get('agent/created')
   assert.equal(typeof created, 'function', 'apply must subscribe to agent/created')
   return { ...harness, created }
+}
+
+/**
+ * Unload the plugin the way cordis does it (fiber.d.ts): every disposer runs in
+ * reverse registration order, and the unload waits for each one.
+ */
+async function unload(harness) {
+  for (const entry of [...harness.effects].reverse()) {
+    if (typeof entry.dispose === 'function') await entry.dispose()
+  }
 }
 
 test('a child with a persisted delegation depth is never gated', () => {
@@ -683,6 +702,7 @@ test('deliver queues exactly one notice with followup, never steer', async () =>
   assert.deepEqual(calls.followup[0].source, {
     kind: mod.SUPERVISE_SOURCE_KIND,
     form: 'notice',
+    summary: '巡检正文',
     senderSessionId: 'child-1',
   })
   assert.equal(calls.flush.length, 1)
@@ -878,7 +898,7 @@ test('the retry prompt goes through the host protocol entry, as a queued turn of
   assert.equal(sender, parent, 'the live parent is the sender the host requires')
   assert.equal(childId, 'child-1')
   assert.deepEqual(content, [{ type: 'text', text: '继续' }])
-  assert.deepEqual(source, { kind: 'orchestrator-retry', form: 'notice' })
+  assert.deepEqual(source, { kind: 'orchestrator-retry', form: 'notice', summary: '继续' })
   assert.equal(delivery, 'queue', 'a retry is a new turn, not a steer into a dead one')
   assert.equal(typeof signal?.aborted, 'boolean')
 })
@@ -908,10 +928,20 @@ test('the retry notice has its own source kind, so it cannot mask a supervision 
   assert.equal(await supervision.deliverRetry('p', '重试正文', ['child-1']), 'queued')
   assert.equal(queued.length, 1)
   assert.equal(queued[0].content[0].text, '重试正文')
-  assert.deepEqual(queued[0].source, { kind: 'orchestrator-retry', form: 'notice', senderSessionId: 'child-1' })
+  assert.deepEqual(queued[0].source, {
+    kind: 'orchestrator-retry',
+    form: 'notice',
+    summary: '重试正文',
+    senderSessionId: 'child-1',
+  })
   // The supervision notice keeps the kind `hasPendingNotice` looks for.
   assert.equal(await supervision.deliver('p', '巡检正文', ['child-1']), 'queued')
-  assert.deepEqual(queued[1].source, { kind: mod.SUPERVISE_SOURCE_KIND, form: 'notice', senderSessionId: 'child-1' })
+  assert.deepEqual(queued[1].source, {
+    kind: mod.SUPERVISE_SOURCE_KIND,
+    form: 'notice',
+    summary: '巡检正文',
+    senderSessionId: 'child-1',
+  })
 })
 
 // ---- Live tool catalog -----------------------------------------------------------------
@@ -1203,10 +1233,42 @@ test('the master session switch resumes the fixed root session and owns a flush-
   // The found session is checkpointed at start, so its file exists before any turn.
   assert.deepEqual(order, ['flush'])
 
-  const owned = harness.effects.find(({ label }) => label === 'orchestrator: master session')
-  assert.ok(owned, 'the master lifecycle is owned by an effect')
-  await owned.dispose()
-  assert.deepEqual(order, ['flush', 'flush', 'dispose'], 'the unload path flushes before it disposes')
+  assert.ok(harness.getCalls.includes('agents'), 'the registry is read through ctx.get, the production path')
+  assert.ok(harness.getCalls.includes('sessions'), 'the session service is read through ctx.get too')
+
+  // The two lifecycle effects, in registration order. cordis runs disposers in
+  // reverse, so this is what an unload actually executes.
+  const lifecycle = harness.effects.filter(({ label }) => label.startsWith('orchestrator: master session'))
+  assert.deepEqual(
+    lifecycle.map(({ label }) => label),
+    ['orchestrator: master session shutdown', 'orchestrator: master session'],
+    'the shutdown marker is registered before the session it protects',
+  )
+  for (const entry of [...lifecycle].reverse()) await entry.dispose()
+  assert.deepEqual(order, ['flush', 'flush', 'dispose'], 'the reversed disposers flush before they dispose')
+})
+
+test('unloading the whole plugin flushes the master before any teardown runs', async () => {
+  const order = []
+  const agent = fakeMasterAgent()
+  const agents = fakeAgentRegistry({
+    resume: async () => ({ agent, dispose: async () => order.push('dispose') }),
+    create: async () => {
+      throw new Error('a found session must not be replaced')
+    },
+  })
+  const sessions = {
+    get: () => undefined,
+    list: () => [],
+    async flush() {
+      order.push('flush')
+      return true
+    },
+  }
+  const harness = start({ masterEnabled: true, agents, sessions })
+  await settle()
+  await unload(harness)
+  assert.deepEqual(order, ['flush', 'flush', 'dispose'], 'flush-then-dispose survives a whole-plugin unload')
 })
 
 test('a master that cannot start is reported and never breaks the rest of the plugin', async () => {

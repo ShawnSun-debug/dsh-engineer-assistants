@@ -175,6 +175,31 @@ test('concurrent ensure calls share one resume and one create', async () => {
   assert.equal(creates, 1, 'two starts must not race two roots')
 })
 
+test('two service wrappers of the same registry share one in-flight discovery', async () => {
+  // cordis hands every access to a Service a fresh Proxy, so object identity is not a
+  // stable flight key: the key has to be the session id.
+  const agent = masterAgent()
+  let resolves = 0
+  const gate = new Promise((resolve) => setTimeout(resolve, 5))
+  const registry = fakeAgents({
+    resume: async () => {
+      resolves += 1
+      await gate
+      return { agent, dispose: async () => {} }
+    },
+  })
+  const first = new Proxy(registry, {})
+  const second = new Proxy(registry, {})
+
+  const [left, right] = await Promise.all([
+    ensureMaster(first, fakeSessions(), {}),
+    ensureMaster(second, fakeSessions(), {}),
+  ])
+
+  assert.equal(left, right, 'both callers get the same record')
+  assert.equal(resolves, 1, 'a proxy identity must not start a second resume')
+})
+
 test('create is asked for a root session by fixed id, with no cwd and no parent', async () => {
   const agent = masterAgent()
   let seen
@@ -241,6 +266,33 @@ test('a master whose session cannot be flushed fails loudly instead of running i
   })
 })
 
+test('a master whose first flush fails is released instead of being left unowned', async () => {
+  // The handle is dropped once the flush fails; without a dispose here the agent stays
+  // in the registry with no owner, so nothing would ever checkpoint it again.
+  const agent = masterAgent()
+  const order = []
+  const agents = fakeAgents({
+    resume: async () => {
+      throw new Error('session not found')
+    },
+    create: async () => ({
+      agent,
+      dispose: async () => {
+        order.push('dispose')
+      },
+    }),
+  })
+  const sessions = {
+    async flush() {
+      order.push('flush')
+      return false
+    },
+  }
+
+  await assert.rejects(ensureMaster(agents, sessions, {}), /no durability listener/)
+  assert.deepEqual(order, ['flush', 'dispose'], 'the failed master is disposed before the error is reported')
+})
+
 // ---- Notice: followup with the plugin source kind, then flush ---------------------------
 
 test('notice queues one followup carrying the plugin source kind, then flushes the session', async () => {
@@ -263,7 +315,12 @@ test('notice queues one followup carrying the plugin source kind, then flushes t
 
   assert.equal(agent.messages.length, 1)
   assert.equal(agent.messages[0].content[0].text, 'worker 完成：结果在 /tmp/x')
-  assert.deepEqual(agent.messages[0].source, { kind: MASTER_SOURCE_KIND, form: 'notice' })
+  // ContextFormed in @deepseek-ai/dsh-llm: form 'notice' requires the one-line summary.
+  assert.deepEqual(agent.messages[0].source, {
+    kind: MASTER_SOURCE_KIND,
+    form: 'notice',
+    summary: 'worker 完成：结果在 /tmp/x',
+  })
   assert.equal(MASTER_SOURCE_KIND, 'orchestrator-master', 'the kind is the plugin own, not a host one')
   assert.deepEqual(order, ['followup', 'flush'], 'the flush follows the queued message')
   assert.equal(llm.created.length, 1)
@@ -274,7 +331,28 @@ test('notice names the sending session when the payload carries one', async () =
   const sources = []
   agent.followup = (message) => sources.push(message.source)
   await notice(masterRecord(agent), fakeSessions(), { text: 'x', senderSessionId: 'worker-1' }, { loadLlm: async () => fakeLlm() })
-  assert.deepEqual(sources, [{ kind: MASTER_SOURCE_KIND, form: 'notice', senderSessionId: 'worker-1' }])
+  assert.deepEqual(sources, [
+    { kind: MASTER_SOURCE_KIND, form: 'notice', summary: 'x', senderSessionId: 'worker-1' },
+  ])
+})
+
+test('a notice summary is one bounded line, the field the host contract requires', async () => {
+  const agent = masterAgent()
+  const sources = []
+  agent.followup = (message) => sources.push(message.source)
+  await notice(
+    masterRecord(agent),
+    fakeSessions(),
+    { text: 'line one\n\nline two ' + 'x'.repeat(300) },
+    { loadLlm: async () => fakeLlm() },
+  )
+  const [source] = sources
+  assert.equal(source.form, 'notice')
+  assert.equal(typeof source.summary, 'string')
+  assert.equal(source.summary.includes('\n'), false, 'a summary is one line')
+  assert.match(source.summary, /^line one line two x/)
+  assert.equal(source.summary.length, 120, 'bounded like the host bounds its own summaries')
+  assert.equal(source.summary.endsWith('\u2026'), true)
 })
 
 test('a notice whose flush throws reports the loss and never pretends it landed', async () => {

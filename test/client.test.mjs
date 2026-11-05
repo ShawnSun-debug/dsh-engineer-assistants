@@ -185,6 +185,10 @@ const T = mod.__test
 const t = (k) => k
 // Values built inside the vm context have another Object.prototype; compare them as plain JSON.
 const plain = (v) => JSON.parse(JSON.stringify(v))
+/** Run every pending microtask; the hook shim commits effects after each render. */
+const flush = async (rounds = 10) => {
+  for (let i = 0; i < rounds; i += 1) await Promise.resolve()
+}
 
 test('route keys round-trip, including ids with slashes, and reject junk', () => {
   const key = T.routeKey('nexus-claude', 'claude/opus:5.5')
@@ -1179,10 +1183,10 @@ test('the master panel shows its empty state when the endpoint has no workers', 
     orch: scope,
     loadState: async () => ({ enabled: true, byState: { Working: 0 }, workers: [] }),
   })
-  for (let i = 0; i < 5; i += 1) await Promise.resolve()
   const trigger = nodes(view.tree).find((node) => node.type === 'button')
   assert.ok(trigger, 'the panel renders its trigger once enabled')
   trigger.props.onClick()
+  await flush()
   assert.ok(
     nodes(view.tree).some((node) => node.props?.['data-testid'] === 'orchestrator-master-empty'),
     'the empty state is a visible element, not an error',
@@ -1206,8 +1210,8 @@ test('the master panel groups worker rows under their state with the projection 
       ],
     }),
   })
-  for (let i = 0; i < 5; i += 1) await Promise.resolve()
   nodes(view.tree).find((node) => node.type === 'button').props.onClick()
+  await flush()
   const text = textOf(view.tree)
   assert.match(text, /Working · 1/)
   assert.match(text, /Needs input · 1/)
@@ -1227,11 +1231,111 @@ test('a failed master read shows an alert instead of crashing the toolbar', asyn
       throw new Error('remote down')
     },
   })
-  for (let i = 0; i < 5; i += 1) await Promise.resolve()
   nodes(view.tree).find((node) => node.type === 'button').props.onClick()
+  await flush()
   const alert = nodes(view.tree).find((node) => node.props?.role === 'alert')
   assert.ok(alert, 'the failure is shown as an alert')
   assert.match(textOf(alert), /master\.failed/)
   assert.match(textOf(alert), /remote down/)
+  view.unmount()
+})
+
+
+test('every expansion asks the endpoint again, and a closed panel never reads', async () => {
+  const { MasterPanel } = mod.__test
+  const scope = fakeScope({ initial: { masterPanelEnabled: true } })
+  let loads = 0
+  const view = mount(MasterPanel, {
+    t,
+    orch: scope,
+    loadState: async () => {
+      loads += 1
+      return { enabled: true, byState: {}, workers: [] }
+    },
+  })
+  await flush()
+  assert.equal(loads, 0, 'mounting the toolbar entry alone no longer reads the endpoint')
+
+  const trigger = () => nodes(view.tree).find((node) => node.type === 'button')
+  trigger().props.onClick()
+  await flush()
+  assert.equal(loads, 1, 'opening the panel reads it once')
+
+  trigger().props.onClick()
+  await flush()
+  assert.equal(loads, 1, 'closing the panel reads nothing')
+
+  trigger().props.onClick()
+  await flush()
+  assert.equal(loads, 2, 'the second expansion reads it again instead of replaying the mount snapshot')
+  view.unmount()
+})
+
+/**
+ * A stand-in for the host's `ctx.remote`: `$mount` installs the namespace, exactly like
+ * the Gateway does, so the client's real `loadMasterState` can be driven end to end.
+ */
+function fakeRemote({ value, result, failFirstMount = false } = {}) {
+  const remote = {
+    mounts: [],
+    $mount(contribution) {
+      remote.mounts.push(contribution)
+      if (failFirstMount === true && remote.mounts.length === 1) {
+        return Promise.reject(new Error('the host is not ready yet'))
+      }
+      remote.orchestratorMaster = {
+        masterState: async () => result ?? { ok: true, value },
+      }
+      return Promise.resolve(() => {})
+    },
+  }
+  return remote
+}
+
+test('loadMasterState mounts once and returns the value of a real RemoteResult', async () => {
+  const { loadMasterState } = mod.__test
+  const value = { enabled: true, byState: { Working: 1 }, workers: [{ id: 'w-1', role: 'worker', state: 'Working', summary: 'ok' }] }
+  const remote = fakeRemote({ value })
+
+  assert.deepEqual(plain(await loadMasterState(remote)), value)
+  assert.deepEqual(plain(await loadMasterState(remote)), value)
+  assert.equal(remote.mounts.length, 1, 'one mount serves every read')
+  assert.equal(remote.mounts[0].descriptors[0].id, 'dsh-orchestrator-master#orchestratorMaster/masterState')
+})
+
+test('a failed RemoteResult becomes a rejection with the host message', async () => {
+  const { loadMasterState } = mod.__test
+  const remote = fakeRemote({ result: { ok: false, error: { message: 'projection is not ready' } } })
+  await assert.rejects(loadMasterState(remote), /projection is not ready/)
+})
+
+test('a failed mount is retried on the next read instead of being cached forever', async () => {
+  const { loadMasterState } = mod.__test
+  const remote = fakeRemote({ value: { enabled: true, byState: {}, workers: [] }, failFirstMount: true })
+
+  await assert.rejects(loadMasterState(remote), /host is not ready yet/)
+  assert.deepEqual(plain(await loadMasterState(remote)), { enabled: true, byState: {}, workers: [] })
+  assert.equal(remote.mounts.length, 2, 'the rejection is not the cached answer for the rest of the page')
+})
+
+test('the panel reads through the real loader and the host mount, not an injected snapshot', async () => {
+  const { MasterPanel, loadMasterState } = mod.__test
+  const remote = fakeRemote({
+    value: {
+      enabled: true,
+      byState: { Working: 1 },
+      workers: [{ id: 'w-1234567890', role: 'worker', state: 'Working', summary: 'from the remote endpoint' }],
+    },
+  })
+  const scope = fakeScope({ initial: { masterPanelEnabled: true } })
+  const view = mount(MasterPanel, { t, orch: scope, loadState: () => loadMasterState(remote) })
+
+  nodes(view.tree).find((node) => node.type === 'button').props.onClick()
+  await flush(14)
+
+  assert.equal(remote.mounts.length, 1, 'the panel mounted the contribution itself')
+  const text = textOf(view.tree)
+  assert.match(text, /from the remote endpoint/)
+  assert.match(text, /Working · 1/)
   view.unmount()
 })

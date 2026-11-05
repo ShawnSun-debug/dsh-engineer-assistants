@@ -184,6 +184,33 @@ test('the entry cap rejects the 201st write with a clear error and keeps all 200
   assert.equal(rows.size, MEMORY_MAX_ENTRIES)
 })
 
+test('two concurrent adds cannot both cross the entry cap', async () => {
+  const rows = new Map()
+  for (let i = 0; i < MEMORY_MAX_ENTRIES - 1; i += 1) {
+    const id = 'm-' + i
+    rows.set(id, { id, text: 'entry ' + i, tags: [], createdAt: i, updatedAt: i })
+  }
+  // The host only updates its in-memory table after the write is durable, so the fake
+  // does the same: two callers that read before it resolves both see 199.
+  const table = {
+    entries: () => rows.entries(),
+    get size() {
+      return rows.size
+    },
+    async put(key, value) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      rows.set(key, value)
+    },
+  }
+  const memory = createMemory({ table })
+  const results = await Promise.allSettled([memory.add('one'), memory.add('two')])
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1, 'exactly one fits')
+  const rejected = results.filter((result) => result.status === 'rejected')
+  assert.equal(rejected.length, 1)
+  assert.match(rejected[0].reason.message, /limit/)
+  assert.equal(memory.size, MEMORY_MAX_ENTRIES, 'the refused write left nothing behind')
+})
+
 test('the byte cap rejects a write that would push the index past 25 KiB', async () => {
   const { table, rows } = fakeDomain()
   const memory = createMemory({ table, now: ticking() })

@@ -25,8 +25,10 @@ master 要把结论交给 worker，worker 也要把结论交回；但会话之�
   不新开回合），否则走 `followup`（开一轮新回合）；投递后 `sessions.flush(agent.session)`，
   `false` / throw 都按失败抛错。
 - **来源标注**：消息 body 的 `source.kind` 是插件自定义 kind `orchestrator-master`，
-  用 `form` 区分 `message`（跨会话消息）与 `notice`（巡检通知），
-  避免「按 kind 找通知」的既有逻辑把跨会话消息二次截获。
+  `form` 取宿主 `ContextForm` 的 `relay`（「另一个 agent 发给本会话的消息」）。
+  master 通知（`notice()`，当前未接线）用 `form: 'notice'`，并按 `ContextFormed` 契约必须带
+  `summary`；巡检通知不是这个 kind，它用 `orchestrator-supervision`。
+  三者分开后，「按 kind 找巡检通知」的既有逻辑不会命中跨会话消息。
 - **没有入口工具**：`apply` 不注册任何消息工具，能力只经包入口导出
   （`composeMessage` / `checkInbound` / `deliverMessage`）。
   开关 `masterMessagingEnabled` 默认 `false`、策略 `masterInboundPolicy` 默认 `accept`，
@@ -55,7 +57,8 @@ master 要把结论交给 worker，worker 也要把结论交回；但会话之�
 1. **没有在真实宿主里跑过一次投递**：`inject` 在 running 回合里的消费时机只有宿主 d.ts 文案支撑。
 2. **`status` 的竞态未验**：读到 `idle` 后、`followup` 前若恰好有另一条投递唤醒 driver，
    会得到两条排队回合而不是一条。
-3. **`source.form: 'message'` 对客户端/日志阅读器没有契约**：`inbox` 投影是否按 `form` 分桶未查证。
+3. **`form` 的消费方未验**：`relay` / `notice` 已按 dsh-llm 的 `ContextFormed` 取值，
+   但 `inbox` 投影或客户端是否按 `form` 分桶未查证。
 4. **`inject` 路径的 flush 时机未验**：注入的消息在下一个 step 之前 flush 一次是否足以让它落到磁盘。
 5. **多进程**：同一接收方的队列计数与 flush 竞争未验（队列是进程内的调用方对象）。
 6. **没有 GUI 验证**：跨会话消息在客户端会话视图里如何显示（是否与用户输入混同）未验。

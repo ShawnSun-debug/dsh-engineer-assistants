@@ -66,6 +66,16 @@ test('a state outside the six values is not listed and does not inflate a count'
   })
 })
 
+test('a prototype key on a row is not a state and never becomes a counter', () => {
+  // byState is a plain object, so `state in byState` is true for 'constructor' and
+  // 'toString'; those rows must be skipped, not counted and then rendered.
+  const stateOf = () => ({ workers: [row('ctor', 'constructor'), row('str', 'toString'), row('ok', 'Idle')] })
+  assert.deepEqual(collectMasterPanel([{}], stateOf), {
+    byState: { ...ZERO, Idle: 1 },
+    workers: [row('ok', 'Idle')],
+  })
+})
+
 test('the Remote Service exports one zero-argument direct method at the expected endpoint', () => {
   const service = new MasterRemote({ registration: Promise.resolve({ stateOf: () => ({ workers: [] }) }) })
   assert.equal(MASTER_SERVICE_KEY, 'orchestratorMaster')

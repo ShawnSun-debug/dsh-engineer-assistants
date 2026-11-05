@@ -61,7 +61,7 @@ The "dispatch mode" plugin for DeepSeek Harness.
 
 ## Master layer (off by default)
 
-This is an add-on: every switch below defaults to off, and while they stay off the plugin behaves exactly as before.
+This is an add-on: every switch below defaults to off. With all of them off the four master features produce no user-visible output, but one host-only projection unit and one read-only endpoint are still registered (the endpoint returns no worker data while off) — ADR 0008 explains why.
 
 - **AI memory (`masterMemoryEnabled`)**:
 
@@ -75,7 +75,7 @@ This is an add-on: every switch below defaults to off, and while they stay off t
 
 - **Persistent master session (`masterSessionEnabled`)**:
 
-    One **cwd-less** root session with the fixed id `orchestrator-master`, persisted under `sessions/_no-cwd/` and resumed on restart instead of being recreated, so restarts do not pile up masters. Notices go in through `followup` and are flushed right after; unloading flushes before disposing, because a disposed agent does not write its buffered events.
+    One **cwd-less** root session with the fixed id `orchestrator-master`, persisted under `sessions/_no-cwd/` (that path comes from the spike under a redirected `DSH_HOME`; the real host directory is still unverified — see ADR 0008) and resumed on restart instead of being recreated, so restarts do not pile up masters. Notices go in through `followup` and are flushed right after; unloading flushes before disposing, because a disposed agent does not write its buffered events.
 
     > This version has no caller that feeds it notices: the session and its contract exist, the wiring comes with a later ticket.
 
