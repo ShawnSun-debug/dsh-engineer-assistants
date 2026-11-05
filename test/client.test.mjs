@@ -1043,3 +1043,71 @@ test('a row with no measurable box still opens, on the static upward-or-downward
   row.view.unmount()
 })
 
+
+test('review route: own fields, same plugin namespace, and copy for both languages', () => {
+  const { REVIEW, WORKER, zh, en } = mod.__test
+  // 评审路由与 worker 路由同一个配置段，但字段各自独立
+  assert.equal(REVIEW.ns, WORKER.ns)
+  // 跨 realm 取回的对象原型不同，deepStrictEqual 会拒；逐字段比对
+  assert.equal(REVIEW.fields.provider, 'reviewProvider')
+  assert.equal(REVIEW.fields.model, 'reviewModel')
+  assert.equal(REVIEW.fields.effort, 'reviewReasoningEffort')
+  assert.equal(REVIEW.fields.clear, 'empty')
+  assert.notEqual(REVIEW.fields.provider, WORKER.fields.provider)
+
+  for (const dict of [zh, en]) {
+    for (const key of ['route.review', 'route.reviewNote', 'route.lastReview', 'route.lastReviewNone']) {
+      assert.equal(typeof dict[key], 'string', key)
+      assert.ok(dict[key].length > 0, key)
+    }
+  }
+})
+
+/** 把渲染树压成可见文本，用来断言面板真的写出了那几行。 */
+function textOf(node) {
+  if (node === null || node === undefined || node === false) return ''
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (Array.isArray(node)) return node.map(textOf).join(' ')
+  const props = node.props ?? {}
+  return textOf(node.kids) + ' ' + textOf(props.title ?? '') + ' ' + textOf(props.children ?? '')
+}
+
+test('the panel shows a review route row and the last verdict', async () => {
+  const { RoutePicker } = mod.__test
+  const mainScope = fakeScope({ initial: { provider: 'p', model: 'm', reasoningEffort: '' } })
+  const workerScope = fakeScope({ initial: { workerProvider: 'wp', workerModel: 'wm', workerReasoningEffort: '' } })
+  const orchScope = fakeScope({ initial: { enabled: true, lastReview: JSON.stringify({ verdict: 'BLOCK', target: 'verify', at: 1 }) } })
+
+  const view = mount(RoutePicker, {
+    t: (key) => key,
+    scopes: { main: mainScope, worker: workerScope, orch: orchScope },
+    orch: orchScope,
+    loadCatalog: async () => ({ ok: true, value: { groups: [{ id: 'wp', name: 'WP', models: [{ id: 'wm', name: 'WM' }] }] } }),
+  })
+
+  // 打开面板：找到那颗标题为 route.title 的按钮并触发它的 onClick
+  const findButton = (node) => {
+    if (node === null || typeof node !== 'object') return null
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const hit = findButton(child)
+        if (hit !== null) return hit
+      }
+      return null
+    }
+    if (node.props?.title === 'route.title') return node
+    return findButton(node.kids)
+  }
+  const button = findButton(view.tree)
+  assert.ok(button, 'the picker must render its trigger button')
+  // 状态更新后 hook shim 会自己重渲染；目录加载的 promise 随后到达，再跑一轮
+  button.props.onClick()
+  for (let i = 0; i < 5; i += 1) await Promise.resolve()
+
+  const text = textOf(view.tree)
+  assert.match(text, /route\.review/, 'the reviewer row must be rendered')
+  assert.match(text, /route\.lastReview/, 'the last verdict line must be rendered')
+  assert.match(text, /BLOCK/, 'the verdict itself must be visible')
+  assert.match(text, /verify/, 'the reviewed field must be visible')
+  view.unmount()
+})

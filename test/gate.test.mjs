@@ -47,7 +47,7 @@ test('denyGuard denies a listed name and lets anything else through', () => {
   const guard = denyGuard(HIDDEN)
   assert.equal(
     guard({ name: 'edit' }),
-    'orchestrator: "edit" is not available to the main agent. The main agent only plans; hand every action to a worker with the delegate or orchestrate tools.',
+    'orchestrator: "edit" is not available to the main agent. The main agent only plans; hand every action to a worker with the dispatch tool.',
   )
   assert.equal(guard({ name: 'write' }).startsWith('orchestrator: "write"'), true)
   assert.equal(guard({ name: 'todo_write' }), undefined)
@@ -556,7 +556,7 @@ test('an explicitly denied run_code keeps the plain tool-level refusal', () => {
   // gets the same sentence as any other denied tool, not the argument-level one.
   assert.equal(
     guard({ name: 'run_code', agent, arguments: { code: 'return 1' } }),
-    'orchestrator: "run_code" is not available to the main agent. The main agent only plans; hand every action to a worker with the delegate or orchestrate tools.',
+    'orchestrator: "run_code" is not available to the main agent. The main agent only plans; hand every action to a worker with the dispatch tool.',
   )
   assert.match(guard({ name: 'run_code', agent, arguments: {} }), /"run_code" is not available/)
   // denyGuard, the fixed-list form, behaves the same way.

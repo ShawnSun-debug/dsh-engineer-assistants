@@ -1,0 +1,145 @@
+[
+  {
+    "id": "g01",
+    "why": "字段完整、单条目、无写操作 → 低风险，不审",
+    "expectedTier": "low",
+    "card": {
+      "goal": "列出仓库里的 ADR 标题",
+      "doneDefinition": "输出 4 个标题",
+      "files": [],
+      "deps": [],
+      "verify": "grep 到 4 行",
+      "fallback": "报告读不到"
+    }
+  },
+  {
+    "id": "g02",
+    "why": "缺验收命令 → 高风险",
+    "expectedTier": "high",
+    "card": {
+      "goal": "重构 gate.js",
+      "doneDefinition": "测试通过",
+      "files": [
+        "lib/gate.js"
+      ],
+      "deps": [],
+      "verify": "",
+      "fallback": "回滚"
+    }
+  },
+  {
+    "id": "g03",
+    "why": "8 个条目超过扇出上限 4 → 高风险",
+    "expectedTier": "high",
+    "card": {
+      "goal": "批量改写 8 个文件头",
+      "doneDefinition": "8 个文件都有头",
+      "files": [
+        "a.js"
+      ],
+      "deps": [],
+      "verify": "node --check",
+      "fallback": "逐个回滚",
+      "items": 8
+    }
+  },
+  {
+    "id": "g04",
+    "why": "缺写白名单 → 高风险",
+    "expectedTier": "high",
+    "card": {
+      "goal": "修 README",
+      "doneDefinition": "段落改好",
+      "deps": [],
+      "verify": "diff 非空",
+      "fallback": "git checkout"
+    }
+  },
+  {
+    "id": "g05",
+    "why": "4 个条目正好在上限 → 低风险",
+    "expectedTier": "low",
+    "card": {
+      "goal": "给 4 个测试补用例",
+      "doneDefinition": "4 个新用例",
+      "files": [
+        "test/a.test.js"
+      ],
+      "deps": [],
+      "verify": "node --test",
+      "fallback": "删除新增用例",
+      "items": 4
+    }
+  },
+  {
+    "id": "g06",
+    "why": "缺回退策略 → 高风险",
+    "expectedTier": "high",
+    "card": {
+      "goal": "升级依赖",
+      "doneDefinition": "锁定版本",
+      "files": [
+        "package.json"
+      ],
+      "deps": [],
+      "verify": "npm ci"
+    }
+  },
+  {
+    "id": "g07",
+    "why": "字段全、单条目 → 低风险",
+    "expectedTier": "low",
+    "card": {
+      "goal": "读 retry.js 并总结重试窗口",
+      "doneDefinition": "给出常量值",
+      "files": [],
+      "deps": [],
+      "verify": "引用行号",
+      "fallback": "报告未找到"
+    }
+  },
+  {
+    "id": "g08",
+    "why": "缺完成定义 → 高风险",
+    "expectedTier": "high",
+    "card": {
+      "goal": "清理死代码",
+      "files": [
+        "lib/stage.js"
+      ],
+      "deps": [],
+      "verify": "node --check",
+      "fallback": "git revert"
+    }
+  },
+  {
+    "id": "g09",
+    "why": "2 个条目、字段完整 → 低风险",
+    "expectedTier": "low",
+    "card": {
+      "goal": "对比两份 ADR 的取舍",
+      "doneDefinition": "两条结论",
+      "files": [],
+      "deps": [],
+      "verify": "引用行号",
+      "fallback": "报告缺失",
+      "items": 2
+    }
+  },
+  {
+    "id": "g10",
+    "why": "不可逆写（删库脚本）→ 高风险，即使字段完整",
+    "expectedTier": "high",
+    "card": {
+      "goal": "清空过期会话日志",
+      "doneDefinition": "日志目录为空",
+      "files": [
+        "state/sessions"
+      ],
+      "deps": [],
+      "verify": "目录为空",
+      "fallback": "从备份恢复",
+      "irreversible": true
+    }
+  }
+]

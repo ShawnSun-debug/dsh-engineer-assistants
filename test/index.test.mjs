@@ -195,7 +195,7 @@ function start(options) {
 
 test('a child with a persisted delegation depth is never gated', () => {
   // Regression: a cold-resumed child was gated as a main agent, losing every working
-  // tool and keeping only delegate/orchestrate. Its depth lives in the session header.
+  // tool and keeping only the dispatch entry. Its depth lives in the session header.
   for (const { agent, restricted, guards } of [
     fakeAgent({ header: { delegationDepth: 1 } }),
     fakeAgent({ header: {} , depth: 1 }),
@@ -213,7 +213,7 @@ test('a delegated child gets a short role-neutral description, never the main-ag
   const { created } = start()
   const { agent, registered } = fakeAgent({ header: { delegationDepth: 1 } })
   created({ agent, source: 'resume' })
-  assert.deepEqual(registered.map((tool) => tool.name).sort(), ['delegate', 'orchestrate'])
+  assert.deepEqual(registered.map((tool) => tool.name).sort(), ['dispatch'])
   for (const tool of registered) {
     assert.equal(/main[- ]agent/i.test(tool.description), false, tool.name)
     assert.equal(tool.description.includes('Main-agent rule:'), false, tool.name)
@@ -225,9 +225,9 @@ test('a delegated child gets a short role-neutral description, never the main-ag
 
 test('a child a preset hid delegation from gets no shadow that would defeat the filter', () => {
   const { created } = start()
-  const { agent, registered } = fakeAgent({ header: { delegationDepth: 1 }, hidden: ['delegate'] })
+  const { agent, registered } = fakeAgent({ header: { delegationDepth: 1 }, hidden: ['dispatch'] })
   created({ agent, source: 'resume' })
-  assert.deepEqual(registered.map((tool) => tool.name), ['orchestrate'])
+  assert.deepEqual(registered.map((tool) => tool.name), [])
 })
 
 test('a main agent gets the full rule and no scoped shadows', () => {
@@ -235,10 +235,8 @@ test('a main agent gets the full rule and no scoped shadows', () => {
   const { agent, registered } = fakeAgent()
   created({ agent, source: 'create' })
   assert.deepEqual(registered, [], 'the global pair is enough for a main agent')
-  const delegate = tools.find((tool) => tool.name === 'delegate')
-  const orchestrate = tools.find((tool) => tool.name === 'orchestrate')
-  assert.match(delegate.description, /Main-agent rule: the main agent plans only/)
-  assert.match(orchestrate.description, /Main-agent rule: the main agent plans only/)
+  const dispatch = tools.find((tool) => tool.name === 'dispatch')
+  assert.match(dispatch.description, /Main-agent rule: the main agent plans only/)
 })
 
 test('a panel refresh still re-masks main agents and leaves a child shadow in place', () => {
@@ -253,11 +251,11 @@ test('a panel refresh still re-masks main agents and leaves a child shadow in pl
   const { handlers, created, allowed } = start({ agents: { get: () => undefined, roots } })
   created({ agent: main.agent, source: 'create' })
   created({ agent: child.agent, source: 'startup' })
-  assert.deepEqual(childShadows, ['delegate', 'orchestrate'])
+  assert.deepEqual(childShadows, ['dispatch'])
   allowed.push('read')
   handlers.get('loader/volatile-update')()
   assert.equal(main.mask.has('read'), false, 'the main mask follows the panel write')
-  assert.deepEqual(childShadows, ['delegate', 'orchestrate'], 'a refresh must not register anything else')
+  assert.deepEqual(childShadows, ['dispatch'], 'a refresh must not register anything else')
 })
 
 test('a main agent is restricted and guarded, and its guard refuses the denied list', () => {
@@ -358,24 +356,20 @@ test('the blocked-tools clause follows the effective list without re-registering
   const denied = []
   const allowed = []
   const { tools } = start({ denied, allowed })
-  const delegate = tools.find((tool) => tool.name === 'delegate')
-  const orchestrate = tools.find((tool) => tool.name === 'orchestrate')
+  const dispatch = tools.find((tool) => tool.name === 'dispatch')
   const blockedOf = (tool) => /Blocked for the main agent: ([^.]+)\./.exec(tool.description)?.[1]
-  assert.equal(blockedOf(delegate), mod.DEFAULT_DENIED_TOOLS.join(', '))
-  assert.equal(blockedOf(orchestrate), mod.DEFAULT_DENIED_TOOLS.join(', '))
+  assert.equal(blockedOf(dispatch), mod.DEFAULT_DENIED_TOOLS.join(', '))
 
   allowed.push('read')
-  denied.push('custom_tool', 'delegate', 'orchestrate')
+  denied.push('custom_tool', 'dispatch')
   // Nothing is exempt: the clause names exactly what the gate refuses, so a profile that
   // denies the delegation tools sees them in the prompt too.
   const expected = [
     ...mod.DEFAULT_DENIED_TOOLS.filter((name) => name !== 'read'),
     'custom_tool',
-    'delegate',
-    'orchestrate',
+    'dispatch',
   ].join(', ')
-  assert.equal(blockedOf(delegate), expected)
-  assert.equal(blockedOf(orchestrate), expected)
+  assert.equal(blockedOf(dispatch), expected)
 })
 /** Only the members supervision adapters use, with recording friendly defaults. */
 function fakeSupervisionHost({ parents = new Map(), sessions = new Map(), stateOf, flush } = {}) {

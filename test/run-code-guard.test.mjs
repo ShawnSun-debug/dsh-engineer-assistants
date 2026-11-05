@@ -3,14 +3,14 @@ import test from 'node:test'
 import { findForbiddenIdentifier, runCodeRefusal, RUN_CODE_TOOL } from '../lib/run-code-guard.js'
 
 const ESCALATION =
-  'orchestrator: "run_code" sandbox escalation is not available to the main agent. The main agent only plans; hand every action to a worker with the delegate or orchestrate tools.'
+  'orchestrator: "run_code" sandbox escalation is not available to the main agent. The main agent only plans; hand every action to a worker with the dispatch tool.'
 
 /** A refusal for one host identifier, in the exact wording the guard produces. */
 function refusalFor(name) {
   return (
     'orchestrator: "run_code" cannot reach the Node.js or host runtime ("' +
     name +
-    '"). The main agent only plans; hand every action to a worker with the delegate or orchestrate tools.'
+    '"). The main agent only plans; hand every action to a worker with the dispatch tool.'
   )
 }
 

@@ -5,7 +5,7 @@
 
 **强模型主脑规划 + 便宜模型统一打工 —— DeepSeek Harness 的「硬隔离调度模式」插件**
 
-[![version](https://img.shields.io/badge/version-0.6.2-4176E6?style=flat-square)](https://github.com/SShiRkiT/dsh-orchestrator)
+[![version](https://img.shields.io/badge/version-0.6.5-4176E6?style=flat-square)](https://github.com/SShiRkiT/dsh-orchestrator)
 [![dsh-plugin](https://img.shields.io/badge/DeepSeek%20Harness-dsh--plugin-4176E6?style=flat-square)](https://github.com/deepseek-ai/deepseek-harness)
 [![platform](https://img.shields.io/badge/platform-Web%20GUI%20%7C%20Desktop-5c6bc0?style=flat-square)](https://github.com/SShiRkiT/dsh-orchestrator)
 [![node](https://img.shields.io/badge/node-%3E%3D22-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org)
@@ -28,7 +28,7 @@ DSH 客户端自带了 `subagent` / `workflow`，官方也有 `@deepseek-ai/dsh-
 | **如何省钱配模型？**<br>*(最核心差异)* | **无独立子代理面板**：子代理要么默认继承昂贵的主模型，要么靠主模型每次调用时自己传参选模型（容易忘传或乱选，改默认模型还得改静态配置） | **双路由独立面板 + 强制锁定便宜模型**：在 UI 面板直接把 Main Agent 设为昂贵强模型（如 `gemini-4-argon-high`），把 Subagent 统一锁死为廉价快模型（如 `gemini-3.8-flash`），改完下一次委派立即生效 |
 | **主代理总忍不住自己动手？** | **靠自觉（软提示词）**：主代理 / Team Lead 手里依然握有 `read`、`edit`、`bash` 等全套工具，聊几轮就经常脱轨亲自去读文件、跑命令，瞬间撑爆主上下文 | **底层闸门物理缴械（Hard Gate）**：直接对主代理隐藏并在执行层强制拦截 42 项读写/命令行工具（连 `run_code` 嵌套偷调也拦），**逼迫 Main Agent 100% 只做规划与验收，Subagent 100% 只干苦力活** |
 | **便宜模型干活卡死/跑偏怎么办？** | **运行期黑盒**：派出后只能干等结束或超时，或者靠 `wait_agent` 阻塞轮询 | **零 Token 后台巡检唤醒**：后台定时静默扫描子代理事件日志（不调模型、零 Token 消耗），超时或卡壳时自动汇总摘要唤醒主代理，由强模型发消息精准纠偏 |
-| **大批量同构任务怎么跑？** | 原生 `workflow` 让模型手写任意 JS 脚本，容易失控且模型路由不统一 | **声明式 `orchestrate` 流水线**：`items × stages` 结构化扇出与多阶段流水线，单项失败隔离、支持 JSON Schema 强校验，全部 Worker 强制走便宜的子代理路由 |
+| **大批量同构任务怎么跑？** | 原生 `workflow` 让模型手写任意 JS 脚本，容易失控且模型路由不统一 | **声明式 `dispatch` 流水线**：`items × stages` 结构化扇出与多阶段流水线，单项失败隔离、支持 JSON Schema 强校验，全部 Worker 强制走便宜的子代理路由 |
 
 ---
 
@@ -38,7 +38,7 @@ DSH 客户端自带了 `subagent` / `workflow`，官方也有 `@deepseek-ai/dsh-
 
 在输入框下方的**「调度模式」专属面板**中，主代理与子代理的模型路由完全解耦：
 - **主代理（Main Agent）**：配置为你最强的旗舰模型（例如 `gpt-astra-6`、`claude-opus-5.5` 等），专门负责需求澄清、任务切分、途中纠偏与最终结果验收。
-- **子代理（Subagent）**：配置为能力稍弱但极其便宜、高吞吐的模型（例如 `deepseek-v4.1-flash`、`gpt-luna-6` 等），**所有通过 `delegate` 和 `orchestrate` 派出的 Worker 强制共用这条便宜路由**（除非用户在当前消息里明确点名要求临时换模型）。
+- **子代理（Subagent）**：配置为能力稍弱但极其便宜、高吞吐的模型（例如 `deepseek-v4.1-flash`、`gpt-luna-6` 等），**所有通过 `dispatch` 派出的 Worker 强制共用这条便宜路由**（除非用户在当前消息里明确点名要求临时换模型）。
 - **防烧钱保护**：如果未配置子代理模型，派发时会直接报错拦截，**绝不静默回退去烧昂贵的主代理模型**。
 
 ![调度模式面板](docs/images/dispatch-panel.png)
@@ -48,7 +48,7 @@ DSH 客户端自带了 `subagent` / `workflow`，官方也有 `@deepseek-ai/dsh-
 ### 2. 主代理「规划与验收」、子代理「纯粹 Work」的硬性闸门
 
 不同于靠 Prompt 劝主模型“多用子代理”，本插件在 DSH 工具层安装了双重守卫（`tools.restrict` + `tools.guard`）：
-- **主代理被彻底收缴执行工具**：默认封禁 42 项文件读写（`read` / `edit` / `write` / `apply_patch`）、搜索（`grep` / `glob`）、终端（`bash` / `pwsh`）、网页抓取乃至原生 `subagent` / `workflow`。主代理只保留 `delegate`、`orchestrate`、`send_message`、`interrupt_agent`、`todo_write`、`ask_user_question`、`compress` 与只读会话日志工具。
+- **主代理被彻底收缴执行工具**：默认封禁 42 项文件读写（`read` / `edit` / `write` / `apply_patch`）、搜索（`grep` / `glob`）、终端（`bash` / `pwsh`）、网页抓取乃至原生 `subagent` / `workflow`。主代理只保留 `dispatch`、`send_message`、`interrupt_agent`、`todo_write`、`ask_user_question`、`compress` 与只读会话日志工具。
 - **子代理独享完整工具链**：被派出的 Worker 不受闸门限制，在各自独立的上下文中读写文件、跑测试、看报错，完工后只把干净的结论交回主代理验收。
 - **一键随时切换**：需要主代理临时亲自操作时，关掉面板上的「启用调度模式」开关即可立刻恢复主代理的全部工具，无需重开会话。
 
@@ -65,12 +65,23 @@ DSH 客户端自带了 `subagent` / `workflow`，官方也有 `@deepseek-ai/dsh-
 
 *巡检通知与纠偏实录：便宜的子代理卡在了 shell 引号和反斜杠转义上，巡检机制按间隔唤醒主代理后，主代理通过 `send_message` 直接给出正确写法完成纠偏。*
 
-### 4. 专为调度模式定制的 `delegate` 与 `orchestrate`
+### 4. 唯一派发入口 `dispatch`：任务卡 + 单任务 / 批量
 
-- **`delegate`（按需异步单派 / 并行扇出）**：
-  用于派发自包含的独立任务（目标 + 允许修改的文件 + 验收命令 + 失败兜底）。同一回合多次调用即可同时启动多个 Worker 并行施工；插件会为每个子代理统一注入简体中文回复指令，并要求它在收尾时直接输出最终总结、禁止调用 `send_message` 向父代理汇报（收尾消息会自动送达主代理）。
-- **`orchestrate`（声明式批量流水线）**：
-  用于处理「一组条目（`items`，1–64）× 固定多阶段步骤（`stages`，1–8）」的批量任务，通过 `maxConcurrency`（1–16，默认 4）控制并发。支持单阶段并行扇出与多阶段**逐条目无屏障流水线**（先做完阶段 1 的条目立刻进入阶段 2，不用傻等慢条目），支持阶段级 JSON Schema 强校验与单项失败隔离。
+派发前先交一张**任务卡**：`goal`、`doneDefinition`、`files`、`deps`、`verify`、`fallback`（`items` 可选，默认 1）。缺任一字段、涉及不可逆写或删除、条目数超过 4——任一条成立即判 `high`，必须先过评审；低风险卡直接放行。
+
+- **单任务**：省略 `items` / `stages`，派一个自包含任务。同一回合多次调用即可并行启动多个 Worker；插件统一注入简体中文回复指令，并要求它在收尾时直接输出最终总结、禁止调用 `send_message` 向父代理汇报。
+- **批量**：给定 `items`（1–64）× `stages`（1–8），走 `maxConcurrency`（1–16，默认 4）的逐条目无屏障流水线，支持阶段级 JSON Schema 强校验与单项失败隔离；批量路径当前同步返回全部结果。
+
+> **破坏性变更**：`delegate` 与 `orchestrate` 不再注册，旧提示词里的这两个名字不会被接受。改写方式是「同一句话换成 `dispatch`，再补上任务卡字段」。
+
+### 5. 派发前的盲评闸门与四段流水线
+
+高风险卡在 worker 启动之前，先由一个**零上下文评审者**判一次——它只看任务卡，看不到主代理的对话与推理：
+
+- **三态结论**：`BLOCK` / `IMPROVE` / `PASS`。`PASS` 合法，但必须列出查了哪几项（完成定义、写白名单、验收命令、回退策略），不允许为产出而编造问题。
+- **`BLOCK` 就是停**：一个 worker 都不启动，错误消息带回 `failureMode`（原计划会失败的具体机制）与 `target`，主代理据此重规划；一次派发只评一次，不自动重评、不自动改写。
+- **四段**：`plan → review → dispatch → settle`。`settle` 标记落定、保留会话日志、把该派发从巡检到期集摘除；日志不删，重试与复盘仍能读到原轨迹。
+- **评审路由**：面板里单独一栏，留空即跟随子代理路由；最近一次结论直接显示在面板上。
 
 ---
 
@@ -110,6 +121,9 @@ dsh plugin --profile desktop add SShiRkiT/dsh-orchestrator#main
 | `enabled` | `true` | 调度模式总开关。关闭时立即对当前会话恢复主代理全部工具。 |
 | `workerProvider` / `workerModel` | `""` | 子代理默认模型路由（必填，未配置时派发直接报错，绝不静默继承主代理模型）。 |
 | `workerReasoningEffort` | `""` | 子代理思考强度，留空则由所选模型自行决定默认值。 |
+| `reviewProvider` / `reviewModel` | `""` | 评审者路由。两项都填才覆盖，否则整体跟随子代理路由——不做半套拼路由。 |
+| `reviewReasoningEffort` | `""` | 评审者思考强度，留空由所选模型决定。 |
+| `lastReview` | `""` | 最近一次评审的 `{ verdict, target, at }` 摘要，由插件写入、面板只读。 |
 | `deniedTools` / `allowedTools` | 42 项内置名单 | 主代理禁用/放行的工具清单；面板右侧可直接勾选任意宿主/MCP/插件工具，下一条消息即刻生效。 |
 | `superviseEnabled` | `true` | 子代理后台巡检总开关。 |
 | `superviseIntervalSeconds` | `600` | 巡检间隔（秒），范围 10–86400，运行中修改立即生效。 |

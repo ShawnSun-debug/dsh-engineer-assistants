@@ -720,7 +720,7 @@ test('the description keeps the main-agent rule and states the explicit-request 
     config: cfg(),
     deniedTools: denied,
   })
-  assert.equal(definition.description.startsWith(mainAgentRule(denied, ORCHESTRATE_TOOL)), true)
+  assert.equal(definition.description.startsWith(mainAgentRule(denied)), true)
   assert.match(definition.description, /Blocked for the main agent: edit, read\./)
   assert.match(definition.description, /the main agent plans only/)
   assert.match(definition.description, /runs ONLY in a worker/i)

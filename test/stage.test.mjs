@@ -29,12 +29,14 @@ test('exit_plan_mode outside plan mode does not claim a review', () => {
 test('delegating while planning or awaiting is not execution', () => {
   assert.equal(fold([turn, mode(true), call('subagent')]).stage, 'planning')
   assert.equal(fold([turn, mode(true), call('orchestrate')]).stage, 'planning')
+  assert.equal(fold([turn, mode(true), call('dispatch')]).stage, 'planning')
   assert.equal(fold([turn, mode(true), call('exit_plan_mode'), call('workflow')]).stage, 'awaiting')
 })
 
 test('delegating after approval, or with no plan mode at all, is execution', () => {
   assert.equal(fold([turn, call('subagent')]).stage, 'executing')
   assert.equal(fold([turn, call('orchestrate')]).stage, 'executing')
+  assert.equal(fold([turn, call('dispatch')]).stage, 'executing')
   assert.equal(fold([turn, mode(true), call('exit_plan_mode'), mode(false), call('subagent_fork')]).stage, 'executing')
 })
 

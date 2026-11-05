@@ -67,11 +67,19 @@ test('the tool is concurrency-safe, named delegate, and takes optional route ove
   assert.equal(tool.isConcurrencySafe(), true)
   assert.deepEqual(Object.keys(tool.parameters).sort(), [
     'cwd',
+    'deps',
     'description',
+    'doneDefinition',
+    'fallback',
+    'files',
+    'goal',
+    'irreversible',
     'model',
     'prompt',
     'provider',
     'reasoning_effort',
+    'review',
+    'verify',
   ])
   // The author dialect spells requiredness per property, not as a `required` array.
   assert.equal(tool.parameters.prompt.required, true)
