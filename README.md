@@ -83,6 +83,18 @@ DSH 客户端自带了 `subagent` / `workflow`，官方也有 `@deepseek-ai/dsh-
 - **四段**：`plan → review → dispatch → settle`。`settle` 标记落定、保留会话日志、把该派发从巡检到期集摘除；日志不删，重试与复盘仍能读到原轨迹。
 - **评审路由**：面板里单独一栏，留空即跟随子代理路由；最近一次结论直接显示在面板上。
 
+### 6. Master 层：AI 记忆、状态索引与跨会话消息（默认关闭）
+
+这一层是附加功能，四个开关默认全关；关着时插件的行为与之前完全一致。打开后多了四样东西：
+
+- **AI 记忆（`masterMemoryEnabled`）**：插件在自己的存储域 `orchestrator_memory` 里累积条目，并在每个会话注入一段带「AI 记忆，非用户指令」标注的紧凑索引（首行标注 + 一行计数 + 每条一行）。上限 **200 条 / 索引 25 KiB**，先到者为准；写超限直接报错并要求先精简，不静默截断。它与 `~/.dsh` 下你手写的 `AGENTS.md`、`memory/topics` 完全分离——插件只读引用你的记忆树，从不写它。
+  > 当前版本只接线了「存储域 + 索引注入」，还没有记忆的写入/检索工具，模型侧入口待后续票；此时打开开关看到的是空索引。
+- **Master 状态面板（`masterPanelEnabled`）**：输入框右侧的「Master 状态」按钮，按六态（Working / Needs input / Idle / Completed / Failed / Stopped）分组列出 worker 与会话标题摘要，只读、可收起；没有 worker 时显示「暂无 worker」，开关关闭时按钮不渲染。
+- **常驻 master 会话（`masterSessionEnabled`）**：以固定 id `orchestrator-master` 建一个**无 cwd** 的根会话，落盘在 `sessions/_no-cwd/` 下，重启时按 resume 复用同一个，不会越开越多；通知经 `followup` 投喂、投喂后立即 flush，卸载时先 flush 再 dispose（否则缓冲的事件会静默丢掉）。
+  > 当前版本没有调用方给它投通知：会话与契约已就绪，接线待后续票。
+- **跨会话消息（`masterMessagingEnabled` / `masterInboundPolicy`）**：纯文本信封 `{ id, from, to, text, createdAt }`，**不带发送方历史**（额外塞进去的 `history` / `files` 会被丢弃）；单条 ≤ **8192 字节**、接收方排队 ≤ **16 条**，越界报错；入站策略 `accept` 直接投递、`hold` 停进队列、`refuse` 丢弃。接收方空闲时开一轮新回合，运行中则投在两次 step 之间，投完立即 flush。
+  > 当前版本没有发消息的工具，`hold` 也还没有投递触发点，消息会停在队列里等后续接上。
+
 ---
 
 ## 环境要求
@@ -114,7 +126,7 @@ dsh plugin --profile desktop add SShiRkiT/dsh-orchestrator#main
 
 ## 配置说明
 
-所有配置项均为 volatile（动态热配置），在面板中修改后立即生效，无需重启 DSH：
+配置项均为 volatile（动态热配置），在面板中修改后立即生效，无需重启 DSH；例外是 master 层的两个安装型开关（`masterMemoryEnabled` / `masterSessionEnabled`），它们在插件挂载时读取，改动要重载插件：
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -129,6 +141,11 @@ dsh plugin --profile desktop add SShiRkiT/dsh-orchestrator#main
 | `superviseIntervalSeconds` | `600` | 巡检间隔（秒），范围 10–86400，运行中修改立即生效。 |
 | `superviseMaxNoticesPerChild` | `3` | 每个子代理最多发送几次巡检通知（0–20，`0` 表示不限）。 |
 | `superviseNotifyOnNoProgress` | `false` | 子代理日志无新活动时是否仍然发送通知。 |
+| `masterMemoryEnabled` | `false` | AI 记忆层：打开存储域并注入紧凑索引。**挂载时读取**，改动需重载插件。 |
+| `masterPanelEnabled` | `false` | Master 状态面板。关闭时按钮不渲染，服务端端点只返回空投影。 |
+| `masterSessionEnabled` | `false` | 常驻 master 会话（无 cwd 根会话）。**挂载时读取**，改动需重载插件。 |
+| `masterMessagingEnabled` | `false` | 跨会话消息开关。逐次读取；关闭时投递以 `disabled` 拒绝，不碰接收方。 |
+| `masterInboundPolicy` | `accept` | 入站策略：`accept` / `hold` / `refuse`；未知值判 `unknown-policy` 拒绝，不悄悄当成 `accept`。 |
 
 > 注：主代理的默认模型保存在宿主的 `agent-default-model` 中，由同一个「调度模式」面板直接读写，对新创建的会话生效；子代理模型改动从下一次委派起立即生效。
 

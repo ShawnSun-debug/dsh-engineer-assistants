@@ -2,7 +2,7 @@
   "name": "dsh-orchestrator",
   "version": "0.6.6",
   "private": true,
-  "description": "Main agent that plans and delegates work; orchestrate fans out with pipelines and structured results; long-running workers are supervised by reading session logs",
+  "description": "Main agent that plans and dispatches work through a single dispatch tool; long-running workers are supervised by reading session logs; an optional master layer adds AI memory, a state index and cross-session messages",
   "type": "module",
   "exports": {
     ".": "./lib/index.js",

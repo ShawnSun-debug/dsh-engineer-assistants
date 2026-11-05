@@ -59,6 +59,32 @@ The "dispatch mode" plugin for DeepSeek Harness.
 
     A batch does single-stage fan-out and multi-stage per-item pipelines (no global barrier); one failed item does not sink the others, and a stage can declare an object schema for structured results.
 
+## Master layer (off by default)
+
+This is an add-on: every switch below defaults to off, and while they stay off the plugin behaves exactly as before.
+
+- **AI memory (`masterMemoryEnabled`)**:
+
+    The plugin accumulates entries in its own storage domain `orchestrator_memory` and injects a compact index into every session: a provenance line, a count, then one line per entry. The caps are **200 entries and 25 KiB of rendered index**, whichever comes first; a write that would cross either is refused with an explicit error instead of being truncated, and the error asks for a prune or a shorter entry. It is fully separate from the hand-written `~/.dsh` tree (`AGENTS.md`, `memory/topics`): the plugin reads that tree and never writes it.
+
+    > This version wires the domain and the injection only. There is no memory tool yet, so the injected index stays empty until a later ticket adds the entry point.
+
+- **Master status panel (`masterPanelEnabled`)**:
+
+    A "Master status" button beside the composer groups workers by the six states (`Working` / `Needs input` / `Idle` / `Completed` / `Failed` / `Stopped`), each with the session-title summary. It is read-only, collapsible, says "No workers yet" when empty, and the button is not rendered while the switch is off.
+
+- **Persistent master session (`masterSessionEnabled`)**:
+
+    One **cwd-less** root session with the fixed id `orchestrator-master`, persisted under `sessions/_no-cwd/` and resumed on restart instead of being recreated, so restarts do not pile up masters. Notices go in through `followup` and are flushed right after; unloading flushes before disposing, because a disposed agent does not write its buffered events.
+
+    > This version has no caller that feeds it notices: the session and its contract exist, the wiring comes with a later ticket.
+
+- **Cross-session messages (`masterMessagingEnabled` / `masterInboundPolicy`)**:
+
+    A plain-text envelope `{ id, from, to, text, createdAt }` with **no sender history** (extra `history` / `files` are dropped). One message is at most **8192 bytes** and at most **16** may queue at the receiver; over either bound is an error, not a truncation. The inbound policy is `accept`, `hold` or `refuse`; an unknown value is refused as `unknown-policy`. An idle receiver gets a new turn, a running one gets the text between two steps, and the delivery is flushed at once.
+
+    > This version has no tool that sends a message, and `hold` has no delivery trigger yet, so held messages stay in the queue.
+
 ## Install
 
 Add it from GitHub in the DSH plugin page, or use the CLI:
@@ -86,7 +112,7 @@ After installing, **fully quit and reopen DSH**: client plugins are composed at 
 
 ## Configuration
 
-Every field is volatile: the host stores it and the plugin re-reads it on each use, so changing the configuration needs no restart.
+Every field is volatile: the host stores it and the plugin re-reads it on each use, so changing the configuration needs no restart. The exception is the two install-time master switches (`masterMemoryEnabled`, `masterSessionEnabled`), which are read when the plugin mounts and therefore need a plugin reload.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -104,6 +130,11 @@ Every field is volatile: the host stores it and the plugin re-reads it on each u
 | `superviseIntervalSeconds` | `600` | Supervision interval in seconds, an integer 10–86400. |
 | `superviseMaxNoticesPerChild` | `3` | Most notices per subagent, an integer 0–20; `0` means unlimited. |
 | `superviseNotifyOnNoProgress` | `false` | Whether to also notify when the log has no new activity. |
+| `masterMemoryEnabled` | `false` | AI memory: opens the storage domain and injects the compact index. Read at mount, so changing it needs a plugin reload. |
+| `masterPanelEnabled` | `false` | Master status panel. When off the button is not rendered and the endpoint returns an empty projection. |
+| `masterSessionEnabled` | `false` | Persistent cwd-less master session. Read at mount, so changing it needs a plugin reload. |
+| `masterMessagingEnabled` | `false` | Cross-session messaging. Read per delivery; when off a delivery is refused with `disabled` and the receiver is never touched. |
+| `masterInboundPolicy` | `accept` | `accept` / `hold` / `refuse`; an unknown value is refused as `unknown-policy`, never quietly treated as `accept`. |
 | `toolCatalog` | `[]` | The live tool catalog the plugin publishes: every tool name the host currently offers, which is how the panel lists tools beyond the 42 built-ins (MCP servers and other plugins included). Written by the plugin; do not edit it by hand. |
 
 The main agent's default route is not part of this configuration: it lives in the host's `agent-default-model` (`provider` / `model` / `reasoningEffort`), is written by the same panel, and is read when a new agent is created.
