@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { registerHooks } from 'node:module'
 import test from 'node:test'
 import { denyGuard } from '../lib/gate.js'
+import { MEMORY_DOMAIN_NAME, MEMORY_INDEX_SECTION, MEMORY_SECTION_ORDER } from '../lib/memory.js'
 
 /**
  * `lib/index.js` is the DSH plugin entry, and it imports three packages the host
@@ -36,7 +37,24 @@ const STUBS = {
     export function defineTool(spec) { return spec }
   `,
   zod: `
-    const z = { object: () => ({ strict: () => ({}) }), enum: () => ({}), boolean: () => ({}) }
+    const chain = () => {
+      const node = {}
+      node.default = () => chain()
+      node.min = () => node
+      node.max = () => node
+      node.int = () => node
+      node.nonnegative = () => node
+      node.strict = () => node
+      return node
+    }
+    const z = {
+      object: () => chain(),
+      enum: () => ({}),
+      boolean: () => ({}),
+      string: () => chain(),
+      number: () => chain(),
+      array: () => chain(),
+    }
     export { z }
     export default z
   `,
@@ -64,8 +82,10 @@ function fakeCtx({
   sessions,
   stateOf,
   catalogNames = ['read', 'edit'],
+  memoryEnabled = false,
+  storageDomain,
 } = {}) {
-  const state = { enabled }
+  const state = { enabled, memoryEnabled }
   const projections = []
   const tools = []
   const handlers = new Map()
@@ -73,6 +93,7 @@ function fakeCtx({
   // with the child's parent as carrier, so the retry listener has to be registered global.
   const handlerOptions = new Map()
   const effects = []
+  const sections = []
   const logs = { info: [], warn: [] }
   const emitted = []
   // The live tool catalog the plugin publishes, as a writable volatile reference.
@@ -97,6 +118,13 @@ function fakeCtx({
       view: () => ({ knownNames: new Set(catalogNames), visible: new Map() }),
     },
     subagents: {},
+    systemPrompt: {
+      section(section) {
+        sections.push(section)
+        return () => {}
+      },
+    },
+    storageDomain,
     agents: agents ?? { get: () => undefined },
     sessions: sessions ?? { get: () => undefined, flush: async () => true },
     effect(fn, label) {
@@ -127,6 +155,7 @@ function fakeCtx({
     superviseIntervalSeconds: { get: () => 600 },
     superviseMaxNoticesPerChild: { get: () => 3 },
     superviseNotifyOnNoProgress: { get: () => false },
+    masterMemoryEnabled: { get: () => state.memoryEnabled },
     toolCatalog: catalogRef,
   }
   return {
@@ -140,6 +169,8 @@ function fakeCtx({
     handlers,
     handlerOptions,
     effects,
+    sections,
+    storageDomain,
     logs,
     emitted,
     catalogNames,
@@ -913,4 +944,112 @@ test('the published catalog includes tools a scope registers for a root agent', 
     agents: { get: () => undefined, roots: () => [scoped] },
   })
   assert.deepEqual(harness.catalog(), ['read', 'subagent'])
+})
+
+// ---- Master memory (ticket 01): opt-in domain plus compact index injection ----
+
+/** A domain handle the plugin can open, backed by a Map so writes are observable. */
+function fakeMemoryDomain(seed = []) {
+  const rows = new Map(seed)
+  const opens = []
+  let closes = 0
+  const domain = {
+    name: 'orchestrator_memory',
+    table(name) {
+      return {
+        tableName: name,
+        get: (key) => rows.get(key),
+        entries: () => rows.entries(),
+        keys: () => rows.keys(),
+        get size() {
+          return rows.size
+        },
+        async put(key, value) {
+          rows.set(key, value)
+        },
+        async delete(key) {
+          return rows.delete(key)
+        },
+        async deleteMany(keys) {
+          let removed = 0
+          for (const key of keys) if (rows.delete(key)) removed += 1
+          return removed
+        },
+      }
+    },
+    async close() {
+      closes += 1
+    },
+  }
+  const storageDomain = {
+    opens,
+    async open(spec) {
+      opens.push(spec)
+      return domain
+    },
+  }
+  return { storageDomain, rows, opens, closes: () => closes }
+}
+
+const memoryRecord = (id, text, updatedAt = 1) => ({ id, text, tags: [], createdAt: updatedAt, updatedAt })
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+test('the master memory switch is off by default: no domain opens and no section is injected', async () => {
+  const memory = fakeMemoryDomain()
+  const harness = start({ storageDomain: memory.storageDomain })
+  await settle()
+  assert.equal(memory.opens.length, 0)
+  assert.equal(harness.sections.length, 0)
+
+  // A config that lacks the key at all is the same answer: the feature stays off.
+  delete harness.config.masterMemoryEnabled
+  assert.equal(await mod.attachMasterMemory(harness.ctx, harness.config), undefined)
+  await settle()
+  assert.equal(memory.opens.length, 0)
+  assert.equal(harness.sections.length, 0)
+})
+
+test('the master memory switch opens the domain and injects a labelled live index', async () => {
+  const memory = fakeMemoryDomain([['mem-1', memoryRecord('mem-1', '用户偏好：worker 用简体中文')]])
+  const harness = start({ memoryEnabled: true, storageDomain: memory.storageDomain })
+  await settle()
+
+  assert.equal(memory.opens.length, 1)
+  assert.equal(memory.opens[0].name, MEMORY_DOMAIN_NAME)
+  assert.equal(harness.sections.length, 1)
+  const [section] = harness.sections
+  assert.equal(section.name, MEMORY_INDEX_SECTION)
+  assert.equal(section.order, MEMORY_SECTION_ORDER)
+  const text = section.text()
+  assert.match(text, /AI 记忆/)
+  assert.match(text, /非用户指令/)
+  assert.match(text, /worker 用简体中文/)
+
+  // The callback reads the domain at assembly time, not at registration time.
+  memory.rows.set('mem-2', memoryRecord('mem-2', '新沉淀的事实', 2))
+  assert.match(section.text(), /新沉淀的事实/)
+
+  // Unload closes the domain the plugin opened.
+  const owned = harness.effects.find(({ label }) => label === 'orchestrator: master memory domain')
+  assert.ok(owned, 'the opened domain is owned by an effect')
+  owned.dispose()
+  await settle()
+  assert.equal(memory.closes(), 1)
+})
+
+test('a host without a usable storage domain degrades explicitly and injects nothing', async () => {
+  const missing = start({ memoryEnabled: true })
+  await settle()
+  assert.equal(missing.sections.length, 0, 'no domain, no injected section')
+  assert.match(missing.logs.warn.join('\n'), /storageDomain|storage-domain/)
+
+  const broken = fakeMemoryDomain()
+  broken.storageDomain.open = async () => {
+    throw new Error('backend-not-found')
+  }
+  const failed = start({ memoryEnabled: true, storageDomain: broken.storageDomain })
+  await settle()
+  assert.equal(failed.sections.length, 1, 'the section registration survives, it is empty')
+  assert.equal(failed.sections[0].text(), '')
+  assert.match(failed.logs.warn.join('\n'), /backend-not-found/)
 })
