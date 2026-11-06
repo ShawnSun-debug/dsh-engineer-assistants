@@ -337,11 +337,11 @@ test('saveRoute surfaces a rejected write and a write that did not land', async 
   assert.equal(await T.saveRoute(dropped, T.MAIN.fields, { provider: 'p', model: 'm', effort: '' }, t), 'route.saveFailed')
 })
 
-test('apply puts the toggle in the left slot, the picker in input.right and the secretary view in main + sidebar', () => {
+test('apply leaves only the plan toggle in the composer, registers the settings page, and keeps the secretary seats', () => {
   const regs = []
   const ctx = {
     effect: (fn) => fn(),
-    locale: { register: () => {} },
+    locale: { register: () => {}, bind: () => (key) => key },
     configForms: { get: (ns) => ({ ns }) },
     remote: {
       commands: { execute: async () => ({ ok: true, value: 'x' }) },
@@ -352,23 +352,46 @@ test('apply puts the toggle in the left slot, the picker in input.right and the 
   }
   mod.apply(ctx)
   assert.deepEqual(regs.map((r) => [r.opts.name, r.opts.id, r.opts.order]), [
+    // The composer keeps one plugin control: the plan toggle. The dispatch entry point and
+    // its whitelist panel moved into the settings page, so nothing targets input.right.
     ['conversation.input.left', 'orchestrator-plan-toggle', 20],
-    ['conversation.input.right', 'orchestrator-route-picker', 11],
+    ['settings.section', 'orchestrator', 30],
     // The secretary view: one keyless-identity registration into the main seat, then the sidebar
     // row that selects it by the same id.
     ['main', undefined, undefined],
     ['sidebar.panellist', 'secretary', 40],
   ])
-  // Ticket 10 retired the legacy master panel: no slot carries its id any more, and the two
-  // secretary seats are the only other registrations apply makes.
+  // Ticket 10 retired the legacy master panel: no slot carries its id any more.
   assert.equal(regs.some((r) => r.opts.id === 'orchestrator-master-panel'), false)
   assert.deepEqual(
     regs.filter((r) => r.opts.id === 'secretary' || r.opts.key === 'secretary').map((r) => r.opts.name),
     ['main', 'sidebar.panellist'],
   )
-  const props = regs[1].opts.inject('S1')
-  assert.deepEqual([props.scopes.main.ns, props.scopes.worker.ns, props.scopes.orch.ns], ['agent-default-model', 'orchestrator', 'orchestrator'])
-  assert.equal(props.setPlan, undefined)
+  // The composer's plugin controls are down to the plan toggle: the route picker and the
+  // allowed-tools column no longer register anywhere in the input area.
+  const composer = regs.filter((r) => String(r.opts.name).startsWith('conversation.input.'))
+  assert.deepEqual(
+    composer.map((r) => [r.opts.name, r.opts.id]),
+    [['conversation.input.left', 'orchestrator-plan-toggle']],
+  )
+  assert.equal(regs.some((r) => r.opts.name === 'conversation.input.right'), false)
+  assert.equal(regs.some((r) => r.opts.id === 'orchestrator-route-picker'), false)
+
+  // The settings section registration follows the host contract: list-slot identity in
+  // `id` (the key the nav selects), a locale-following `label` thunk, and its own inject face.
+  const settings = regs.find((r) => r.opts.name === 'settings.section')
+  assert.equal(settings.opts.id, 'orchestrator')
+  assert.equal(settings.opts.order, 30)
+  assert.equal(settings.opts.locale, 'orchestrator')
+  assert.equal(settings.opts.label(), 'section.title')
+  assert.equal(settings.comp, T.OrchestratorSettingsSection)
+  const pageProps = settings.opts.inject()
+  assert.deepEqual(
+    [pageProps.scopes.main.ns, pageProps.scopes.worker.ns, pageProps.scopes.orch.ns],
+    ['agent-default-model', 'orchestrator', 'orchestrator'],
+  )
+  assert.equal(pageProps.orch, pageProps.scopes.orch)
+  assert.equal(typeof pageProps.loadCatalog, 'function')
   assert.deepEqual(plain(mod.inject), [
     'slots',
     'locale',
@@ -930,30 +953,17 @@ test('a rejected write is reported without dropping the stored state', async () 
   assert.equal(row().kids[0].props.checked, true)
 })
 
-test('the popover is two columns, the original panel then the allowed tools column', () => {
-  const scopes = { main: fakeScope(), worker: fakeScope(), orch: fakeScope() }
-  const view = mount(T.RoutePicker, {
-    t,
-    scopes,
-    orch: scopes.orch,
-    loadCatalog: async () => ({ ok: true, value: { groups: [] } }),
-  })
-  // The popover only exists while open; the trigger is the only button before that.
-  nodes(view.tree).find((node) => node.type === 'button').props.onClick()
-  const dialog = nodes(view.tree).find((node) => node.props?.role === 'dialog')
-  assert.ok(dialog)
-  assert.equal(dialog.kids.length, 2)
-  const [left, right] = dialog.kids
-  assert.equal(left.type, 'div')
-  assert.equal(left.props.style.width, '340px')
-  assert.match(left.props.style.borderRight, /^1px solid/)
-  assert.equal(right.type, T.AllowedToolsPanel)
-  assert.equal(right.props.scope, scopes.orch)
-  // The enable row is label-then-switch, and the switch is the new component.
-  const switchRow = nodes(left).find((node) => node.type === T.EnableSwitch)
-  assert.ok(switchRow)
-  assert.equal(switchRow.props.label, 'route.enable')
-  view.unmount()
+test('the composer popover is gone, and the whitelist stands alone as a settings card', () => {
+  // The two-column popover, its trigger and its component are gone from the bundle.
+  assert.equal(src.includes('orchestrator-route-picker'), false)
+  assert.equal(src.includes('function RoutePicker'), false)
+  assert.equal('RoutePicker' in T, false, '__test still exports RoutePicker')
+  // The allowed-tools panel survives as a full-width card: no fixed column, no divider, one box.
+  const panel = mountAllowed(fakeScope())
+  assert.equal(panel.view.tree.props.style.width, undefined)
+  assert.equal(panel.view.tree.props.style.borderRight, undefined)
+  assert.match(panel.view.tree.props.style.border, /^1px solid/)
+  assert.equal(panel.rows().length, HOST_DEFAULT_ALLOWED_TOOLS.length)
 })
 
 
@@ -1147,36 +1157,18 @@ function textOf(node) {
   return textOf(node.kids) + ' ' + textOf(props.title ?? '') + ' ' + textOf(props.children ?? '')
 }
 
-test('the panel shows a review route row and the last verdict', async () => {
-  const { RoutePicker } = mod.__test
+test('the settings page shows a review route row and the last verdict', async () => {
   const mainScope = fakeScope({ initial: { provider: 'p', model: 'm', reasoningEffort: '' } })
   const workerScope = fakeScope({ initial: { workerProvider: 'wp', workerModel: 'wm', workerReasoningEffort: '' } })
   const orchScope = fakeScope({ initial: { enabled: true, lastReview: JSON.stringify({ verdict: 'BLOCK', target: 'verify', at: 1 }) } })
 
-  const view = mount(RoutePicker, {
+  const view = mount(T.OrchestratorSettingsSection, {
     t: (key) => key,
     scopes: { main: mainScope, worker: workerScope, orch: orchScope },
     orch: orchScope,
     loadCatalog: async () => ({ ok: true, value: { groups: [{ id: 'wp', name: 'WP', models: [{ id: 'wm', name: 'WM' }] }] } }),
   })
-
-  // 打开面板：找到那颗标题为 route.title 的按钮并触发它的 onClick
-  const findButton = (node) => {
-    if (node === null || typeof node !== 'object') return null
-    if (Array.isArray(node)) {
-      for (const child of node) {
-        const hit = findButton(child)
-        if (hit !== null) return hit
-      }
-      return null
-    }
-    if (node.props?.title === 'route.title') return node
-    return findButton(node.kids)
-  }
-  const button = findButton(view.tree)
-  assert.ok(button, 'the picker must render its trigger button')
-  // 状态更新后 hook shim 会自己重渲染；目录加载的 promise 随后到达，再跑一轮
-  button.props.onClick()
+  // The page fetches the catalog on mount; the promise lands after a few microtasks.
   for (let i = 0; i < 5; i += 1) await Promise.resolve()
 
   const text = textOf(view.tree)
@@ -1184,6 +1176,111 @@ test('the panel shows a review route row and the last verdict', async () => {
   assert.match(text, /route\.lastReview/, 'the last verdict line must be rendered')
   assert.match(text, /BLOCK/, 'the verdict itself must be visible')
   assert.match(text, /verify/, 'the reviewed field must be visible')
+  view.unmount()
+})
+
+// ---- The plugin settings page --------------------------------------------------------
+
+/** Mount the settings page over three writable scopes and a one-provider catalog. */
+function mountSettings({ groups = [{ id: 'nexus-deepseek', name: 'Nexus DeepSeek', models: [{ id: 'flash', name: 'Flash' }] }] } = {}) {
+  const scopes = { main: fakeScope(), worker: fakeScope(), orch: fakeScope() }
+  const view = mount(T.OrchestratorSettingsSection, {
+    t,
+    scopes,
+    orch: scopes.orch,
+    loadCatalog: async () => ({ ok: true, value: { groups } }),
+  })
+  return { view, scopes, groups }
+}
+
+test('the settings page has four zones and gives every control the scope it writes', async () => {
+  const { view, scopes } = mountSettings()
+  await flush()
+  const tree = view.tree
+  // A section element, addressed for the host and for a test, is the page root.
+  assert.equal(tree.type, 'section')
+  assert.equal(tree.props['data-testid'], 'orchestrator-settings')
+  const zones = nodes(tree).filter((node) => node.props?.['data-zone'] !== undefined)
+  assert.deepEqual(zones.map((zone) => zone.props['data-zone']), ['enable', 'routes', 'allowed', 'supervise'])
+  for (const key of ['section.title', 'section.enable', 'section.routes', 'section.allowed', 'section.supervise']) {
+    assert.equal(textOf(tree).includes(key), true, key)
+  }
+
+  // The dispatch switch shows the stored value and is wired to the plugin entry.
+  const sw = nodes(tree).find((node) => node.type === T.EnableSwitch)
+  assert.ok(sw)
+  assert.equal(sw.props.checked, false)
+  assert.equal(sw.props.label, 'route.enable')
+
+  // The three route rows are in the routes zone, in the same order as the old panel.
+  const rows = nodes(tree).filter((node) => node.type === T.RouteRow)
+  assert.deepEqual(rows.map((row) => row.props.label), ['route.main', 'route.worker', 'route.review'])
+
+  // The whitelist and the interval field both read and write this plugin's own config entry.
+  const allowed = nodes(tree).find((node) => node.type === T.AllowedToolsPanel)
+  const interval = nodes(tree).find((node) => node.type === T.SuperviseIntervalField)
+  assert.equal(allowed.props.scope, scopes.orch)
+  assert.equal(interval.props.scope, scopes.orch)
+
+  // The page title is the copy that used to label the composer button, not an orphan key.
+  assert.equal(T.zh['section.title'], '调度模式')
+  assert.equal('route.button' in T.zh, false)
+  assert.equal('route.button' in T.en, false)
+  view.unmount()
+})
+
+test('settings-page controls write the same config keys the composer panel wrote', async () => {
+  const { view, scopes } = mountSettings()
+  await flush()
+
+  // 1. The switch stores enabled in the plugin entry.
+  const sw = () => nodes(view.tree).find((node) => node.type === T.EnableSwitch)
+  await sw().props.onChange(true)
+  assert.deepEqual(plain(scopes.orch.calls[0].ops), [{ op: 'set', path: ['enabled'], value: true }])
+  assert.equal(scopes.orch.calls[0].expected, 1)
+
+  // 2. The main row writes the host's agent-default-model entry, effort included.
+  const rows = () => nodes(view.tree).filter((node) => node.type === T.RouteRow)
+  await rows()[0].props.onChange({ provider: 'nexus-deepseek', model: 'flash', effort: 'high' })
+  assert.deepEqual(plain(scopes.main.calls[0].ops), [
+    { op: 'set', path: ['provider'], value: 'nexus-deepseek' },
+    { op: 'set', path: ['model'], value: 'flash' },
+    { op: 'set', path: ['reasoningEffort'], value: 'high' },
+  ])
+
+  // 3. The worker row writes the plugin's worker fields; no effort stores the empty string
+  //    so the bundled default cannot come back through an unset.
+  await rows()[1].props.onChange({ provider: 'p', model: 'm', effort: '' })
+  assert.deepEqual(plain(scopes.worker.calls[0].ops), [
+    { op: 'set', path: ['workerProvider'], value: 'p' },
+    { op: 'set', path: ['workerModel'], value: 'm' },
+    { op: 'set', path: ['workerReasoningEffort'], value: '' },
+  ])
+
+  // 4. The reviewer row writes the review fields in the same plugin entry.
+  await rows()[2].props.onChange({ provider: 'p2', model: 'm2', effort: 'low' })
+  assert.deepEqual(plain(scopes.orch.calls[1].ops), [
+    { op: 'set', path: ['reviewProvider'], value: 'p2' },
+    { op: 'set', path: ['reviewModel'], value: 'm2' },
+    { op: 'set', path: ['reviewReasoningEffort'], value: 'low' },
+  ])
+  view.unmount()
+})
+
+test('the settings page reports a failed catalog read instead of hiding the routes silently', async () => {
+  const scopes = { main: fakeScope(), worker: fakeScope(), orch: fakeScope() }
+  const view = mount(T.OrchestratorSettingsSection, {
+    t,
+    scopes,
+    orch: scopes.orch,
+    loadCatalog: async () => ({ ok: false, error: { message: 'no catalog' } }),
+  })
+  await flush()
+  const alert = nodes(view.tree).find((node) => node.props?.role === 'alert')
+  assert.equal(alert.kids[0], 'route.catalogFailed')
+  // No route rows without a catalog, but the switch, whitelist and interval stay usable.
+  assert.equal(nodes(view.tree).some((node) => node.type === T.RouteRow), false)
+  assert.ok(nodes(view.tree).some((node) => node.type === T.AllowedToolsPanel))
   view.unmount()
 })
 
