@@ -343,6 +343,10 @@ test('apply puts the toggle in the left slot, the picker and the master panel in
     ['conversation.input.left', 'orchestrator-plan-toggle', 20],
     ['conversation.input.right', 'orchestrator-route-picker', 11],
     ['conversation.input.right', 'orchestrator-master-panel', 12],
+    // The secretary view: one keyless-identity registration into the main seat, then the sidebar
+    // row that selects it by the same id.
+    ['main', undefined, undefined],
+    ['sidebar.panellist', 'secretary', 40],
   ])
   const props = regs[1].opts.inject('S1')
   assert.deepEqual([props.scopes.main.ns, props.scopes.worker.ns, props.scopes.orch.ns], ['agent-default-model', 'orchestrator', 'orchestrator'])
@@ -355,7 +359,16 @@ test('apply puts the toggle in the left slot, the picker and the master panel in
   // The loader is wired to the ctx (not ctx.remote) and reads the namespace through ctx.get;
   // a `remote.orchestratorMaster` property read would throw "cannot get property … without inject".
   assert.deepEqual(plain(await master.loadState()), projection)
-  assert.deepEqual(plain(mod.inject), ['slots', 'locale', 'remote', 'remote.commands', 'remote.session', 'configForms'])
+  assert.deepEqual(plain(mod.inject), [
+    'slots',
+    'locale',
+    'remote',
+    'remote.commands',
+    'remote.session',
+    'configForms',
+    'layout',
+    'uiWorkspace',
+  ])
 })
 
 test('filterGroups matches provider names wholesale and model ids or names otherwise', () => {
@@ -1387,3 +1400,671 @@ test('the panel reads through the real loader and the host mount, not an injecte
   assert.match(text, /Working · 1/)
   view.unmount()
 })
+
+// ---- 秘书视图（票 07） -------------------------------------------------------------------
+//
+// The view reads the ticket-06 payload and nothing else. These cases mount the real components
+// over the same hook shim the master-panel cases use, so a regression in the mapping, the empty
+// state or the error path fails here instead of only in the browser.
+
+/** A payload with one waiting session, one running one, a report and a conflict row. */
+function secretaryPayload(overrides = {}) {
+  return Object.assign(
+    {
+      enabled: true,
+      registry: {
+        masterSessionId: 'm-1',
+        orchestrators: [
+          { sessionId: 's-1', title: '构建视图', workspace: 'D:\\w', trackedAt: 1 },
+          { sessionId: 's-2', title: '收尾', workspace: '', trackedAt: 2 },
+        ],
+        conflict: { masterSessionId: 'm-1', conflictingOrchestratorIds: ['s-9'] },
+      },
+      orchestrators: [
+        {
+          sessionId: 's-1',
+          title: '构建视图',
+          workspace: 'D:\\w',
+          live: true,
+          state: 'Needs input',
+          step: { index: 2, total: 5, done: false },
+          workers: [
+            { id: 'w-1', state: 'Working', summary: '写测试' },
+            { id: 'w-2', state: 'Idle', summary: '' },
+          ],
+          beats: { count: 3, startedAt: 1, capped: false, stoppedReason: null },
+          lastReport: { path: 'r/1.md', at: 1700000000000, kind: 'delta' },
+          lastError: null,
+        },
+        {
+          sessionId: 's-2',
+          title: '收尾',
+          workspace: '',
+          live: true,
+          state: 'Working',
+          step: { index: 1, total: 3, done: false },
+          workers: [{ id: 'w-3', state: 'Working', summary: '整理提交' }],
+          beats: { count: 1, startedAt: 2, capped: false, stoppedReason: null },
+          lastReport: null,
+          lastError: null,
+        },
+      ],
+      reports: [
+        {
+          sessionId: 's-1',
+          at: 1700000000000,
+          kind: 'delta',
+          path: 'r/1.md',
+          bytes: 10,
+          changes: [
+            '进度：第 3 步 / 共 5 步',
+            '写测试：完成',
+            '会话进入 Needs input',
+            '会话：Idle → Working',
+            '一句对不上模板的话',
+          ],
+          error: null,
+        },
+      ],
+      drafts: [],
+      policy: {
+        beatSeconds: 180,
+        maxRunSeconds: 7200,
+        notifyOn: { state: true, step: true, block: true, deliverable: true, timeout: true },
+        promptText: '',
+        reportsRoot: '.scratch/master-secretary/reports',
+        viewReportLimit: 50,
+      },
+    },
+    overrides,
+  )
+}
+
+/** Mount the panel over the hook shim; the scope is enabled unless a case says otherwise. */
+function mountSecretary({ payload = secretaryPayload(), loadState, scope, openSession, mutate } = {}) {
+  return mount(mod.__test.SecretaryPanel, {
+    t,
+    orch: scope ?? fakeScope({ initial: { secretaryEnabled: true } }),
+    loadState: loadState ?? (async () => payload),
+    openSession,
+    mutate,
+  })
+}
+
+/** The node carrying a data-testid, or undefined. */
+function byTestId(tree, id) {
+  return nodes(tree).find((node) => node.props?.['data-testid'] === id)
+}
+
+/**
+ * The tab panel's body. The shim renders one component per mount, so a child component stays an
+ * element node here: its type is what a panel-level case can assert, and its own cases mount it
+ * directly.
+ */
+function bodyOf(tree) {
+  const panel = nodes(tree).find((node) => node.props?.role === 'tabpanel')
+  return panel === undefined ? undefined : panel.kids[0]
+}
+
+test('the three tabs are the fixed vocabulary and both dictionaries label them', () => {
+  const tabs = plain(T.secretaryTabsOf())
+  assert.deepEqual(tabs.map((tab) => tab.id), ['overview', 'history', 'settings'])
+  for (const tab of tabs) {
+    for (const dict of [T.zh, T.en]) {
+      assert.equal(typeof dict[tab.labelKey], 'string', tab.labelKey)
+      assert.ok(dict[tab.labelKey].length > 0, tab.labelKey)
+    }
+  }
+  // Both dictionaries carry the same secretary keys, so a language switch never shows a raw key.
+  const zhKeys = Object.keys(T.zh)
+    .filter((key) => key.startsWith('secretary.'))
+    .sort()
+  const enKeys = Object.keys(T.en)
+    .filter((key) => key.startsWith('secretary.'))
+    .sort()
+  assert.deepEqual(zhKeys, enKeys)
+  assert.ok(zhKeys.length > 40)
+})
+
+test('the secretary contribution mirrors the master one: src-json, zero parameters', () => {
+  const [descriptor] = T.SECRETARY_CONTRIBUTION.descriptors
+  assert.deepEqual(plain(descriptor.result), { mode: 'src-json' })
+  assert.deepEqual(plain(descriptor.parameters), [])
+  assert.equal(descriptor.id, 'dsh-orchestrator-secretary#orchestratorSecretary/secretaryState')
+  assert.equal(descriptor.service, 'orchestratorSecretary')
+  assert.equal(descriptor.namespace, 'orchestratorSecretary')
+  assert.equal(descriptor.method, 'secretaryState')
+})
+
+test('the three tabs switch, keep aria-selected honest, and answer the arrow keys', async () => {
+  const view = mountSecretary()
+  await flush()
+  const tab = (id) => byTestId(view.tree, 'orchestrator-secretary-tab-' + id)
+  const panel = () => nodes(view.tree).find((node) => node.props?.role === 'tabpanel')
+
+  assert.deepEqual(
+    ['overview', 'history', 'settings'].map((id) => tab(id).props['aria-selected']),
+    [true, false, false],
+  )
+  assert.equal(tab('overview').props.role, 'tab')
+  assert.equal(nodes(view.tree).find((node) => node.props?.role === 'tablist') !== undefined, true)
+  assert.equal(panel().props['aria-labelledby'], 'orchestrator-secretary-tab-overview')
+
+  tab('history').props.onClick()
+  assert.deepEqual(
+    ['overview', 'history', 'settings'].map((id) => tab(id).props['aria-selected']),
+    [false, true, false],
+  )
+  assert.equal(panel().props.id, 'orchestrator-secretary-panel-history')
+  assert.equal(panel().props['aria-labelledby'], 'orchestrator-secretary-tab-history')
+
+  // Left/right walk the strip and wrap at both ends; the focused tab is the selected one.
+  tab('history').props.onKeyDown({ key: 'ArrowRight', preventDefault() {} })
+  assert.equal(tab('settings').props['aria-selected'], true)
+  tab('settings').props.onKeyDown({ key: 'ArrowRight', preventDefault() {} })
+  assert.equal(tab('overview').props['aria-selected'], true)
+  tab('overview').props.onKeyDown({ key: 'ArrowLeft', preventDefault() {} })
+  assert.equal(tab('settings').props['aria-selected'], true)
+  tab('settings').props.onKeyDown({ key: 'Home', preventDefault() {} })
+  assert.equal(tab('overview').props['aria-selected'], true)
+  tab('overview').props.onKeyDown({ key: 'End', preventDefault() {} })
+  assert.equal(tab('settings').props['aria-selected'], true)
+  // Any other key leaves the selection alone.
+  tab('settings').props.onKeyDown({ key: 'a', preventDefault() {} })
+  assert.equal(tab('settings').props['aria-selected'], true)
+  view.unmount()
+})
+
+test('nothing registered renders the guide instead of a blank panel', async () => {
+  const payload = secretaryPayload({
+    registry: { masterSessionId: '', orchestrators: [], conflict: null },
+    orchestrators: [],
+    reports: [],
+  })
+  const view = mountSecretary({ payload })
+  await flush()
+  const empty = byTestId(view.tree, 'orchestrator-secretary-empty')
+  assert.ok(empty, 'the empty state is a visible element')
+  assert.match(textOf(empty), /secretary\.empty/)
+  assert.equal(nodes(view.tree).some((node) => node.props?.role === 'alert'), false)
+  // The tabs stay reachable: the copy points at the Settings tab, which must be clickable.
+  byTestId(view.tree, 'orchestrator-secretary-tab-settings').props.onClick()
+  assert.equal(byTestId(view.tree, 'orchestrator-secretary-empty'), undefined)
+  assert.equal(bodyOf(view.tree).type, T.SecretarySettings)
+  view.unmount()
+})
+
+test('a failed read is an alert with a retry, never a silent blank', async () => {
+  let calls = 0
+  const view = mountSecretary({
+    loadState: async () => {
+      calls += 1
+      if (calls === 1) throw new Error('secretary endpoint is down')
+      return secretaryPayload()
+    },
+  })
+  await flush()
+  const failed = byTestId(view.tree, 'orchestrator-secretary-failed')
+  assert.ok(failed, 'the failure is rendered')
+  assert.equal(failed.props.role, 'alert')
+  assert.match(textOf(failed), /secretary\.failed/)
+  assert.match(textOf(failed), /secretary endpoint is down/)
+  const retry = byTestId(view.tree, 'orchestrator-secretary-retry')
+  assert.ok(retry, 'the alert carries a retry')
+
+  retry.props.onClick()
+  await flush()
+  assert.equal(calls, 2, 'the retry really reads the endpoint again')
+  assert.equal(byTestId(view.tree, 'orchestrator-secretary-failed'), undefined)
+  assert.equal(byTestId(view.tree, 'orchestrator-secretary-loading'), undefined)
+  assert.equal(bodyOf(view.tree).type, T.SecretaryOverview)
+  view.unmount()
+})
+
+test('the overview maps the payload to its blockers, its current run and its worker rows', () => {
+  const opened = []
+  const view = mount(T.SecretaryOverview, {
+    t,
+    payload: secretaryPayload(),
+    width: 1200,
+    openSession: (sessionId) => opened.push(sessionId),
+  })
+  const text = textOf(view.tree)
+
+  // The waiting session is a blocker, and the conflict row is the warning above them.
+  const blocker = byTestId(view.tree, 'orchestrator-secretary-blocker-s-1')
+  assert.ok(blocker, 'a session waiting for input is a blocker')
+  assert.match(textOf(blocker), /secretary\.reason\.needsInput/)
+  assert.match(textOf(blocker), /构建视图/)
+  assert.match(textOf(byTestId(view.tree, 'orchestrator-secretary-conflict')), /s-9/)
+
+  // The current run is the Working row, with its step label and its worker table.
+  const current = byTestId(view.tree, 'orchestrator-secretary-current')
+  assert.match(textOf(current), /收尾/)
+  assert.match(textOf(current), /1\/3/)
+  const worker = byTestId(view.tree, 'orchestrator-secretary-worker-w-3')
+  assert.ok(worker, 'the running session lists its workers')
+  assert.match(textOf(worker), /整理提交/)
+  assert.match(textOf(worker), /Working/)
+
+  // The tracker tree carries both registered rows, grouped by workspace.
+  assert.ok(byTestId(view.tree, 'orchestrator-secretary-row-s-1'))
+  assert.ok(byTestId(view.tree, 'orchestrator-secretary-row-s-2'))
+  assert.match(text, /secretary\.workspaceNone/)
+  // A worker with no summary still gets a row, with the placeholder instead of an empty cell.
+  const quiet = mount(T.SecretaryOverview, {
+    t,
+    width: 1200,
+    payload: secretaryPayload({
+      orchestrators: [
+        {
+          sessionId: 's-2',
+          title: '收尾',
+          live: true,
+          state: 'Working',
+          step: null,
+          workers: [{ id: 'w-9', state: 'Idle', summary: '' }],
+        },
+      ],
+    }),
+  })
+  assert.match(textOf(byTestId(quiet.tree, 'orchestrator-secretary-worker-w-9')), /secretary\.workerSummaryEmpty/)
+
+  // A live row opens its session; the Master is marked in the tree.
+  byTestId(view.tree, 'orchestrator-secretary-row-s-1').props.onClick()
+  assert.deepEqual(opened, ['s-1'])
+  // Without the host's uiWorkspace every jump is disabled instead of throwing.
+  const noHost = mount(T.SecretaryOverview, { t, payload: secretaryPayload(), width: 1200 })
+  assert.equal(byTestId(noHost.tree, 'orchestrator-secretary-row-s-1').props.disabled, true)
+  assert.match(byTestId(noHost.tree, 'orchestrator-secretary-row-s-1').props.title, /secretary\.rowDisabled/)
+  // An ended session keeps its row but cannot be opened.
+  const ended = mount(T.SecretaryOverview, {
+    t,
+    width: 1200,
+    openSession: () => {},
+    payload: secretaryPayload({
+      registry: { masterSessionId: '', orchestrators: [{ sessionId: 'gone', title: '旧的', workspace: '' }], conflict: null },
+      orchestrators: [{ sessionId: 'gone', title: '旧的', live: false, state: 'Completed', step: null, workers: [] }],
+    }),
+  })
+  assert.equal(byTestId(ended.tree, 'orchestrator-secretary-row-gone').props.disabled, true)
+  assert.match(textOf(byTestId(ended.tree, 'orchestrator-secretary-row-gone')), /secretary\.ended/)
+})
+
+test('the blockers and the tracker rows come from the payload, not from the view', () => {
+  const payload = secretaryPayload()
+  const blockers = plain(T.secretaryBlockersOf(payload))
+  assert.deepEqual(
+    blockers.map((blocker) => [blocker.sessionId, blocker.reason]),
+    [['s-1', 'needsInput']],
+  )
+  // A loud failure and a stopped beat are blockers too; a pending draft is one as well.
+  const more = plain(
+    T.secretaryBlockersOf({
+      orchestrators: [
+        { sessionId: 'x', title: '坏掉的', state: 'Idle', lastError: 'boom', beats: { capped: false } },
+        { sessionId: 'y', title: '超时的', state: 'Idle', lastError: null, beats: { capped: true, stoppedReason: '达到上限' } },
+        { sessionId: 'z', title: '安静的', state: 'Idle', lastError: null, beats: { capped: false } },
+      ],
+      drafts: [
+        { id: 'd-1', targetSessionId: 'x', targetTitle: '坏掉的', reason: '等待拍板', status: 'pending' },
+        { id: 'd-2', targetSessionId: 'x', reason: '已发过', status: 'sent' },
+      ],
+    }),
+  )
+  assert.deepEqual(
+    more.map((blocker) => [blocker.sessionId, blocker.reason]),
+    [
+      ['x', 'error'],
+      ['y', 'capped'],
+      ['x', 'draft'],
+    ],
+  )
+  assert.equal(more[0].text, 'boom')
+  assert.equal(more[1].text, '达到上限')
+
+  const rows = plain(T.secretaryRowsOf(payload))
+  assert.deepEqual(
+    rows.map((row) => [row.sessionId, row.state, row.live, row.stepLabel]),
+    [
+      ['s-1', 'Needs input', true, '2/5'],
+      ['s-2', 'Working', true, '1/3'],
+    ],
+  )
+  assert.deepEqual(rows[0].workers.map((worker) => worker.id), ['w-1', 'w-2'])
+  assert.equal(rows[0].lastReportAt, 1700000000000)
+  // A registered session with no live row keeps its place, ended and idle.
+  const ended = plain(T.secretaryRowsOf({ registry: { orchestrators: [{ sessionId: 'gone', title: '旧的' }] }, orchestrators: [] }))
+  assert.deepEqual([ended[0].state, ended[0].live], ['Idle', false])
+  // A missing segment is no rows, never a throw.
+  assert.deepEqual(plain(T.secretaryRowsOf(undefined)), [])
+  assert.deepEqual(plain(T.secretaryBlockersOf(undefined)), [])
+  assert.deepEqual(plain(T.reportLinesOf(undefined)), [])
+  assert.deepEqual(plain(T.draftRowsOf(undefined)), [])
+})
+
+test('the history tab groups the newest report and lists the timeline', () => {
+  const view = mount(T.SecretaryHistory, { t, payload: secretaryPayload() })
+  const diff = byTestId(view.tree, 'orchestrator-secretary-diff')
+  const text = textOf(diff)
+  assert.match(text, /secretary\.diff\.completed/)
+  assert.match(text, /secretary\.diff\.blocked/)
+  assert.match(text, /secretary\.diff\.flipped/)
+  assert.match(text, /进度：第 3 步 \/ 共 5 步/)
+  assert.match(text, /会话进入 Needs input/)
+  assert.match(text, /会话：Idle → Working/)
+  // A bullet that matches none of the writer's shapes stays visible under "other".
+  assert.match(text, /secretary\.diff\.other/)
+  assert.match(text, /一句对不上模板的话/)
+  const timeline = byTestId(view.tree, 'orchestrator-secretary-timeline')
+  assert.match(textOf(timeline), /secretary\.reportKind\.delta/)
+  assert.match(textOf(timeline), /r\/1\.md/)
+  view.unmount()
+})
+
+test('diffGroupsOf separates the writer shapes and keeps the unknown ones', () => {
+  const groups = plain(
+    T.diffGroupsOf(['进度：第 2 步 / 共 5 步', '产出：a.md', 'worker：完成', 'worker：等确认', '会话进入 Needs input', 'worker：Idle → Working', '别的话']),
+  )
+  assert.deepEqual(groups.completed, ['进度：第 2 步 / 共 5 步', '产出：a.md', 'worker：完成'])
+  assert.deepEqual(groups.blocked, ['worker：等确认', '会话进入 Needs input'])
+  assert.deepEqual(groups.flipped, ['worker：Idle → Working'])
+  assert.deepEqual(groups.other, ['别的话'])
+})
+
+test('the layout is two columns at 1100 and scrolls only inside the list regions', () => {
+  const wide = T.secretaryStyleOf(1100)
+  assert.equal(wide.wide, true)
+  assert.match(wide.columns.gridTemplateColumns, /^minmax\(0, 2fr\) minmax\(0, 1fr\)$/)
+  assert.equal(wide.root.height, '100%')
+  assert.equal(wide.root.overflow, 'hidden')
+  assert.equal(wide.listOverflow.overflowY, 'auto')
+  const narrow = T.secretaryStyleOf(1099)
+  assert.equal(narrow.wide, false)
+  assert.equal(narrow.columns.gridTemplateColumns, 'minmax(0, 1fr)')
+  assert.equal(T.secretaryStyleOf(undefined).wide, false)
+  assert.equal(T.secretaryStyleOf(Number.NaN).wide, false)
+})
+
+test('the settings tab shows the policy numbers the payload carries', () => {
+  const render = (policy) => {
+    const scope = fakeScope()
+    const view = mount(T.SecretarySettings, { t, orch: scope, payload: secretaryPayload({ policy }), mutate: scope.mutate })
+    return {
+      view,
+      field: (key) => byTestId(view.tree, 'orchestrator-secretary-field-' + key),
+      scope,
+    }
+  }
+  const first = render({
+    beatSeconds: 180,
+    maxRunSeconds: 7200,
+    notifyOn: { state: true, step: false, block: true, deliverable: false, timeout: true },
+    promptText: '口径一',
+    reportsRoot: 'r',
+    viewReportLimit: 50,
+  })
+  assert.equal(first.field('beatSeconds').props.value, '180')
+  assert.equal(first.field('maxRunSeconds').props.value, '7200')
+  assert.equal(byTestId(first.view.tree, 'orchestrator-secretary-prompt').props.value, '口径一')
+  assert.equal(byTestId(first.view.tree, 'orchestrator-secretary-notify-state').props.checked, true)
+  assert.equal(byTestId(first.view.tree, 'orchestrator-secretary-notify-step').props.checked, false)
+
+  // A second profile with different numbers renders those numbers: nothing is hardcoded.
+  const second = render({
+    beatSeconds: 300,
+    maxRunSeconds: 900,
+    notifyOn: { state: true, step: true, block: true, deliverable: true, timeout: true },
+    promptText: '',
+    reportsRoot: 'r',
+    viewReportLimit: 50,
+  })
+  assert.equal(second.field('beatSeconds').props.value, '300')
+  assert.equal(second.field('maxRunSeconds').props.value, '900')
+})
+
+test('a policy edit writes the one key with the snapshot revision', async () => {
+  const scope = fakeScope()
+  const view = mount(T.SecretarySettings, { t, orch: scope, payload: secretaryPayload(), mutate: scope.mutate })
+  const field = () => byTestId(view.tree, 'orchestrator-secretary-field-beatSeconds')
+  field().props.onChange({ target: { value: '300' } })
+  await field().props.onBlur()
+  await flush()
+  assert.deepEqual(plain(scope.calls[0].ops), [{ op: 'set', path: ['beatSeconds'], value: 300 }])
+  assert.equal(scope.calls[0].expected, 1)
+  assert.equal(field().props.value, '300')
+
+  // Junk is rejected without a write and explained inside the tab.
+  field().props.onChange({ target: { value: '0' } })
+  await field().props.onBlur()
+  await flush()
+  assert.equal(scope.calls.length, 1)
+  assert.match(textOf(byTestId(view.tree, 'orchestrator-secretary-settings-error')), /secretary\.invalidNumber/)
+})
+
+test('a rejected settings write stays in the tab instead of escaping as a toast', async () => {
+  const scope = fakeScope({ reject: 'settings changed since it was read' })
+  const view = mount(T.SecretarySettings, { t, orch: scope, payload: secretaryPayload(), mutate: scope.mutate })
+  const notify = byTestId(view.tree, 'orchestrator-secretary-notify-step')
+  notify.props.onChange()
+  await flush()
+  const error = byTestId(view.tree, 'orchestrator-secretary-settings-error')
+  assert.equal(error.props.role, 'alert')
+  assert.match(textOf(error), /settings changed/)
+  // The switch still reflects the stored payload: a failed write does not invent a value.
+  assert.equal(byTestId(view.tree, 'orchestrator-secretary-notify-step').props.checked, true)
+})
+
+test('registering, unregistering and designating the Master each write the ticket ops', async () => {
+  const scope = fakeScope()
+  const view = mount(T.SecretarySettings, { t, orch: scope, payload: secretaryPayload(), mutate: scope.mutate })
+  byTestId(view.tree, 'orchestrator-secretary-register-id').props.onChange({ target: { value: 's-3' } })
+  byTestId(view.tree, 'orchestrator-secretary-register-title').props.onChange({ target: { value: '新会话' } })
+  byTestId(view.tree, 'orchestrator-secretary-register').props.onClick()
+  await flush()
+  const registered = plain(scope.calls[0].ops[0])
+  assert.deepEqual(registered.path, ['secretaryOrchestrators', '2'])
+  assert.equal(registered.op, 'set')
+  assert.equal(registered.value.sessionId, 's-3')
+  assert.equal(registered.value.title, '新会话')
+  assert.equal(typeof registered.value.trackedAt, 'number')
+
+  byTestId(view.tree, 'orchestrator-secretary-unregister-s-1').props.onClick()
+  await flush()
+  assert.deepEqual(plain(scope.calls[1].ops), [{ op: 'unset', path: ['secretaryOrchestrators', '0'] }])
+
+  byTestId(view.tree, 'orchestrator-secretary-setmaster-s-2').props.onClick()
+  await flush()
+  // The new Master, its row removed, and the old conflict row unset — all in one mutate.
+  assert.deepEqual(plain(scope.calls[2].ops), [
+    { op: 'set', path: ['secretaryMasterSessionId'], value: 's-2' },
+    { op: 'unset', path: ['secretaryOrchestrators', '1'] },
+  ])
+})
+
+test('the switch off renders its own state, reads nothing, and can be turned on', async () => {
+  const scope = fakeScope({ initial: { secretaryEnabled: false } })
+  let loads = 0
+  const view = mount(mod.__test.SecretaryPanel, {
+    t,
+    orch: scope,
+    loadState: async () => {
+      loads += 1
+      return secretaryPayload()
+    },
+    mutate: scope.mutate,
+  })
+  await flush()
+  assert.ok(byTestId(view.tree, 'orchestrator-secretary-disabled'))
+  assert.equal(loads, 0, 'a disabled view never calls the endpoint')
+  byTestId(view.tree, 'orchestrator-secretary-enable').props.onClick()
+  await flush()
+  assert.deepEqual(plain(scope.calls[0].ops), [{ op: 'set', path: ['secretaryEnabled'], value: true }])
+})
+
+test('the sidebar glyph is decorative: no second button inside the row', () => {
+  const view = mount(T.SecretaryIcon, { size: 16 })
+  assert.equal(view.tree.type, 'svg')
+  assert.equal(view.tree.props['aria-hidden'], 'true')
+  assert.equal(view.tree.props.width, 16)
+  assert.equal(nodes(view.tree).filter((node) => node.type === 'button').length, 0)
+  // The default edge keeps the icon sane when the host passes no size.
+  assert.equal(mount(T.SecretaryIcon, {}).tree.props.width, 18)
+})
+
+test('the icon and the main panel share one id so the sidebar row can select it', () => {
+  const regs = []
+  const scopes = { orch: { ns: 'orchestrator' } }
+  const selected = []
+  const opened = []
+  const ctx = {
+    effect: (fn) => fn(),
+    locale: { register: () => {}, bind: () => (key) => key },
+    configForms: { get: () => ({ ...scopes.orch, getSnapshot: () => ({ status: 'ready', writable: true, revision: 1, value: {} }) }) },
+    remote: { commands: { execute: async () => ({ ok: true, value: 'x' }) }, session: { modelCatalog: async () => ({ ok: true, value: { groups: [] } }) } },
+    get(name) {
+      if (name === 'uiWorkspace') return { openSession: (id) => opened.push(id) }
+      if (name === 'layout') return { selectPanel: (id) => selected.push(id) }
+      return undefined
+    },
+    slots: { inject: (_name, cb) => cb(), register: (opts, component) => regs.push({ opts, component }) },
+  }
+  mod.apply(ctx)
+  const main = regs.find((reg) => reg.opts.name === 'main')
+  const icon = regs.find((reg) => reg.opts.name === 'sidebar.panellist')
+  assert.equal(main.opts.key, 'secretary')
+  assert.equal(icon.opts.id, main.opts.key)
+  assert.equal(icon.opts.order, 40)
+  assert.equal(icon.opts.locale, 'orchestrator')
+  assert.equal(icon.opts.label(), 'secretary.label')
+  assert.equal(icon.component, T.SecretaryIcon)
+
+  const props = main.opts.inject()
+  assert.equal(props.orch.ns, 'orchestrator')
+  assert.equal(typeof props.loadState, 'function')
+  assert.equal(typeof props.mutate, 'function')
+  // Opening a row leaves the panel seat first, then opens the session.
+  props.openSession('s-1')
+  assert.deepEqual(selected, [null])
+  assert.deepEqual(opened, ['s-1'])
+})
+
+/**
+ * A stand-in client ctx for the secretary endpoint: ctx.get answers the namespace once $mount
+ * installed it, and the injected remote property throws on every other read, exactly like the
+ * host's traced Remote service.
+ */
+function fakeSecretaryCtx({ value, result, failFirstMount = false, remoteViaGet = false } = {}) {
+  let namespace
+  const mounts = []
+  const remote = {
+    $mount(contribution) {
+      mounts.push(contribution)
+      if (failFirstMount === true && mounts.length === 1) {
+        return Promise.reject(new Error('the host is not ready yet'))
+      }
+      namespace = { secretaryState: async () => result ?? { ok: true, value } }
+      return Promise.resolve(() => {})
+    },
+  }
+  const guarded = new Proxy(remote, {
+    get(target, prop) {
+      if (prop === '$mount') return target.$mount.bind(target)
+      throw new Error('cannot get property "remote.' + String(prop) + '" without inject')
+    },
+  })
+  const ctx = {
+    mounts,
+    get(name) {
+      if (name === 'remote.orchestratorSecretary') return namespace
+      if (name === 'remote' && remoteViaGet) return remote
+      return undefined
+    },
+  }
+  if (!remoteViaGet) ctx.remote = guarded
+  return ctx
+}
+
+test('loadSecretaryState reads through ctx.get and mounts the contribution once', async () => {
+  const { loadSecretaryState } = mod.__test
+  const value = secretaryPayload()
+  const ctx = fakeSecretaryCtx({ value })
+  assert.deepEqual(plain(await loadSecretaryState(ctx)), plain(value))
+  assert.deepEqual(plain(await loadSecretaryState(ctx)), plain(value))
+  assert.equal(ctx.mounts.length, 1, 'one mount serves every read')
+  assert.equal(ctx.mounts[0].descriptors[0].id, 'dsh-orchestrator-secretary#orchestratorSecretary/secretaryState')
+})
+
+test('the secretary namespace is also reachable through ctx.get("remote")', async () => {
+  const { loadSecretaryState } = mod.__test
+  const ctx = fakeSecretaryCtx({ value: secretaryPayload(), remoteViaGet: true })
+  assert.deepEqual(plain(await loadSecretaryState(ctx)).enabled, true)
+  assert.equal(ctx.mounts.length, 1)
+})
+
+test('an unavailable secretary namespace and a failed result both reject', async () => {
+  const { loadSecretaryState } = mod.__test
+  const unavailable = { mounts: [], remote: { $mount: async () => {} }, get: () => undefined }
+  await assert.rejects(loadSecretaryState(unavailable), /orchestratorSecretary\/secretaryState is unavailable/)
+  const failed = fakeSecretaryCtx({ result: { ok: false, error: { message: 'projection is not ready' } } })
+  await assert.rejects(loadSecretaryState(failed), /projection is not ready/)
+})
+
+test('a failed mount is retried on the next read instead of poisoning the panel', async () => {
+  const { loadSecretaryState } = mod.__test
+  const ctx = fakeSecretaryCtx({ value: secretaryPayload(), failFirstMount: true })
+  await assert.rejects(loadSecretaryState(ctx), /host is not ready yet/)
+  assert.deepEqual(plain(await loadSecretaryState(ctx)).enabled, true)
+  assert.equal(ctx.mounts.length, 2)
+})
+
+test('the panel reads through the real loader and the host mount', async () => {
+  const { SecretaryPanel, loadSecretaryState } = mod.__test
+  const ctx = fakeSecretaryCtx({ value: secretaryPayload() })
+  const scope = fakeScope({ initial: { secretaryEnabled: true } })
+  const view = mount(SecretaryPanel, { t, orch: scope, loadState: () => loadSecretaryState(ctx) })
+  await flush(14)
+  assert.equal(ctx.mounts.length, 1, 'the view mounted the contribution itself')
+  assert.equal(byTestId(view.tree, 'orchestrator-secretary-loading'), undefined)
+  assert.equal(bodyOf(view.tree).type, T.SecretaryOverview)
+  // The payload the endpoint answered is what the body was handed.
+  assert.equal(bodyOf(view.tree).props.payload.registry.orchestrators.length, 2)
+  view.unmount()
+})
+test('the first render is a loading line and polling stops on unmount', async () => {
+  // A read that has not answered yet is one loading line, not a blank frame.
+  const pending = mountSecretary({ loadState: () => new Promise(() => {}) })
+  assert.ok(byTestId(pending.tree, 'orchestrator-secretary-loading'))
+  assert.equal(byTestId(pending.tree, 'orchestrator-secretary-failed'), undefined)
+  pending.unmount()
+
+  let calls = 0
+  const view = mountSecretary({
+    loadState: async () => {
+      calls += 1
+      return secretaryPayload()
+    },
+  })
+  await flush()
+  assert.equal(calls, 1)
+  const timer = timers[timers.length - 1]
+  assert.equal(timer.ms, T.SECRETARY_POLL_MS, 'the view re-reads on one slow cadence')
+  view.unmount()
+  timer.fn()
+  await flush()
+  assert.equal(calls, 1, 'an unmounted view never reads again')
+})
+
+test('every tab survives a payload with no segments', () => {
+  for (const component of [T.SecretaryOverview, T.SecretaryHistory]) {
+    const bare = mount(component, { t, payload: {}, width: 0 })
+    assert.ok(bare.tree, component.name)
+    assert.equal(nodes(bare.tree).some((node) => node.props?.role === 'alert'), false, component.name)
+  }
+  const scope = fakeScope()
+  const settings = mount(T.SecretarySettings, { t, orch: scope, payload: {}, mutate: scope.mutate })
+  assert.ok(byTestId(settings.tree, 'orchestrator-secretary-policy'))
+  assert.ok(byTestId(settings.tree, 'orchestrator-secretary-binding'))
+})
+
+
