@@ -23,7 +23,25 @@ const STUBS = {
   `,
   '@deepseek-ai/dsh-tools': `export function defineTool(spec) { return spec }`,
   zod: `
-    const z = { object: () => ({ strict: () => ({}) }), enum: () => ({}), boolean: () => ({}) }
+    const chain = () => {
+      const node = {}
+      node.default = () => chain()
+      node.min = () => node
+      node.max = () => node
+      node.int = () => node
+      node.nonnegative = () => node
+      node.strict = () => node
+      node.optional = () => node
+      return node
+    }
+    const z = {
+      object: () => chain(),
+      enum: () => ({}),
+      boolean: () => ({}),
+      string: () => chain(),
+      number: () => chain(),
+      array: () => chain(),
+    }
     export { z }
     export default z
   `,
