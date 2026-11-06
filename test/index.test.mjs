@@ -246,6 +246,9 @@ function fakeAgent({ id = 'agent-1', depth, header = {}, hidden = [] } = {}) {
   const restricted = []
   const guards = []
   const registered = []
+  // 当前生效的遮罩（安装时加入、disposer 执行时移除）：restricted 是历史，判断"现在被藏
+  // 起来了什么"必须看这一个，否则取消再认领之后历史里的 read 会一直留在数组里。
+  const masked = new Set()
   const agent = {
     id,
     options: { provider: 'p', model: 'm', ...(depth === undefined ? {} : { subagentDepth: depth }) },
@@ -254,7 +257,8 @@ function fakeAgent({ id = 'agent-1', depth, header = {}, hidden = [] } = {}) {
       tools: {
         restrict({ deny }) {
           restricted.push(deny[0])
-          return () => {}
+          masked.add(deny[0])
+          return () => masked.delete(deny[0])
         },
         guard(fn) {
           guards.push(fn)
@@ -270,7 +274,7 @@ function fakeAgent({ id = 'agent-1', depth, header = {}, hidden = [] } = {}) {
       },
     },
   }
-  return { agent, restricted, guards, registered }
+  return { agent, restricted, guards, registered, masked: () => [...masked] }
 }
 
 /** Start the plugin and hand back its `agent/created` handler. */
@@ -1768,5 +1772,111 @@ test('the secretary endpoint lists the archived reports of a registered workspac
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
+})
+
+// ---------------------------------------------------------------------------
+// 调度指挥（草图 B）：authority 认领与默认闸门的互换。默认配置（开关关闭、指定为空）下
+// 这些分支一条都不走，所以上面既有的 gate 断言一条都不用改。
+// ---------------------------------------------------------------------------
+
+/** 被指定为 Master 的根 agent：fakeCtx 的 secretaryMasterSessionId 恒为 master-1。 */
+function masterAgent(options = {}) {
+  return fakeAgent({ id: 'master-1', ...options })
+}
+
+test('with the secretary switch off the master session gets the default gate, exactly as today', () => {
+  const { created, logs, handlers } = start()
+  const { agent, restricted, guards } = masterAgent()
+  created({ agent, source: 'create' })
+  assert.deepEqual(restricted, mod.DEFAULT_DENIED_TOOLS)
+  assert.equal(guards.length, 1)
+  assert.match(guards[0]({ name: 'read' }), /is not available to the main agent/)
+  assert.equal(logs.info.some((line) => line.includes('dispatch-command')), false)
+  // A settings write while the switch is off must not claim anything either.
+  handlers.get('loader/volatile-update')()
+  assert.deepEqual(restricted, mod.DEFAULT_DENIED_TOOLS)
+})
+
+test('an unset master id designates nobody, even with the secretary switch on', () => {
+  const harness = start({ secretaryEnabled: true })
+  harness.config.secretaryMasterSessionId = { get: () => '' }
+  const { agent, restricted, guards } = masterAgent()
+  harness.created({ agent, source: 'create' })
+  assert.deepEqual(restricted, mod.DEFAULT_DENIED_TOOLS)
+  assert.equal(guards.length, 1)
+  assert.equal(harness.logs.info.some((line) => line.includes('dispatch-command')), false)
+})
+
+test('a session that is not the master keeps the default gate while the switch is on', () => {
+  const harness = start({ secretaryEnabled: true })
+  const { agent, restricted, guards } = fakeAgent({ id: 'someone-else' })
+  harness.created({ agent, source: 'create' })
+  assert.deepEqual(restricted, mod.DEFAULT_DENIED_TOOLS)
+  assert.equal(guards.length, 1)
+  assert.equal(harness.logs.info.some((line) => line.includes('dispatch-command')), false)
+})
+
+test('the designated master is handed to the authority: no default gate, reads stay open', () => {
+  const harness = start({ secretaryEnabled: true })
+  const { agent, restricted, guards } = masterAgent()
+  harness.created({ agent, source: 'create' })
+  // The default list is gone: the mask is now "catalog minus the allow list".
+  assert.equal(restricted.includes('read'), false, 'a read must stay reachable for the master')
+  assert.equal(restricted.includes('edit'), true, 'a writer is still hidden')
+  assert.equal(restricted.includes('write'), true)
+  assert.equal(guards.length, 1, 'exactly one guard is installed for the master')
+  assert.match(harness.logs.info.join('\n'), /dispatch-command authority installed/)
+  assert.equal(guards[0]({ name: 'read', arguments: {} }), undefined)
+  assert.match(guards[0]({ name: 'edit', arguments: {} }), /not available to the dispatch-command agent/)
+})
+
+test('cancelling the switch or re-designating the master reinstates the default gate', () => {
+  const agent = masterAgent()
+  const harness = start({
+    secretaryEnabled: true,
+    agents: { get: () => undefined, roots: () => [agent.agent] },
+  })
+  harness.created({ agent: agent.agent, source: 'create' })
+  assert.equal(agent.masked().includes('read'), false, 'the authority mask leaves reads open')
+
+  // 开关关闭 = 取消调度指挥；交还时必须把默认闸门装回去，不能让它裸奔。
+  harness.state.secretaryEnabled = false
+  harness.handlers.get('loader/volatile-update')()
+  assert.ok(agent.masked().includes('read'), 'the default gate is back once the switch is off')
+
+  // 再打开是新的认领；换个指定则把旧 master 交还，同一条交还路径。
+  harness.state.secretaryEnabled = true
+  harness.handlers.get('loader/volatile-update')()
+  assert.equal(agent.masked().includes('read'), false, 'the authority claims it again')
+  harness.config.secretaryMasterSessionId = { get: () => 'someone-else' }
+  harness.handlers.get('loader/volatile-update')()
+  assert.ok(agent.masked().includes('read'), 're-designating the master returns the default gate')
+})
+
+test('a disposed master is released without a fresh default gate on a dead agent', () => {
+  const harness = start({ secretaryEnabled: true })
+  const { agent, restricted } = masterAgent()
+  harness.created({ agent, source: 'create' })
+  const before = restricted.length
+  harness.handlers.get('agent/disposed')({ agent })
+  assert.equal(restricted.length, before, 'a disposed agent must not be gated again')
+})
+
+test('the secretary payload carries the authority refusals as policy.violations', async () => {
+  const harness = start({ secretaryEnabled: true })
+  const service = harness.services.get('orchestratorSecretary')
+  const clean = await service.secretaryState()
+  assert.equal('violations' in clean.policy, false, 'no record, no extra key: the payload is what it was')
+  assert.deepEqual(Object.keys(clean.policy), ['beatSeconds', 'maxRunSeconds', 'notifyOn', 'promptText'])
+
+  const { agent, guards } = masterAgent()
+  harness.created({ agent, source: 'create' })
+  assert.match(guards[0]({ name: 'pwsh', arguments: {} }), /not available to the dispatch-command agent/)
+
+  const payload = await service.secretaryState()
+  assert.equal(payload.policy.violations.length, 1)
+  assert.deepEqual(Object.keys(payload.policy.violations[0]).sort(), ['action', 'agentId', 'at', 'reason'])
+  assert.equal(payload.policy.violations[0].action, 'pwsh')
+  assert.equal(payload.policy.violations[0].agentId, 'master-1')
 })
 
