@@ -318,13 +318,24 @@ test('saveRoute surfaces a rejected write and a write that did not land', async 
   assert.equal(await T.saveRoute(dropped, T.MAIN.fields, { provider: 'p', model: 'm', effort: '' }, t), 'route.saveFailed')
 })
 
-test('apply puts the toggle in the left slot, the picker and the master panel in input.right', () => {
+test('apply puts the toggle in the left slot, the picker and the master panel in input.right', async () => {
   const regs = []
+  const projection = { enabled: true, byState: { Working: 1 }, workers: [{ id: 'w-1', role: 'worker', state: 'Working', summary: 'wired' }] }
+  // The Gateway installs a mounted namespace as the Cordis service `remote.<namespace>`;
+  // ctx.get is the inject-free read, and $mount is what installs it.
+  let installed
   const ctx = {
     effect: (fn) => fn(),
     locale: { register: () => {} },
     configForms: { get: (ns) => ({ ns }) },
-    remote: { commands: { execute: async () => ({ ok: true, value: 'x' }) }, session: { modelCatalog: async () => ({ ok: true, value: { groups: [] } }) } },
+    remote: {
+      commands: { execute: async () => ({ ok: true, value: 'x' }) },
+      session: { modelCatalog: async () => ({ ok: true, value: { groups: [] } }) },
+      $mount: async () => {
+        installed = { masterState: async () => ({ ok: true, value: projection }) }
+      },
+    },
+    get: (name) => (name === 'remote.orchestratorMaster' ? installed : undefined),
     slots: { inject: (_n, cb) => cb(), register: (opts, comp) => regs.push({ opts, comp }) },
   }
   mod.apply(ctx)
@@ -341,6 +352,9 @@ test('apply puts the toggle in the left slot, the picker and the master panel in
   assert.equal(master.orch.ns, 'orchestrator')
   assert.equal(typeof master.loadState, 'function')
   assert.equal(master.setPlan, undefined)
+  // The loader is wired to the ctx (not ctx.remote) and reads the namespace through ctx.get;
+  // a `remote.orchestratorMaster` property read would throw "cannot get property … without inject".
+  assert.deepEqual(plain(await master.loadState()), projection)
   assert.deepEqual(plain(mod.inject), ['slots', 'locale', 'remote', 'remote.commands', 'remote.session', 'configForms'])
 })
 
@@ -1272,55 +1286,89 @@ test('every expansion asks the endpoint again, and a closed panel never reads', 
 })
 
 /**
- * A stand-in for the host's `ctx.remote`: `$mount` installs the namespace, exactly like
- * the Gateway does, so the client's real `loadMasterState` can be driven end to end.
+ * A stand-in for the host's client ctx. `get(name)` is the inject-free service read Cordis
+ * offers and `$mount` installs `remote.<namespace>`, exactly like the Gateway does, so the
+ * real `loadMasterState` runs end to end. The `remote` view answers `$mount` and throws on
+ * every other property — the way the host's traced Remote service throws
+ * `cannot get property "remote.orchestratorMaster" without inject` for a namespace the
+ * plugin never declared. Any regression back to that property read fails loudly.
  */
-function fakeRemote({ value, result, failFirstMount = false } = {}) {
+function fakeCtx({ value, result, failFirstMount = false, remoteViaGet = false } = {}) {
+  let namespace
+  const mounts = []
   const remote = {
-    mounts: [],
     $mount(contribution) {
-      remote.mounts.push(contribution)
-      if (failFirstMount === true && remote.mounts.length === 1) {
+      mounts.push(contribution)
+      if (failFirstMount === true && mounts.length === 1) {
         return Promise.reject(new Error('the host is not ready yet'))
       }
-      remote.orchestratorMaster = {
-        masterState: async () => result ?? { ok: true, value },
-      }
+      namespace = { masterState: async () => result ?? { ok: true, value } }
       return Promise.resolve(() => {})
     },
   }
-  return remote
+  const guarded = new Proxy(remote, {
+    get(target, prop) {
+      if (prop === '$mount') return target.$mount.bind(target)
+      throw new Error(`cannot get property "remote.${String(prop)}" without inject`)
+    },
+  })
+  const ctx = {
+    mounts,
+    get(name) {
+      if (name === 'remote.orchestratorMaster') return namespace
+      if (name === 'remote' && remoteViaGet) return remote
+      return undefined
+    },
+  }
+  if (!remoteViaGet) ctx.remote = guarded
+  return ctx
 }
 
-test('loadMasterState mounts once and returns the value of a real RemoteResult', async () => {
+test('loadMasterState reads the namespace through ctx.get and mounts once', async () => {
   const { loadMasterState } = mod.__test
   const value = { enabled: true, byState: { Working: 1 }, workers: [{ id: 'w-1', role: 'worker', state: 'Working', summary: 'ok' }] }
-  const remote = fakeRemote({ value })
+  const ctx = fakeCtx({ value })
 
-  assert.deepEqual(plain(await loadMasterState(remote)), value)
-  assert.deepEqual(plain(await loadMasterState(remote)), value)
-  assert.equal(remote.mounts.length, 1, 'one mount serves every read')
-  assert.equal(remote.mounts[0].descriptors[0].id, 'dsh-orchestrator-master#orchestratorMaster/masterState')
+  assert.deepEqual(plain(await loadMasterState(ctx)), value)
+  assert.deepEqual(plain(await loadMasterState(ctx)), value)
+  assert.equal(ctx.mounts.length, 1, 'one mount serves every read')
+  assert.equal(ctx.mounts[0].descriptors[0].id, 'dsh-orchestrator-master#orchestratorMaster/masterState')
+})
+
+test('the remote service is reachable through ctx.get as well as the injected property', async () => {
+  const { loadMasterState } = mod.__test
+  const value = { enabled: false, byState: {}, workers: [] }
+  // No `remote` property at all: the service lookup alone has to carry the mount.
+  const ctx = fakeCtx({ value, remoteViaGet: true })
+  assert.deepEqual(plain(await loadMasterState(ctx)), value)
+  assert.equal(ctx.mounts.length, 1)
+})
+
+test('an unavailable namespace is a clear error instead of a property read', async () => {
+  const { loadMasterState } = mod.__test
+  // $mount succeeds but installs nothing: ctx.get keeps answering undefined.
+  const ctx = { mounts: [], remote: { $mount: async () => {} }, get: () => undefined }
+  await assert.rejects(loadMasterState(ctx), /orchestratorMaster\/masterState is unavailable/)
 })
 
 test('a failed RemoteResult becomes a rejection with the host message', async () => {
   const { loadMasterState } = mod.__test
-  const remote = fakeRemote({ result: { ok: false, error: { message: 'projection is not ready' } } })
-  await assert.rejects(loadMasterState(remote), /projection is not ready/)
+  const ctx = fakeCtx({ result: { ok: false, error: { message: 'projection is not ready' } } })
+  await assert.rejects(loadMasterState(ctx), /projection is not ready/)
 })
 
 test('a failed mount is retried on the next read instead of being cached forever', async () => {
   const { loadMasterState } = mod.__test
-  const remote = fakeRemote({ value: { enabled: true, byState: {}, workers: [] }, failFirstMount: true })
+  const ctx = fakeCtx({ value: { enabled: true, byState: {}, workers: [] }, failFirstMount: true })
 
-  await assert.rejects(loadMasterState(remote), /host is not ready yet/)
-  assert.deepEqual(plain(await loadMasterState(remote)), { enabled: true, byState: {}, workers: [] })
-  assert.equal(remote.mounts.length, 2, 'the rejection is not the cached answer for the rest of the page')
+  await assert.rejects(loadMasterState(ctx), /host is not ready yet/)
+  assert.deepEqual(plain(await loadMasterState(ctx)), { enabled: true, byState: {}, workers: [] })
+  assert.equal(ctx.mounts.length, 2, 'the rejection is not the cached answer for the rest of the page')
 })
 
 test('the panel reads through the real loader and the host mount, not an injected snapshot', async () => {
   const { MasterPanel, loadMasterState } = mod.__test
-  const remote = fakeRemote({
+  const ctx = fakeCtx({
     value: {
       enabled: true,
       byState: { Working: 1 },
@@ -1328,12 +1376,12 @@ test('the panel reads through the real loader and the host mount, not an injecte
     },
   })
   const scope = fakeScope({ initial: { masterPanelEnabled: true } })
-  const view = mount(MasterPanel, { t, orch: scope, loadState: () => loadMasterState(remote) })
+  const view = mount(MasterPanel, { t, orch: scope, loadState: () => loadMasterState(ctx) })
 
   nodes(view.tree).find((node) => node.type === 'button').props.onClick()
   await flush(14)
 
-  assert.equal(remote.mounts.length, 1, 'the panel mounted the contribution itself')
+  assert.equal(ctx.mounts.length, 1, 'the panel mounted the contribution itself')
   const text = textOf(view.tree)
   assert.match(text, /from the remote endpoint/)
   assert.match(text, /Working · 1/)
