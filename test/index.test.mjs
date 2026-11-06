@@ -4,6 +4,9 @@ import test from 'node:test'
 import { denyGuard } from '../lib/gate.js'
 import { MAX_MESSAGE_BYTES, MAX_MESSAGE_QUEUE, checkInbound, composeMessage, deliverMessage } from '../lib/master-messaging.js'
 import { MEMORY_DOMAIN_NAME, MEMORY_INDEX_SECTION, MEMORY_SECTION_ORDER } from '../lib/memory.js'
+import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { MASTER_SESSION_ID } from '../lib/master-session.js'
 
 /**
@@ -18,20 +21,34 @@ const dataUrl = (source) => 'data:text/javascript,' + encodeURIComponent(source)
 const STUBS = {
   '@deepseek-ai/schemastery': `
     function chain() {
-      const node = {}
-      node.default = () => chain()
-      node.volatile = () => chain()
-      node.min = () => chain()
-      node.max = () => chain()
-      node.step = () => chain()
+      // The shape is recorded rather than enforced: no host package is installed, so the
+      // tests can only read what the plugin declared (default, bounds, volatility).
+      const node = { defaultValue: undefined, minValue: undefined, maxValue: undefined, volatileFlag: false }
+      node.default = (value) => {
+        node.defaultValue = value
+        return node
+      }
+      node.volatile = () => {
+        node.volatileFlag = true
+        return node
+      }
+      node.min = (value) => {
+        node.minValue = value
+        return node
+      }
+      node.max = (value) => {
+        node.maxValue = value
+        return node
+      }
+      node.step = () => node
       return node
     }
     const z = {
       boolean: () => chain(),
       string: () => chain(),
       number: () => chain(),
-      array: () => chain(),
-      object: () => chain(),
+      array: (item) => Object.assign(chain(), { item }),
+      object: (shape) => Object.assign(chain(), { shape }),
     }
     export default z
   `,
@@ -88,9 +105,11 @@ function fakeCtx({
   memoryEnabled = false,
   panelEnabled = false,
   masterEnabled = false,
+  secretaryEnabled = false,
+  secretaryOrchestrators = [],
   storageDomain,
 } = {}) {
-  const state = { enabled, memoryEnabled, panelEnabled, masterEnabled }
+  const state = { enabled, memoryEnabled, panelEnabled, masterEnabled, secretaryEnabled, secretaryOrchestrators }
   const projections = []
   const tools = []
   const handlers = new Map()
@@ -189,6 +208,9 @@ function fakeCtx({
     masterMemoryEnabled: { get: () => state.memoryEnabled },
     masterPanelEnabled: { get: () => state.panelEnabled },
     masterSessionEnabled: { get: () => state.masterEnabled },
+    secretaryEnabled: { get: () => state.secretaryEnabled },
+    secretaryMasterSessionId: { get: () => 'master-1' },
+    secretaryOrchestrators: { get: () => state.secretaryOrchestrators },
     toolCatalog: catalogRef,
   }
   return {
@@ -1359,4 +1381,176 @@ test('a switch-off host refuses a message without touching any agent', async () 
   )
   assert.deepEqual(result, { decision: 'refuse', reason: 'disabled' })
   assert.equal(looked, 0)
+})
+
+// ---- Secretary registry (secretary spec, ticket 01): declaration only -----------------
+
+test('the secretary keys are declared with their defaults and are all volatile', () => {
+  // This ticket adds the storage face of lib/secretary-registry.js: six config keys the
+  // settings card will write. Nothing reads them yet, so what can be pinned is the
+  // declaration itself — the default, the bounds the spec fixes, and the volatile flag
+  // that lets a settings write reach the running plugin without editing the profile file.
+  const { shape } = mod.Config
+  assert.ok(shape, 'Config must expose the keys it declares')
+
+  const defaults = {
+    secretaryMasterSessionId: '',
+    secretaryBeatSeconds: 180,
+    secretaryMaxRunSeconds: 7200,
+    secretaryPromptText: '',
+  }
+  for (const [key, value] of Object.entries(defaults)) {
+    assert.ok(shape[key], `Config must declare ${key}`)
+    assert.deepEqual(shape[key].defaultValue, value, `${key} default`)
+    assert.equal(shape[key].volatileFlag, true, `${key} must be volatile`)
+  }
+
+  assert.deepEqual(shape.secretaryOrchestrators.defaultValue, [])
+  assert.equal(shape.secretaryOrchestrators.volatileFlag, true, 'secretaryOrchestrators must be volatile')
+
+  assert.deepEqual(shape.secretaryNotifyOn.defaultValue, [
+    'state-flip',
+    'step-advance',
+    'blocked',
+    'deliverable',
+    'timeout',
+  ])
+  assert.equal(shape.secretaryNotifyOn.volatileFlag, true, 'secretaryNotifyOn must be volatile')
+
+  // The spec fixes the cadence window: 3 minutes by default, capped at 2 hours.
+  assert.equal(shape.secretaryBeatSeconds.minValue, 10)
+  assert.equal(shape.secretaryBeatSeconds.maxValue, 86400)
+  assert.equal(shape.secretaryMaxRunSeconds.minValue, 60)
+  assert.equal(shape.secretaryMaxRunSeconds.maxValue, 86400)
+})
+
+test('one tracked row stores a session id and three optional fields', () => {
+  const { shape } = mod.Config
+  const fields = shape.secretaryOrchestrators.item.shape
+  assert.ok(fields, 'a stored row must declare its fields')
+  assert.ok(fields.sessionId, 'a row must declare sessionId')
+  assert.equal(fields.workspace?.defaultValue, '')
+  assert.equal(fields.title?.defaultValue, '')
+  assert.equal(fields.trackedAt?.defaultValue, 0)
+})
+
+test('applying with no secretary key at all is still a clean start', () => {
+  // The keys are storage for later tickets, so an older profile has none of them: the
+  // plugin must load and register its ordinary units without a complaint.
+  const harness = start()
+  assert.ok(harness.projections.some(({ key }) => key === 'orchestrator'))
+  assert.ok(harness.tools.some(({ name }) => name === 'dispatch'))
+  assert.equal(harness.logs.warn.length, 0)
+})
+
+// ---- Secretary trigger (secretary spec, ticket 03): opt-in watch + planning report ------
+
+/** 会话日志里的一条 dispatch 工具调用，形状与宿主的 `tool/call` 事件一致。 */
+function dispatchEvent(args, { callId = 'call-1', time = 1000 } = {}) {
+  return { type: 'tool/call', time, data: { turn: 1, step: 1, callId, name: 'dispatch', arguments: JSON.stringify(args) } }
+}
+
+const trackedOrchestrator = { sessionId: 'orch-1', workspace: 'w', title: '日报', trackedAt: 1 }
+const planDir = (dir) => join(dir, '.scratch', 'master-secretary', 'reports', 'orch-1')
+
+test('the secretary watch switch is off by default and volatile', () => {
+  const { shape } = mod.Config
+  assert.ok(shape.secretaryEnabled, 'Config must declare the watch switch')
+  assert.equal(shape.secretaryEnabled.defaultValue, false, 'a watch nothing registered is the safe default')
+  assert.equal(shape.secretaryEnabled.volatileFlag, true, 'a settings write must reach the running plugin')
+})
+
+test('an off switch registers no secretary effect and subscribes to no session event', () => {
+  const off = start()
+  // 最老的 profile 里这三把键一个都不存在：加载结果必须与「声明了但关着」一模一样，
+  // 这样「关闭时行为与今天完全一致」就不是一句话，而是一次逐项比较。
+  const older = fakeCtx()
+  delete older.config.secretaryEnabled
+  delete older.config.secretaryMasterSessionId
+  delete older.config.secretaryOrchestrators
+  mod.apply(older.ctx, older.config)
+
+  assert.deepEqual(
+    off.effects.map(({ label }) => label),
+    older.effects.map(({ label }) => label),
+    'an off switch adds no effect at all',
+  )
+  assert.deepEqual([...off.handlers.keys()], [...older.handlers.keys()], 'and no extra subscription')
+  assert.deepEqual(
+    off.tools.map(({ name }) => name),
+    older.tools.map(({ name }) => name),
+    'and no extra tool',
+  )
+  assert.equal(
+    off.effects.some(({ label }) => label.startsWith('orchestrator: secretary')),
+    false,
+    'an off switch owns nothing',
+  )
+  assert.equal(off.handlers.has('session/event'), false, 'no session listener may exist while the switch is off')
+  assert.equal(
+    off.tools.some(({ name }) => /secretary/i.test(name)),
+    false,
+    'this ticket adds no tool',
+  )
+})
+
+test('a tracked dispatch writes one planning report, and a repeat dispatch does not rewrite it', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'secretary-plan-'))
+  try {
+    const harness = start({ secretaryEnabled: true, secretaryOrchestrators: [trackedOrchestrator] })
+    const listener = harness.handlers.get('session/event')
+    assert.equal(typeof listener, 'function', 'the watch subscribes to session/event')
+    assert.ok(
+      harness.effects.some(({ label }) => label === 'orchestrator: secretary watch'),
+      'the listener is owned by an effect, so an unload removes it',
+    )
+
+    const session = { id: 'orch-1', header: { cwd: dir } }
+    await listener(
+      session,
+      dispatchEvent({ description: '修登录', prompt: '让重试可用', verify: 'node --test', doneDefinition: '测试全绿' }),
+    )
+
+    // 票 04 的归档约定：与节拍报告同一套 `<HH-mm>.md`，不再另写 .plan.json。
+    const files = await readdir(planDir(dir))
+    assert.equal(files.length, 1)
+    assert.match(files[0], /^\d{2}-\d{2}\.md$/)
+    const written = await readFile(join(planDir(dir), files[0]), 'utf8')
+    assert.match(written, /^# 秘书规划$/m)
+    assert.match(written, /- 时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}/)
+    assert.match(written, /- 会话：orch-1/)
+    assert.match(written, /## 步骤\n\n1\. 修登录 — 让重试可用/)
+    assert.match(written, /## 验收点\n\n- 测试全绿\n- node --test/)
+    assert.match(written, /## 触发依据\n\n- 来源：dispatch/)
+    assert.match(written, /- 调用：call-1/)
+
+    // 同一会话第二次 dispatch：不再起表，第一份文件原样留着。
+    await listener(session, dispatchEvent({ description: '第二份' }, { callId: 'call-2', time: 2000 }))
+    assert.equal(await readFile(join(planDir(dir), files[0]), 'utf8'), written)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('an untracked session writes nothing, and registering it takes effect on the next dispatch', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'secretary-untracked-'))
+  try {
+    const harness = start({ secretaryEnabled: true })
+    const listener = harness.handlers.get('session/event')
+    const session = { id: 'orch-1', header: { cwd: dir } }
+
+    await listener(session, dispatchEvent({ description: '未登记' }))
+    await assert.rejects(readdir(join(dir, '.scratch')), { code: 'ENOENT' })
+
+    // 非 dispatch 的工具调用也不算出发。
+    harness.state.secretaryOrchestrators.push(trackedOrchestrator)
+    await listener(session, { type: 'tool/call', time: 1, data: { callId: 'c', name: 'read', arguments: '{}' } })
+    await assert.rejects(readdir(join(dir, '.scratch')), { code: 'ENOENT' })
+
+    // 登记表是 volatile 的，下一次 dispatch 就用新名单。
+    await listener(session, dispatchEvent({ description: '修登录' }))
+    assert.equal((await readdir(planDir(dir))).length, 1)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })
