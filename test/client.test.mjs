@@ -1188,6 +1188,10 @@ function secretaryPayload(overrides = {}) {
           { sessionId: 's-1', title: '构建视图', workspace: 'D:\\w', trackedAt: 1 },
           { sessionId: 's-2', title: '收尾', workspace: '', trackedAt: 2 },
         ],
+        // The stored list the settings writes address by index. Here it is longer than the
+        // normalized one: s-9 duplicates the Master and is dropped by normalization, which is
+        // exactly when the two lists differ.
+        raw: [{ sessionId: 's-1' }, { sessionId: 's-9' }, { sessionId: 's-2' }],
         conflict: { masterSessionId: 'm-1', conflictingOrchestratorIds: ['s-9'] },
       },
       orchestrators: [
@@ -1197,14 +1201,12 @@ function secretaryPayload(overrides = {}) {
           workspace: 'D:\\w',
           live: true,
           state: 'Needs input',
-          step: { index: 2, total: 5, done: false },
           workers: [
             { id: 'w-1', state: 'Working', summary: '写测试' },
             { id: 'w-2', state: 'Idle', summary: '' },
           ],
           beats: { count: 3, startedAt: 1, capped: false, stoppedReason: null },
           lastReport: { path: 'r/1.md', at: 1700000000000, kind: 'delta' },
-          lastError: null,
         },
         {
           sessionId: 's-2',
@@ -1212,11 +1214,9 @@ function secretaryPayload(overrides = {}) {
           workspace: '',
           live: true,
           state: 'Working',
-          step: { index: 1, total: 3, done: false },
           workers: [{ id: 'w-3', state: 'Working', summary: '整理提交' }],
           beats: { count: 1, startedAt: 2, capped: false, stoppedReason: null },
           lastReport: null,
-          lastError: null,
         },
       ],
       reports: [
@@ -1241,8 +1241,6 @@ function secretaryPayload(overrides = {}) {
         maxRunSeconds: 7200,
         notifyOn: { state: true, step: true, block: true, deliverable: true, timeout: true },
         promptText: '',
-        reportsRoot: '.scratch/master-secretary/reports',
-        viewReportLimit: 50,
       },
     },
     overrides,
@@ -1424,10 +1422,12 @@ test('the overview maps the payload to its blockers, its current run and its wor
   assert.match(textOf(blocker), /构建视图/)
   assert.match(textOf(byTestId(view.tree, 'orchestrator-secretary-conflict')), /s-9/)
 
-  // The current run is the Working row, with its step label and its worker table.
+  // The current run is the Working row, with its state and its worker table. There is no step
+  // label: the endpoint has no source for a step counter, so the row no longer invents one.
   const current = byTestId(view.tree, 'orchestrator-secretary-current')
   assert.match(textOf(current), /收尾/)
-  assert.match(textOf(current), /1\/3/)
+  assert.match(textOf(current), /Working/)
+  assert.equal(textOf(current).includes('secretary.step'), false, 'no step line without a step field')
   const worker = byTestId(view.tree, 'orchestrator-secretary-worker-w-3')
   assert.ok(worker, 'the running session lists its workers')
   assert.match(textOf(worker), /整理提交/)
@@ -1448,7 +1448,6 @@ test('the overview maps the payload to its blockers, its current run and its wor
           title: '收尾',
           live: true,
           state: 'Working',
-          step: null,
           workers: [{ id: 'w-9', state: 'Idle', summary: '' }],
         },
       ],
@@ -1470,11 +1469,36 @@ test('the overview maps the payload to its blockers, its current run and its wor
     openSession: () => {},
     payload: secretaryPayload({
       registry: { masterSessionId: '', orchestrators: [{ sessionId: 'gone', title: '旧的', workspace: '' }], conflict: null },
-      orchestrators: [{ sessionId: 'gone', title: '旧的', live: false, state: 'Completed', step: null, workers: [] }],
+      orchestrators: [{ sessionId: 'gone', title: '旧的', live: false, state: 'Completed', workers: [] }],
     }),
   })
   assert.equal(byTestId(ended.tree, 'orchestrator-secretary-row-gone').props.disabled, true)
   assert.match(textOf(byTestId(ended.tree, 'orchestrator-secretary-row-gone')), /secretary\.ended/)
+})
+
+test('a row the host could not tie to a workspace says why no report is listed (why: the history stayed blank)', () => {
+  const view = mount(T.SecretaryOverview, {
+    t,
+    width: 1200,
+    payload: secretaryPayload({
+      registry: {
+        masterSessionId: '',
+        orchestrators: [
+          { sessionId: 's-1', title: '构建视图', workspace: 'D:\\w', trackedAt: 1 },
+          { sessionId: 's-3', title: '无工作区', workspace: '', workspaceMissing: true, trackedAt: 2 },
+        ],
+        conflict: null,
+      },
+      orchestrators: [],
+    }),
+  })
+  const missing = byTestId(view.tree, 'orchestrator-secretary-workspace-missing-s-3')
+  assert.ok(missing, 'the tree says why the report list is empty')
+  assert.match(textOf(missing), /secretary\.workspaceMissing/)
+  assert.equal(byTestId(view.tree, 'orchestrator-secretary-workspace-missing-s-1'), undefined)
+  // The flag rides on the row, not on the group: a resolved workspace never shows the notice.
+  const rows = plain(T.secretaryRowsOf(secretaryPayload()))
+  assert.deepEqual(rows.map((row) => row.workspaceMissing), [false, false])
 })
 
 /** A pending draft card's payload row, ticket 08 shape. */
@@ -1598,13 +1622,15 @@ test('the blockers and the tracker rows come from the payload, not from the view
     blockers.map((blocker) => [blocker.sessionId, blocker.reason]),
     [['s-1', 'needsInput']],
   )
-  // A loud failure and a stopped beat are blockers too; a pending draft is one as well.
+  // A stopped beat is a blocker too, and a pending draft is one as well. A session that only
+  // carries the removed lastError field is not: the endpoint has no such field, so nothing may
+  // turn it into a blocker any more.
   const more = plain(
     T.secretaryBlockersOf({
       orchestrators: [
-        { sessionId: 'x', title: '坏掉的', state: 'Idle', lastError: 'boom', beats: { capped: false } },
-        { sessionId: 'y', title: '超时的', state: 'Idle', lastError: null, beats: { capped: true, stoppedReason: '达到上限' } },
-        { sessionId: 'z', title: '安静的', state: 'Idle', lastError: null, beats: { capped: false } },
+        { sessionId: 'x', title: '安静的', state: 'Idle', beats: { capped: false } },
+        { sessionId: 'y', title: '超时的', state: 'Idle', beats: { capped: true, stoppedReason: '达到上限' } },
+        { sessionId: 'z', title: '旧的', state: 'Idle', lastError: 'boom', beats: { capped: false } },
       ],
       drafts: [
         { id: 'd-1', sessionId: 'x', reason: '等待拍板', text: '等你拍板', status: 'pending' },
@@ -1615,23 +1641,24 @@ test('the blockers and the tracker rows come from the payload, not from the view
   assert.deepEqual(
     more.map((blocker) => [blocker.sessionId, blocker.reason]),
     [
-      ['x', 'error'],
       ['y', 'capped'],
       ['x', 'draft'],
     ],
   )
-  assert.equal(more[0].text, 'boom')
-  assert.equal(more[1].text, '达到上限')
-  assert.equal(more[2].text, '等你拍板', 'a draft blocker carries the generated body')
+  assert.equal(more[0].text, '达到上限')
+  assert.equal(more[1].text, '等你拍板', 'a draft blocker carries the generated body')
 
   const rows = plain(T.secretaryRowsOf(payload))
   assert.deepEqual(
-    rows.map((row) => [row.sessionId, row.state, row.live, row.stepLabel]),
+    rows.map((row) => [row.sessionId, row.state, row.live]),
     [
-      ['s-1', 'Needs input', true, '2/5'],
-      ['s-2', 'Working', true, '1/3'],
+      ['s-1', 'Needs input', true],
+      ['s-2', 'Working', true],
     ],
   )
+  // Neither field is read any more: a payload that still carries them does not resurrect them.
+  assert.equal('stepLabel' in rows[0], false)
+  assert.equal('lastError' in rows[0], false)
   assert.deepEqual(rows[0].workers.map((worker) => worker.id), ['w-1', 'w-2'])
   assert.equal(rows[0].lastReportAt, 1700000000000)
   // A registered session with no live row keeps its place, ended and idle.
@@ -1726,12 +1753,14 @@ test('the layout is two columns at 1100 and scrolls only inside the list regions
   assert.equal(T.secretaryStyleOf(Number.NaN).wide, false)
 })
 
-test('the settings tab shows the policy numbers the payload carries', () => {
+test('the settings tab shows the policy numbers the payload carries, keyed by the real config key', () => {
   const render = (policy) => {
     const scope = fakeScope()
     const view = mount(T.SecretarySettings, { t, orch: scope, payload: secretaryPayload({ policy }), mutate: scope.mutate })
     return {
       view,
+      // The field is addressed by its config key; the number it shows comes from the payload's
+      // short policy name. The two must not be the same string (see the write test below).
       field: (key) => byTestId(view.tree, 'orchestrator-secretary-field-' + key),
       scope,
     }
@@ -1741,11 +1770,10 @@ test('the settings tab shows the policy numbers the payload carries', () => {
     maxRunSeconds: 7200,
     notifyOn: { state: true, step: false, block: true, deliverable: false, timeout: true },
     promptText: '口径一',
-    reportsRoot: 'r',
-    viewReportLimit: 50,
   })
-  assert.equal(first.field('beatSeconds').props.value, '180')
-  assert.equal(first.field('maxRunSeconds').props.value, '7200')
+  assert.equal(first.field('secretaryBeatSeconds').props.value, '180')
+  assert.equal(first.field('secretaryMaxRunSeconds').props.value, '7200')
+  assert.equal(first.field('beatSeconds'), undefined, 'the payload name is never the field key')
   assert.equal(byTestId(first.view.tree, 'orchestrator-secretary-prompt').props.value, '口径一')
   assert.equal(byTestId(first.view.tree, 'orchestrator-secretary-notify-state').props.checked, true)
   assert.equal(byTestId(first.view.tree, 'orchestrator-secretary-notify-step').props.checked, false)
@@ -1756,21 +1784,28 @@ test('the settings tab shows the policy numbers the payload carries', () => {
     maxRunSeconds: 900,
     notifyOn: { state: true, step: true, block: true, deliverable: true, timeout: true },
     promptText: '',
-    reportsRoot: 'r',
-    viewReportLimit: 50,
   })
-  assert.equal(second.field('beatSeconds').props.value, '300')
-  assert.equal(second.field('maxRunSeconds').props.value, '900')
+  assert.equal(second.field('secretaryBeatSeconds').props.value, '300')
+  assert.equal(second.field('secretaryMaxRunSeconds').props.value, '900')
+
+  // The report location is a property of each registered row. The old single "report root" line
+  // was a policy field the endpoint never sent, so it went away with the row-level display.
+  const binding = textOf(byTestId(first.view.tree, 'orchestrator-secretary-binding'))
+  assert.match(binding, /D:\\w/)
+  assert.match(binding, /secretary\.workspaceNone/)
+  assert.equal(textOf(first.view.tree).includes('secretary.reportsRoot'), false)
 })
 
-test('a policy edit writes the one key with the snapshot revision', async () => {
+test('a policy edit writes the full config key with the snapshot revision', async () => {
   const scope = fakeScope()
   const view = mount(T.SecretarySettings, { t, orch: scope, payload: secretaryPayload(), mutate: scope.mutate })
-  const field = () => byTestId(view.tree, 'orchestrator-secretary-field-beatSeconds')
+  const field = () => byTestId(view.tree, 'orchestrator-secretary-field-secretaryBeatSeconds')
   field().props.onChange({ target: { value: '300' } })
   await field().props.onBlur()
   await flush()
-  assert.deepEqual(plain(scope.calls[0].ops), [{ op: 'set', path: ['beatSeconds'], value: 300 }])
+  // A write to the payload's short name beatSeconds reaches no config field at all, so the
+  // beat never changed. The path is the schema key.
+  assert.deepEqual(plain(scope.calls[0].ops), [{ op: 'set', path: ['secretaryBeatSeconds'], value: 300 }])
   assert.equal(scope.calls[0].expected, 1)
   assert.equal(field().props.value, '300')
 
@@ -1795,7 +1830,9 @@ test('a rejected settings write stays in the tab instead of escaping as a toast'
   assert.equal(byTestId(view.tree, 'orchestrator-secretary-notify-step').props.checked, true)
 })
 
-test('registering, unregistering and designating the Master each write the ticket ops', async () => {
+test('registering, unregistering and designating the Master address the stored row, not the normalized index', async () => {
+  // The fixture's raw list is longer than the normalized one (s-9 duplicates the Master and is
+  // dropped), so a normalized index addresses the wrong stored row.
   const scope = fakeScope()
   const view = mount(T.SecretarySettings, { t, orch: scope, payload: secretaryPayload(), mutate: scope.mutate })
   byTestId(view.tree, 'orchestrator-secretary-register-id').props.onChange({ target: { value: 's-3' } })
@@ -1803,23 +1840,59 @@ test('registering, unregistering and designating the Master each write the ticke
   byTestId(view.tree, 'orchestrator-secretary-register').props.onClick()
   await flush()
   const registered = plain(scope.calls[0].ops[0])
-  assert.deepEqual(registered.path, ['secretaryOrchestrators', '2'])
+  // Appended at the stored length (3), not the normalized length (2): a set at 2 would overwrite
+  // the stored row that sits there.
+  assert.deepEqual(registered.path, ['secretaryOrchestrators', '3'])
   assert.equal(registered.op, 'set')
   assert.equal(registered.value.sessionId, 's-3')
   assert.equal(registered.value.title, '新会话')
   assert.equal(typeof registered.value.trackedAt, 'number')
 
-  byTestId(view.tree, 'orchestrator-secretary-unregister-s-1').props.onClick()
+  // s-2 is normalized index 1 but stored index 2; the old code unset index 1 — the Master row.
+  byTestId(view.tree, 'orchestrator-secretary-unregister-s-2').props.onClick()
   await flush()
-  assert.deepEqual(plain(scope.calls[1].ops), [{ op: 'unset', path: ['secretaryOrchestrators', '0'] }])
+  assert.deepEqual(plain(scope.calls[1].ops), [{ op: 'unset', path: ['secretaryOrchestrators', '2'] }])
 
+  // Two rows have to go (the new Master and the row duplicating it). Unsetting both by index
+  // would shift the second index, so the whole list is rewritten from the normalized rows.
   byTestId(view.tree, 'orchestrator-secretary-setmaster-s-2').props.onClick()
   await flush()
-  // The new Master, its row removed, and the old conflict row unset — all in one mutate.
   assert.deepEqual(plain(scope.calls[2].ops), [
     { op: 'set', path: ['secretaryMasterSessionId'], value: 's-2' },
-    { op: 'unset', path: ['secretaryOrchestrators', '1'] },
+    {
+      op: 'set',
+      path: ['secretaryOrchestrators'],
+      value: [{ sessionId: 's-1', workspace: 'D:\\w', title: '构建视图', trackedAt: 1 }],
+    },
   ])
+})
+
+test('an id the stored list does not hold is removed by rewriting, never by index (why: index deletes a neighbour)', async () => {
+  // The host sent no raw list at all: there is no index to trust.
+  const legacy = fakeScope()
+  const legacyView = mount(T.SecretarySettings, {
+    t,
+    orch: legacy,
+    payload: secretaryPayload({ registry: { masterSessionId: 'm-1', orchestrators: [{ sessionId: 's-1', title: '构建', workspace: 'D:\\w', trackedAt: 1 }], conflict: null } }),
+    mutate: legacy.mutate,
+  })
+  byTestId(legacyView.tree, 'orchestrator-secretary-unregister-s-1').props.onClick()
+  await flush()
+  assert.deepEqual(plain(legacy.calls[0].ops), [{ op: 'set', path: ['secretaryOrchestrators'], value: [] }])
+
+  // A raw list that does not contain the row (a stale payload) is no better.
+  const stale = fakeScope()
+  const staleView = mount(T.SecretarySettings, {
+    t,
+    orch: stale,
+    payload: secretaryPayload({
+      registry: { masterSessionId: '', orchestrators: [{ sessionId: 's-1', title: '构建', workspace: 'D:\\w', trackedAt: 1 }], raw: [{ sessionId: 'other' }], conflict: null },
+    }),
+    mutate: stale.mutate,
+  })
+  byTestId(staleView.tree, 'orchestrator-secretary-unregister-s-1').props.onClick()
+  await flush()
+  assert.deepEqual(plain(stale.calls[0].ops), [{ op: 'set', path: ['secretaryOrchestrators'], value: [] }])
 })
 
 test('the switch off renders its own state, reads nothing, and can be turned on', async () => {
@@ -1836,10 +1909,40 @@ test('the switch off renders its own state, reads nothing, and can be turned on'
   })
   await flush()
   assert.ok(byTestId(view.tree, 'orchestrator-secretary-disabled'))
+  // With the switch off no endpoint is registered and the entry disappears; the page left on
+  // screen has to say so and point at the plugin settings that can turn it back on.
+  assert.match(textOf(byTestId(view.tree, 'orchestrator-secretary-disabled-hint')), /secretary\.disabledHint/i)
   assert.equal(loads, 0, 'a disabled view never calls the endpoint')
   byTestId(view.tree, 'orchestrator-secretary-enable').props.onClick()
   await flush()
   assert.deepEqual(plain(scope.calls[0].ops), [{ op: 'set', path: ['secretaryEnabled'], value: true }])
+})
+
+test('the tracking switch shows the host answer and writes both directions (why: it could only turn off)', async () => {
+  // On: the switch is checked because the endpoint says enabled, and turning it off writes
+  // false — the one value the old hardwired handler could produce at all.
+  const scope = fakeScope({ initial: { secretaryEnabled: true } })
+  const view = mount(T.SecretarySettings, { t, orch: scope, payload: secretaryPayload(), mutate: scope.mutate })
+  const toggle = byTestId(view.tree, 'orchestrator-secretary-enabled')
+  assert.equal(toggle.props.checked, true, 'the switch shows what the endpoint reports')
+  toggle.props.onChange()
+  await flush()
+  assert.deepEqual(plain(scope.calls[0].ops), [{ op: 'set', path: ['secretaryEnabled'], value: false }])
+
+  // Off: a host that answers enabled:false shows an unchecked switch, and clicking it turns the
+  // secretary on instead of writing false once more.
+  const offScope = fakeScope({ initial: { secretaryEnabled: true } })
+  const offView = mount(T.SecretarySettings, {
+    t,
+    orch: offScope,
+    payload: secretaryPayload({ enabled: false }),
+    mutate: offScope.mutate,
+  })
+  const offToggle = byTestId(offView.tree, 'orchestrator-secretary-enabled')
+  assert.equal(offToggle.props.checked, false)
+  offToggle.props.onChange()
+  await flush()
+  assert.deepEqual(plain(offScope.calls[0].ops), [{ op: 'set', path: ['secretaryEnabled'], value: true }])
 })
 
 test('the sidebar glyph is decorative: no second button inside the row', () => {

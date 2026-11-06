@@ -4,7 +4,7 @@ import test from 'node:test'
 import { denyGuard } from '../lib/gate.js'
 import { MAX_MESSAGE_BYTES, MAX_MESSAGE_QUEUE, checkInbound, composeMessage, deliverMessage } from '../lib/master-messaging.js'
 import { MEMORY_DOMAIN_NAME, MEMORY_INDEX_SECTION, MEMORY_SECTION_ORDER } from '../lib/memory.js'
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MASTER_SESSION_ID } from '../lib/master-session.js'
@@ -1580,10 +1580,14 @@ test('the secretary endpoint is provided only while its switch is on', async () 
   assert.deepEqual(Object.keys(payload), ['enabled', 'registry', 'orchestrators', 'reports', 'drafts', 'policy'])
   assert.equal(payload.enabled, true)
   assert.equal(payload.registry.masterSessionId, 'master-1')
+  // No workspace on the ledger row and no session to resolve one from: the row says so instead
+  // of the view silently listing no reports forever.
   assert.deepEqual(
     payload.registry.orchestrators,
-    [{ sessionId: 'orch-1', workspace: '', title: '', trackedAt: 1 }],
+    [{ sessionId: 'orch-1', workspace: '', workspaceMissing: true, title: '', trackedAt: 1 }],
   )
+  // The stored list the settings edits address by index, unnormalized.
+  assert.deepEqual(payload.registry.raw, [{ sessionId: 'orch-1' }])
   assert.equal(payload.orchestrators.length, 1)
   assert.equal(payload.orchestrators[0].sessionId, 'orch-1')
   assert.equal(payload.orchestrators[0].title, '修登录', 'an empty ledger title falls back to the session title')
@@ -1598,7 +1602,9 @@ test('the secretary endpoint is provided only while its switch is on', async () 
   assert.deepEqual(payload.drafts, [], 'ticket 08 owns the drafts')
   assert.equal(payload.policy.beatSeconds, 180)
   assert.equal(payload.policy.maxRunSeconds, 7200)
-  assert.equal(payload.policy.viewReportLimit, 50)
+  // Only the four fields the endpoint really reads: a report root and a view limit were never
+  // config keys, and showing them in the settings tab was a lie about what can be changed.
+  assert.deepEqual(Object.keys(payload.policy), ['beatSeconds', 'maxRunSeconds', 'notifyOn', 'promptText'])
 
   // 开关是 volatile 的：关掉之后同一个服务返回稳定空结构，不读任何会话。
   harness.state.secretaryEnabled = false
@@ -1606,6 +1612,58 @@ test('the secretary endpoint is provided only while its switch is on', async () 
   assert.equal(closed.enabled, false)
   assert.deepEqual(closed.orchestrators, [])
   assert.deepEqual(closed.registry.orchestrators, [])
+})
+
+test('a row registered without a workspace reads its reports from the session cwd (why: the history stayed blank forever)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'secretary-noworkspace-'))
+  try {
+    await mkdir(planDir(dir), { recursive: true })
+    const reportPath = join(planDir(dir), '05-07.md')
+    await writeFile(reportPath, '# 秘书汇报\n\n- 类型：增量\n')
+    // The settings page registers a session id and nothing else, so the ledger row's workspace is
+    // the empty string. The report is really under that session's header.cwd.
+    const session = { id: 'orch-1', title: '修登录', header: { id: 'orch-1', cwd: dir } }
+    const harness = start({
+      secretaryEnabled: true,
+      secretaryOrchestrators: [{ sessionId: 'orch-1', workspace: '', title: '', trackedAt: 1 }],
+      sessions: {
+        get: (id) => (id === 'orch-1' ? session : undefined),
+        list: () => [session],
+        flush: async () => true,
+      },
+      stateOf: () => ({ workers: [{ id: 'orch-1', role: 'main', state: 'Working', summary: '在写报告' }] }),
+    })
+    const payload = await harness.services.get('orchestratorSecretary').secretaryState()
+    assert.deepEqual(payload.registry.orchestrators, [
+      { sessionId: 'orch-1', workspace: dir, workspaceMissing: false, title: '', trackedAt: 1 },
+    ])
+    assert.equal(payload.reports.length, 1, 'the archived report is listed once the workspace is known')
+    assert.equal(payload.reports[0].path, reportPath)
+    assert.equal(payload.reports[0].kind, 'delta')
+
+    // A session the host cannot resolve is flagged, not pointed at a guessed directory: the
+    // report root of an empty or borrowed workspace is never read.
+    const other = start({
+      secretaryEnabled: true,
+      secretaryOrchestrators: [{ sessionId: 'orch-1', workspace: '', title: '', trackedAt: 1 }],
+      sessions: {
+        get: () => undefined,
+        list: () => [{ id: 'orch-1', title: '修登录', header: { id: 'orch-1' } }],
+        flush: async () => true,
+      },
+    })
+    const flagged = await other.services.get('orchestratorSecretary').secretaryState()
+    assert.deepEqual(flagged.registry.orchestrators[0], {
+      sessionId: 'orch-1',
+      workspace: '',
+      workspaceMissing: true,
+      title: '',
+      trackedAt: 1,
+    })
+    assert.deepEqual(flagged.reports, [], 'nothing is listed for a row with no workspace')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })
 
 test('the mounted secretary drafts a nudge for a Needs input session, dedupes it, and sends only on confirm (why: reads no longer draft)', async () => {

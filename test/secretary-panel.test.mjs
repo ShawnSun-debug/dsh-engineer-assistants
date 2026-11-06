@@ -19,13 +19,14 @@ import {
 } from '../lib/secretary-panel.js'
 import { renderPlanReport, renderReport } from '../lib/secretary-report.js'
 
+// Four fields, all of them read from config by the endpoint. The report root and the view limit
+// are constants of the reader, not policy: a field the endpoint never sends would be a lie in the
+// settings tab, and neither of them can be changed from there.
 const EMPTY_POLICY = {
   beatSeconds: 180,
   maxRunSeconds: 7200,
   notifyOn: { state: true, step: true, block: true, deliverable: true, timeout: true },
   promptText: '',
-  reportsRoot: '.scratch/master-secretary/reports',
-  viewReportLimit: 50,
 }
 
 const ORCHESTRATOR = {
@@ -72,15 +73,29 @@ test('the payload carries five segments with exactly the contract field names (w
     orchestrators: [ORCHESTRATOR],
     reports: [REPORT],
     drafts: [DRAFT],
-    policy: { beatSeconds: 300, maxRunSeconds: 900, notifyOn: notifyOnFrom([]), promptText: '口径', reportsRoot: '.scratch/x', viewReportLimit: 7 },
+    policy: { beatSeconds: 300, maxRunSeconds: 900, notifyOn: notifyOnFrom([]), promptText: '口径' },
   })
 
   assert.deepEqual(Object.keys(payload), ['enabled', 'registry', 'orchestrators', 'reports', 'drafts', 'policy'])
   assert.equal(payload.enabled, true)
 
-  assert.deepEqual(Object.keys(payload.registry), ['masterSessionId', 'orchestrators', 'conflict'])
-  assert.deepEqual(Object.keys(payload.registry.orchestrators[0]), ['sessionId', 'workspace', 'title', 'trackedAt'])
-  assert.deepEqual(payload.registry.orchestrators[0], { sessionId: 'orch-1', workspace: 'w', title: '日报', trackedAt: 7 })
+  assert.deepEqual(Object.keys(payload.registry), ['masterSessionId', 'orchestrators', 'raw', 'conflict'])
+  assert.deepEqual(Object.keys(payload.registry.orchestrators[0]), [
+    'sessionId',
+    'workspace',
+    'workspaceMissing',
+    'title',
+    'trackedAt',
+  ])
+  assert.deepEqual(payload.registry.orchestrators[0], {
+    sessionId: 'orch-1',
+    workspace: 'w',
+    workspaceMissing: false,
+    title: '日报',
+    trackedAt: 7,
+  })
+  // The stored list, ids only and in storage order: the view edits by this index.
+  assert.deepEqual(payload.registry.raw, [{ sessionId: 'orch-1' }])
 
   // step / lastError are gone on purpose: with no data source they were always null
   // and made the view's branches unreachable. They return with a ticket that has one.
@@ -114,21 +129,12 @@ test('the payload carries five segments with exactly the contract field names (w
   ])
   assert.deepEqual(payload.drafts[0], DRAFT)
 
-  assert.deepEqual(Object.keys(payload.policy), [
-    'beatSeconds',
-    'maxRunSeconds',
-    'notifyOn',
-    'promptText',
-    'reportsRoot',
-    'viewReportLimit',
-  ])
+  assert.deepEqual(Object.keys(payload.policy), ['beatSeconds', 'maxRunSeconds', 'notifyOn', 'promptText'])
   assert.deepEqual(payload.policy, {
     beatSeconds: 300,
     maxRunSeconds: 900,
     notifyOn: { state: false, step: false, block: false, deliverable: false, timeout: false },
     promptText: '口径',
-    reportsRoot: '.scratch/x',
-    viewReportLimit: 7,
   })
 })
 
@@ -136,7 +142,7 @@ test('the empty payload is the stable five-segment shape the view can always ren
   const empty = emptyViewState()
   assert.deepEqual(empty, {
     enabled: false,
-    registry: { masterSessionId: '', orchestrators: [], conflict: null },
+    registry: { masterSessionId: '', orchestrators: [], raw: [], conflict: null },
     orchestrators: [],
     reports: [],
     drafts: [],
@@ -150,7 +156,7 @@ test('the empty payload is the stable five-segment shape the view can always ren
 test('nothing registered is an empty orchestrators array, never an error', () => {
   const payload = composeViewState({ enabled: true, registry: { masterSessionId: '', orchestrators: [] } })
   assert.deepEqual(payload.orchestrators, [])
-  assert.deepEqual(payload.registry, { masterSessionId: '', orchestrators: [], conflict: null })
+  assert.deepEqual(payload.registry, { masterSessionId: '', orchestrators: [], raw: [], conflict: null })
   assert.deepEqual(payload.reports, [])
   assert.deepEqual(payload.drafts, [])
   assert.deepEqual(payload.policy, EMPTY_POLICY)
@@ -175,10 +181,9 @@ test('a session registered as both master and orchestrator is reported as a conf
   assert.deepEqual(payload.registry.conflict, { masterSessionId: 'x', conflictingOrchestratorIds: ['x'] })
 })
 
-test('the policy segment falls back to the documented defaults and honours what it is given', () => {
+test('the policy segment carries the four real fields and nothing else', () => {
   assert.deepEqual(emptyViewState().policy, EMPTY_POLICY)
-  assert.equal(VIEW_REPORT_LIMIT, EMPTY_POLICY.viewReportLimit)
-  assert.equal(DEFAULT_REPORTS_ROOT, EMPTY_POLICY.reportsRoot)
+  assert.deepEqual(Object.keys(EMPTY_POLICY), ['beatSeconds', 'maxRunSeconds', 'notifyOn', 'promptText'])
   assert.deepEqual(notifyOnFrom(['state-flip', 'blocked', 'later-additions']), {
     state: true,
     step: false,
@@ -186,16 +191,22 @@ test('the policy segment falls back to the documented defaults and honours what 
     deliverable: false,
     timeout: false,
   })
-  const custom = composeViewState({ policy: { beatSeconds: 300, maxRunSeconds: 900 } }).policy
+  const custom = composeViewState({
+    policy: { beatSeconds: 300, maxRunSeconds: 900, reportsRoot: '.scratch/x', viewReportLimit: 7 },
+  }).policy
   assert.equal(custom.beatSeconds, 300)
   assert.equal(custom.maxRunSeconds, 900)
   assert.deepEqual(custom.notifyOn, EMPTY_POLICY.notifyOn, 'a missing switch list defaults to all five on')
-  assert.equal(custom.reportsRoot, DEFAULT_REPORTS_ROOT)
-  assert.equal(custom.viewReportLimit, VIEW_REPORT_LIMIT)
+  // Input that still names them cannot bring them back: they are not policy.
+  assert.equal('reportsRoot' in custom, false)
+  assert.equal('viewReportLimit' in custom, false)
+  // The reader's own constants stay constants.
+  assert.equal(DEFAULT_REPORTS_ROOT, '.scratch/master-secretary/reports')
+  assert.equal(VIEW_REPORT_LIMIT, 50)
 })
 
-test('reports and drafts arrive newest first and the report list stops at the policy limit', () => {
-  const reports = Array.from({ length: 4 }, (_, index) => ({
+test('reports and drafts arrive newest first and the report list stops at the reader limit', () => {
+  const reports = Array.from({ length: 60 }, (_, index) => ({
     sessionId: 'orch-1',
     at: index,
     kind: 'delta',
@@ -203,18 +214,68 @@ test('reports and drafts arrive newest first and the report list stops at the po
     bytes: 1,
     changes: [],
     error: null,
-  })).concat([{ sessionId: 'orch-1', at: 99, kind: 'delta', path: '', bytes: 0, changes: [], error: null }])
+  })).concat([
+    // 没有路径的行是垃圾行，不是一条历史。
+    { sessionId: 'orch-1', at: 99, kind: 'delta', path: '', bytes: 0, changes: [], error: null },
+  ])
   const payload = composeViewState({
     reports,
-    // 没有路径的行是垃圾行，不是一条历史。
-    policy: { viewReportLimit: 2 },
     drafts: [
       { id: 'old', createdAt: 1 },
       { id: 'new', createdAt: 5 },
     ],
   })
-  assert.deepEqual(payload.reports.map((row) => row.at), [3, 2])
+  // The cap is VIEW_REPORT_LIMIT, a constant of the reader; it used to be read from a policy field
+  // the endpoint never sent, and the settings tab showed it as if it were configurable.
+  assert.equal(payload.reports.length, VIEW_REPORT_LIMIT)
+  assert.deepEqual(payload.reports.slice(0, 3).map((row) => row.at), [59, 58, 57])
+  assert.equal(payload.reports.some((row) => row.path === ''), false, 'a row with no path is not history')
   assert.deepEqual(payload.drafts.map((row) => row.id), ['new', 'old'])
+})
+
+test('the raw list keeps storage order while the normalized one drops rows, and an unbound row resolves its workspace', () => {
+  const payload = composeViewState({
+    enabled: true,
+    registry: {
+      masterSessionId: 'x',
+      orchestrators: [
+        { sessionId: 'x', workspace: '', title: '主', trackedAt: 1 },
+        { sessionId: 'y', workspace: 'w2', title: '同名', trackedAt: 2 },
+        { sessionId: 'y', workspace: 'w2', title: '同名', trackedAt: 3 },
+        { sessionId: 'z', workspace: '', title: '无', trackedAt: 4 },
+      ],
+    },
+    // The session's own directory, the same answer the read function gives in lib/index.js.
+    workspaceOf: (sessionId) => (sessionId === 'z' ? 'w3' : ''),
+  })
+  // Normalized: the Master row is gone and the second y is deduped.
+  assert.deepEqual(
+    payload.registry.orchestrators.map((row) => [row.sessionId, row.workspace, row.workspaceMissing]),
+    [
+      ['y', 'w2', false],
+      ['z', 'w3', false],
+    ],
+  )
+  // Raw keeps storage order and length, so index 0 is still the Master row and 2 the duplicate.
+  assert.deepEqual(payload.registry.raw, [
+    { sessionId: 'x' },
+    { sessionId: 'y' },
+    { sessionId: 'y' },
+    { sessionId: 'z' },
+  ])
+
+  // A resolver that throws is no answer, not a crash.
+  const broken = composeViewState({
+    registry: { masterSessionId: '', orchestrators: [{ sessionId: 'z', workspace: '', title: '', trackedAt: 1 }] },
+    workspaceOf: () => {
+      throw new Error('no such session')
+    },
+  })
+  assert.deepEqual(
+    [broken.registry.orchestrators[0].workspace, broken.registry.orchestrators[0].workspaceMissing],
+    ['', true],
+  )
+  assert.deepEqual(broken.registry.raw, [{ sessionId: 'z' }])
 })
 
 test('composing never writes into the input it was handed', () => {
