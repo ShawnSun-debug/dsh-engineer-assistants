@@ -1554,3 +1554,88 @@ test('an untracked session writes nothing, and registering it takes effect on th
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+// ---- Secretary view endpoint (secretary spec, ticket 06): read-only five-segment payload -----
+
+test('the secretary endpoint is provided only while its switch is on', async () => {
+  // 关闭：一个服务都不注册（master 面板的端点与这把开关无关，仍在）。
+  const off = start()
+  assert.deepEqual([...off.services.keys()], ['orchestratorMaster'])
+  assert.equal(off.services.has('orchestratorSecretary'), false, 'a closed switch registers no secretary service')
+
+  const session = { id: 'orch-1', title: '修登录', header: { id: 'orch-1' } }
+  const harness = start({
+    secretaryEnabled: true,
+    secretaryOrchestrators: [{ sessionId: 'orch-1', workspace: '', title: '', trackedAt: 1 }],
+    sessions: { get: () => undefined, list: () => [session], flush: async () => true },
+    agents: { get: (id) => (id === 'orch-1' ? { id } : undefined) },
+    stateOf: () => ({ workers: [{ id: 'orch-1', role: 'main', state: 'Working', summary: '在写报告' }] }),
+  })
+  const service = harness.services.get('orchestratorSecretary')
+  assert.ok(service, 'the open switch provides the read-only endpoint')
+  assert.equal(typeof service.secretaryState, 'function')
+
+  const payload = await service.secretaryState()
+  assert.deepEqual(Object.keys(payload), ['enabled', 'registry', 'orchestrators', 'reports', 'drafts', 'policy'])
+  assert.equal(payload.enabled, true)
+  assert.equal(payload.registry.masterSessionId, 'master-1')
+  assert.deepEqual(
+    payload.registry.orchestrators,
+    [{ sessionId: 'orch-1', workspace: '', title: '', trackedAt: 1 }],
+  )
+  assert.equal(payload.orchestrators.length, 1)
+  assert.equal(payload.orchestrators[0].sessionId, 'orch-1')
+  assert.equal(payload.orchestrators[0].title, '修登录', 'an empty ledger title falls back to the session title')
+  assert.equal(payload.orchestrators[0].live, true)
+  assert.equal(payload.orchestrators[0].state, 'Working')
+  assert.equal(payload.orchestrators[0].step, null)
+  assert.deepEqual(payload.reports, [], 'a workspace that was never written lists no report')
+  assert.deepEqual(payload.drafts, [], 'ticket 08 owns the drafts')
+  assert.equal(payload.policy.beatSeconds, 180)
+  assert.equal(payload.policy.maxRunSeconds, 7200)
+  assert.equal(payload.policy.viewReportLimit, 50)
+
+  // 开关是 volatile 的：关掉之后同一个服务返回稳定空结构，不读任何会话。
+  harness.state.secretaryEnabled = false
+  const closed = await service.secretaryState()
+  assert.equal(closed.enabled, false)
+  assert.deepEqual(closed.orchestrators, [])
+  assert.deepEqual(closed.registry.orchestrators, [])
+})
+
+test('the secretary endpoint lists the archived reports of a registered workspace', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'secretary-view-'))
+  try {
+    const session = { id: 'orch-1', title: '修登录', header: { id: 'orch-1', cwd: dir } }
+    const harness = start({
+      secretaryEnabled: true,
+      secretaryOrchestrators: [{ sessionId: 'orch-1', workspace: dir, title: '', trackedAt: 1 }],
+      sessions: { get: () => undefined, list: () => [session], flush: async () => true },
+      stateOf: () => ({ workers: [{ id: 'orch-1', role: 'main', state: 'Completed', summary: '做完了' }] }),
+    })
+    const service = harness.services.get('orchestratorSecretary')
+    assert.deepEqual((await service.secretaryState()).reports, [], 'no archive yet is an empty list, not an error')
+
+    // 票 03 的 watch 写规划首报；端点从票 04 的归档目录把它读回来。
+    const listener = harness.handlers.get('session/event')
+    await listener(session, dispatchEvent({ description: '修登录', prompt: '让重试可用' }))
+
+    const payload = await service.secretaryState()
+    assert.equal(payload.reports.length, 1)
+    assert.equal(payload.reports[0].sessionId, 'orch-1')
+    assert.equal(payload.reports[0].kind, 'plan')
+    assert.match(payload.reports[0].path, /\.scratch[\\/]master-secretary[\\/]reports[\\/]orch-1[\\/]\d{2}-\d{2}\.md$/)
+    assert.deepEqual(payload.reports[0].changes, [])
+    assert.equal(payload.reports[0].error, null)
+    assert.ok(payload.reports[0].bytes > 0)
+    assert.deepEqual(payload.orchestrators[0].lastReport, {
+      path: payload.reports[0].path,
+      at: payload.reports[0].at,
+      kind: 'plan',
+    })
+    assert.equal(payload.orchestrators[0].live, false, 'no live agent means not live, not an error')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
