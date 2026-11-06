@@ -78,7 +78,7 @@ function tabsOf(view) {
 }
 
 function pageOf(view, title) {
-  return tabsOf(view).pages.find((page) => page.title === title)
+  return tabsOf(view).items.find((page) => page.label === title)
 }
 
 const POLICY = {
@@ -147,29 +147,47 @@ test('scope.sessionId limits every page to that session (why: session.tab gives 
   assert.ok(!serialized.includes('第二会话'))
   assert.ok(!serialized.includes('第二个卡点'))
 
-  const trackingRows = pageOf(scoped, '跟踪').children[0].rows
+  const trackingRows = pageOf(scoped, '跟踪').children[0].items
   assert.equal(trackingRows.length, 1)
   assert.equal(trackingRows[0].title, '会话 orch-1')
 
   const historyItems = pageOf(scoped, '历史').children[0].items
   assert.equal(historyItems.length, 1)
 
-  const diffTitles = pageOf(scoped, '差异').children.map((component) => component.rows[0].title)
+  const diffTitles = pageOf(scoped, '差异').children.map((component) => component.items[0].title)
   assert.deepEqual(diffTitles, ['w1: Working → Completed', '无', '无'])
 
   const unscoped = buildView({ state: stateOf() })
-  assert.equal(pageOf(unscoped, '跟踪').children[0].rows.length, 2)
+  assert.equal(pageOf(unscoped, '跟踪').children[0].items.length, 2)
 })
 
 test('the native panel has the five pages the panel contract names', () => {
   const view = buildView({ state: stateOf() })
   assert.equal(view.type, 'stack')
   assert.equal(view.title, '秘书')
-  assert.deepEqual(tabsOf(view).pages.map((page) => page.title), [...TAB_TITLES])
+  assert.deepEqual(tabsOf(view).items.map((page) => page.label), [...TAB_TITLES])
   assert.deepEqual(
     [...TAB_TITLES],
     ['总览', '跟踪', '编排', '差异', '历史'],
   )
+})
+
+test('the view root declares v 2, so the tabs and timeline components render', () => {
+  // Two different version numbers: the manifest's dshGo.v is the protocol (1, or the app
+  // rejects the plugin as unsupported), this root v is the view path (2, or the app drops
+  // every v2-only component — tabs and timeline among them — and shows an empty panel).
+  const view = buildView({ state: stateOf() })
+  assert.equal(view.v, 2)
+
+  const types = componentsOf(view).map((component) => component.type)
+  for (const type of ['tabs', 'timeline']) assert.ok(types.includes(type), type + ' is v2-only')
+  assert.equal(tabsOf(view).type, 'tabs')
+
+  // A v2 timeline entry is { label } and nothing else: the schema forbids extra fields, so
+  // the clock time has to live inside the label rather than in its own 'at'.
+  const entry = pageOf(view, '历史').children[0].items[0]
+  assert.deepEqual(Object.keys(entry), ['label'])
+  assert.ok(entry.label.includes(' · '), 'the label carries the clock time: ' + entry.label)
 })
 
 test('the view stays inside the node budget and the 8-level depth cap', () => {
@@ -199,11 +217,11 @@ test('the view stays inside the node budget and the 8-level depth cap', () => {
 
   assert.ok(measured.nodes <= PANEL_LIMITS.nodes, 'got ' + measured.nodes + ' nodes')
   assert.ok(measured.depth <= PANEL_LIMITS.depth, 'got depth ' + measured.depth)
-  assert.equal(tabsOf(view).pages.length, 5, 'budget trimming never removes a page')
-  assert.ok(pageOf(view, '跟踪').children[0].rows.length <= PANEL_LIMITS.list)
+  assert.equal(tabsOf(view).items.length, 5, 'budget trimming never removes a page')
+  assert.ok(pageOf(view, '跟踪').children[0].items.length <= PANEL_LIMITS.list)
   assert.ok(pageOf(view, '编排').children[1].rows.length <= PANEL_LIMITS.table)
   assert.ok(pageOf(view, '历史').children[0].items.length <= PANEL_LIMITS.timeline)
-  assert.ok(pageOf(view, '总览').children[0].rows.length <= PANEL_LIMITS.keyValue)
+  assert.ok(pageOf(view, '总览').children[0].items.length <= PANEL_LIMITS.keyValue)
 })
 
 test('the view stays under 32 KiB even with pathological strings', () => {
@@ -229,7 +247,7 @@ test('the view stays under 32 KiB even with pathological strings', () => {
   const bytes = Buffer.byteLength(JSON.stringify(view), 'utf8')
 
   assert.ok(bytes <= PANEL_LIMITS.bytes, 'got ' + bytes + ' bytes')
-  assert.equal(tabsOf(view).pages.length, 5)
+  assert.equal(tabsOf(view).items.length, 5)
   assert.ok(countNodes(view).nodes <= PANEL_LIMITS.nodes)
 })
 
@@ -341,7 +359,7 @@ test('mountDshGo registers exactly one panel called secretary through ctx.inject
   assert.equal(typeof options.actions[ACTIONS.copySummary], 'function')
 
   const view = options.view({ sessionId: 'orch-1', features: [] })
-  assert.equal(pageOf(view, '跟踪').children[0].rows.length, 1)
+  assert.equal(pageOf(view, '跟踪').children[0].items.length, 1)
   assert.equal(summarize(state).startsWith('在跑 2'), true)
 
   const cancel = options.data({}, (payload) => emissions.push(payload))

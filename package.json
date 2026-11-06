@@ -32,12 +32,12 @@
     }
   },
   "dshGo": {
-    "v": 2,
+    "v": 1,
     "title": {
       "zh": "秘书",
       "en": "Secretary"
     },
-    "icon": "message",
+    "icon": "chat",
     "contributes": {
       "panels": [
         {
