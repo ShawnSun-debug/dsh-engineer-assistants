@@ -31,6 +31,32 @@
       ]
     }
   },
+  "dshGo": {
+    "v": 2,
+    "title": {
+      "zh": "秘书",
+      "en": "Secretary"
+    },
+    "icon": "message",
+    "contributes": {
+      "panels": [
+        {
+          "id": "secretary",
+          "title": {
+            "zh": "秘书",
+            "en": "Secretary"
+          },
+          "placement": [
+            "features",
+            "session.tab"
+          ]
+        }
+      ]
+    }
+  },
+  "engines": {
+    "dsh": ">=0.2.1-rc.2 <0.3.0-0"
+  },
   "peerDependencies": {
     "@deepseek-ai/dsh-tools": "*",
     "@deepseek-ai/schemastery": "*",
@@ -44,6 +70,7 @@
     "dsh",
     "deepseek-harness",
     "dsh-plugin",
+    "dsh-bundle",
     "orchestrator",
     "subagent",
     "planning"

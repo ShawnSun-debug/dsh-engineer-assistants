@@ -1,3 +1,8 @@
+# 本包同时带两半，分工固定：
+# - 网页半侧：package.json 的 dsh.client（界面在 lib/client.js）
+# - App 原生半侧：package.json 的 dshGo（运行时在 lib/dshgo.js，经 ctx.inject(['dshGo']) 注册面板）
+# 这个 bundle 只负责安装层：把插件装进 profile，不声明任何适配。适配声明一律在 package.json
+# 的 dsh / dshGo 键里，别在这里复制一份，否则静态声明与运行时会有两份真相。
 - insert:
     - id: orchestrator
       name: dsh-orchestrator
