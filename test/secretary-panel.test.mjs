@@ -17,6 +17,7 @@ import {
   listReportRows,
   notifyOnFrom,
 } from '../lib/secretary-panel.js'
+import { applyDraftTriggers, createDraftStore } from '../lib/secretary-nudge.js'
 import { renderPlanReport, renderReport } from '../lib/secretary-report.js'
 
 // Four fields, all of them read from config by the endpoint. The report root and the view limit
@@ -436,6 +437,74 @@ test('the Remote exposes the read method plus the two draft transitions (why: ti
     { method: 'confirmDraft', invocation: { kind: 'direct' } },
     { method: 'discardDraft', invocation: { kind: 'direct' } },
   ])
+})
+
+/** Every own path whose value is undefined; a JSON round trip drops those keys silently. */
+function undefinedPaths(value, path = []) {
+  if (value === undefined) return [path.join('.') || '<root>']
+  if (value === null || typeof value !== 'object') return []
+  if (Array.isArray(value)) return value.flatMap((item, index) => undefinedPaths(item, [...path, String(index)]))
+  return Object.keys(value).flatMap((key) => undefinedPaths(value[key], [...path, key]))
+}
+
+/** A messaging adapter that answers one fixed outcome. */
+function fakeMessaging(outcome = { delivered: true }) {
+  return {
+    async deliver() {
+      return outcome
+    },
+  }
+}
+
+/** A store with one pending Needs-input draft plus the Remote that transitions it. */
+function draftFixture(messaging) {
+  const store = createDraftStore()
+  applyDraftTriggers({ store, orchestrators: [{ sessionId: 's-1', title: '构建', state: 'Needs input' }], now: 1000 })
+  const service = new SecretaryRemote({
+    enabled: () => true,
+    read: async () => ({ drafts: store.list() }),
+    drafts: store,
+    masterSessionId: 'master-1',
+    messaging,
+  })
+  return { store, service, draft: store.list()[0] }
+}
+
+test('both draft transitions answer values that survive a JSON round trip unchanged (why: src-json results cross the wire as raw JSON)', async () => {
+  const sent = draftFixture(fakeMessaging())
+  const confirmed = await sent.service.confirmDraft(sent.draft.id)
+  assert.equal(confirmed.delivered, true)
+  assert.equal(confirmed.draft.status, 'sent')
+
+  const refused = draftFixture(fakeMessaging({ delivered: false, reason: 'no live agent' }))
+  const failed = await refused.service.confirmDraft(refused.draft.id)
+  assert.equal(failed.delivered, false)
+  assert.equal(failed.reason, 'no live agent')
+
+  const missing = draftFixture(fakeMessaging())
+  const unknown = await missing.service.confirmDraft('draft-missing')
+  assert.equal(unknown.reason, 'draft-missing')
+
+  const discardedFixture = draftFixture(fakeMessaging())
+  const discarded = await discardedFixture.service.discardDraft(discardedFixture.draft.id)
+  assert.equal(discarded.draft.status, 'discarded')
+
+  const decidedFixture = draftFixture(fakeMessaging())
+  await decidedFixture.service.discardDraft(decidedFixture.draft.id)
+  const decided = await decidedFixture.service.discardDraft(decidedFixture.draft.id)
+  assert.equal(decided.reason, 'draft-decided')
+  const unknownDiscard = await decidedFixture.service.discardDraft('draft-missing')
+  assert.equal(unknownDiscard.reason, 'draft-missing')
+
+  const off = new SecretaryRemote({ enabled: () => false })
+  const disabledConfirm = await off.confirmDraft('anything')
+  const disabledDiscard = await off.discardDraft('anything')
+
+  const answers = { confirmed, failed, unknown, discarded, decided, unknownDiscard, disabledConfirm, disabledDiscard }
+  for (const [name, value] of Object.entries(answers)) {
+    assert.deepEqual(JSON.parse(JSON.stringify(value)), value, name + ' keeps every field through JSON')
+    assert.deepEqual(undefinedPaths(value), [], name + ' carries no undefined-valued key')
+  }
 })
 
 test('the switch off returns the empty payload and reads neither the host nor the archive', async () => {

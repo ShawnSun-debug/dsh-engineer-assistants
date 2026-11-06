@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import test from 'node:test'
 import vm from 'node:vm'
+import { z } from 'zod'
 import { WORKER_STATE } from '../lib/master-state.js'
 import { NOTIFY_SWITCHES } from '../lib/secretary-constants.js'
 
@@ -158,6 +159,9 @@ const fakeWindow = {
     load: (def) => {
       mod = def.factory((id) => {
         if (id === 'react') return React
+        // The web loader resolves 'zod' for every client bundle that asks (api-remotes does),
+        // so the plugin's codec factory may require it by the same id.
+        if (id === 'zod') return { z }
         throw new Error('unexpected require ' + id)
       })
     },
@@ -1348,9 +1352,88 @@ test('the secretary contribution declares the two draft transitions with one dra
     assert.equal(descriptor.service, 'orchestratorSecretary')
     assert.equal(descriptor.namespace, 'orchestratorSecretary')
     assert.equal(descriptor.invocation.kind, 'direct')
-    assert.deepEqual(descriptor.parameters, [{ name: 'draftId', source: 'json', codec: { mode: 'src-json' } }])
+    // Why changed (mount-gate fix): the parameter used to be src-json and carried no wire name,
+    // so $mount threw "field undefined has no strict codec" before anything was installed and
+    // the panel never read its state. The wire name is what the Host matches its SRC parameter
+    // against — without it the request would carry no draftId and the Host would refuse it as an
+    // unexpected field.
+    const [parameter] = descriptor.parameters
+    assert.equal(parameter.name, 'draftId')
+    assert.equal(parameter.wire, 'draftId')
+    assert.equal(parameter.source, 'json')
+    assert.equal(parameter.codec.mode, 'strict')
+    assert.equal(typeof parameter.codec.typeSymbol, 'string')
+    assert.ok(parameter.codec.typeSymbol.length > 0)
+    // plain() drops functions, so the factory is read from the live descriptor and run once:
+    // the declared codec really is a string schema, not a placeholder that only satisfies a
+    // typeof check.
+    const live = T.SECRETARY_CONTRIBUTION.descriptors.find((entry) => entry.method === descriptor.method)
+    assert.equal(typeof live.parameters[0].codec.create, 'function', 'a strict codec needs its factory')
+    const schema = live.parameters[0].codec.create()
+    assert.equal(schema.parse('d-1'), 'd-1')
+    assert.throws(() => schema.parse(1), 'draftId is a string on the wire')
+    assert.deepEqual(plain(parameter.codec.jsonSchema), { type: 'string' })
+    // The results stay src-json (commit 814d662): raw JSON both ways, no generated decoder.
     assert.deepEqual(descriptor.result, { mode: 'src-json' })
   }
+})
+
+
+// ---- The Gateway's client mount gate, ported -------------------------------------------
+//
+// ctx.remote.$mount() validates a contribution before any method becomes callable, in two
+// places outside this repo:
+//
+//   @deepseek-ai/dsh-api-gateway lib/types/client/index.js
+//     validateContribution -> requireStrictInputs -> requireStrictCodec
+//   @deepseek-ai/dsh-typert-registry lib/client.browser.js
+//     RemoteStore.register -> DescriptorStore.validate -> validateInvocation -> validateCodec
+//
+// The first refuses every Client-supplied field whose codec is not 'strict' (the message is
+// "client api: generated Remote <endpoint> field <wire> has no strict codec"); the second
+// refuses a strict codec without a type symbol and a create() factory. Both are copied here
+// in behaviour, message included, so a red run says exactly what the browser console says.
+function requireStrictCodec(codec, endpoint, field) {
+  if (codec === undefined || codec.mode !== 'strict') {
+    throw new Error('client api: generated Remote ' + endpoint + ' field ' + JSON.stringify(field) + ' has no strict codec')
+  }
+}
+
+function validateWireName(subject, value) {
+  if (value === '.' || value === '..' || !/^[A-Za-z0-9_$.-]+$/.test(value)) {
+    throw new Error('typert: invalid ' + subject + ' "' + String(value) + '"')
+  }
+}
+
+function validateCodec(codec, subject) {
+  if (codec === undefined) throw new Error('typert: ' + subject + ' has no codec')
+  if (codec.mode === 'src-json') return
+  if (typeof codec.typeSymbol !== 'string' || codec.typeSymbol.length === 0) {
+    throw new Error('typert: ' + subject + ' type symbol is not a nonempty string')
+  }
+  if (typeof codec.create !== 'function') throw new Error('typert: ' + subject + ' strict codec has no create() factory')
+}
+
+function mountContribution(contribution) {
+  // The Gateway refuses inputs it cannot type before anything is installed.
+  for (const descriptor of contribution.descriptors) {
+    for (const parameter of descriptor.parameters) {
+      requireStrictCodec(parameter.codec, descriptor.namespace + '/' + descriptor.method, parameter.wire)
+    }
+  }
+  // The Typert registry then validates what it is about to store, result codec included.
+  for (const descriptor of contribution.descriptors) {
+    validateWireName('invocation method', descriptor.method)
+    validateCodec(descriptor.result, descriptor.id + ' result')
+    for (const parameter of descriptor.parameters) {
+      validateWireName('parameter name', parameter.name)
+      validateCodec(parameter.codec, descriptor.id + ' parameter ' + parameter.name)
+    }
+  }
+}
+
+test('the secretary contribution passes the Gateway mount gate (why: a src-json input made every $mount throw and the panel never read its state)', () => {
+  assert.doesNotThrow(() => mountContribution(T.SECRETARY_CONTRIBUTION))
 })
 
 test('the secretary contribution stays src-json with zero parameters', () => {
