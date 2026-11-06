@@ -1,5 +1,7 @@
 # DSH Orchestrator
 
+[![version](https://img.shields.io/badge/version-0.8.0-4176E6?style=flat-square)](https://github.com/SShiRkiT/dsh-orchestrator)
+
 The "dispatch mode" plugin for DeepSeek Harness.
   
   The main agent only clarifies, plans, slices work, and accepts results
@@ -27,7 +29,7 @@ The "dispatch mode" plugin for DeepSeek Harness.
 
 - **The main agent only plans, enforced by a gate**:
   
-     a built-in deny list of 42 tools hides and refuses read, write, shell, web, and other tools at execution time; the main agent keeps only `dispatch`, `send_message`, `todo_write`, `ask_user_question`, `compress`, plus the session tools (`session_*`) and `interrupt_agent`.
+     a whitelist of 11 built-in planning and dispatch tools (`DEFAULT_ALLOWED_TOOLS` / `allowedTools`) is all the main agent may call; every read, write, shell, web, and other host tool — plus any MCP or third-party plugin tool registered later — is hidden and refused at execution time (even a nested call smuggled through `run_code`); the main agent keeps only `dispatch`, `send_message`, `todo_write`, `ask_user_question`, `compress`, `interrupt_agent`, plus the read-only session log tools (`session_*`).
   
 - **One dispatch entry**:
 
@@ -104,11 +106,11 @@ After installing, **fully quit and reopen DSH**: client plugins are composed at 
 1. Dispatch mode is already on after installing and restarting (`enabled` defaults to `true`).
 2. In the composer's "Dispatch mode" panel, configure `workerProvider` and `workerModel` (required) and `workerReasoningEffort` (may stay empty, letting the model resolve its default effort); dispatching without a route fails outright instead of silently inheriting the main-agent model.
 3. Turning off the "Enable dispatch mode" switch temporarily restores all main-agent tools and applies to already-open sessions immediately.
-4. The Denied Tools list on the right of the panel names every tool the host currently offers — read live at start and again whenever the registry changes, so tools another plugin or an MCP server registers are listed too: check to deny, uncheck to allow, with nothing locked out of the list — the dispatch tools (`dispatch`, `send_message`, `todo_write`, `compress`) are rows like any other; "Reset to defaults" returns to the 42 built-ins. A checkbox change rebuilds the main agent's tool table at once, so an already-open session sees it on its next message, with no new session and no switch off/on.
+4. The Allowed Tools list on the right of the panel names every tool the host currently offers — read live at start and again whenever the registry changes, so tools another plugin or an MCP server registers are listed too: check a row to allow the main agent to use that tool, uncheck it to block it, and anything left unchecked — including a newly registered MCP or plugin tool — stays blocked by default; the dispatch entry (`dispatch`, `send_message`, `todo_write`, `compress`) are rows like any other; "Reset to defaults" returns to the 11 built-in allowed tools. A checkbox change rebuilds the main agent's tool table at once, so an already-open session sees it on its next message, with no new session and no switch off/on.
 
 ![Dispatch mode panel](docs/images/dispatch-panel.png)
 
-*The dispatch mode panel: the enable switch, the main agent's and the subagents' models and reasoning effort, and the subagent patrol interval (default 600 s, range 10–86400); the Denied Tools list sits on the right.*
+*The dispatch mode panel: the enable switch, the main agent's and the subagents' models and reasoning effort, and the subagent patrol interval (default 600 s, range 10–86400); the Allowed Tools whitelist sits on the right.*
 
 ## Configuration
 
@@ -117,8 +119,7 @@ Every field is volatile: the host stores it and the plugin re-reads it on each u
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | Master switch for dispatch mode. When off it revokes the hiding; the guard stays installed but lets calls through. |
-| `deniedTools` | 42 built-ins | Tools the main agent may not use, added on top of the built-ins. |
-| `allowedTools` | `[]` | Built-in tools the profile re-allows; the effective list is built-ins + `deniedTools` − `allowedTools`. |
+| `allowedTools` | 11 built-ins | Whitelist-driven: the main agent may use only the tools listed here; every other host, MCP, or plugin tool is hidden and disabled automatically. Check a row in the panel's Allowed Tools column to allow it, uncheck to block it; effective on the next message. |
 | `workerProvider` | `""` | Subagent provider; empty means unconfigured. |
 | `workerModel` | `""` | Subagent model; empty means unconfigured. |
 | `workerReasoningEffort` | `""` | Subagent reasoning effort; empty means it is not passed and the model resolves the default. |
@@ -135,7 +136,7 @@ Every field is volatile: the host stores it and the plugin re-reads it on each u
 | `masterSessionEnabled` | `false` | Persistent cwd-less master session. Read at mount, so changing it needs a plugin reload. |
 | `masterMessagingEnabled` | `false` | Cross-session messaging. Read per delivery; when off a delivery is refused with `disabled` and the receiver is never touched. |
 | `masterInboundPolicy` | `accept` | `accept` / `hold` / `refuse`; an unknown value is refused as `unknown-policy`, never quietly treated as `accept`. |
-| `toolCatalog` | `[]` | The live tool catalog the plugin publishes: every tool name the host currently offers, which is how the panel lists tools beyond the 42 built-ins (MCP servers and other plugins included). Written by the plugin; do not edit it by hand. |
+| `toolCatalog` | `[]` | The live tool catalog the plugin publishes: every tool name the host currently offers, which is how the panel lists tools beyond the 11 built-in allowed tools (MCP servers and other plugins included). Written by the plugin; do not edit it by hand. |
 
 The main agent's default route is not part of this configuration: it lives in the host's `agent-default-model` (`provider` / `model` / `reasoningEffort`), is written by the same panel, and is read when a new agent is created.
 

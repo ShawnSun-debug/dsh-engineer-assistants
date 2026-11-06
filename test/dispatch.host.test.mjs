@@ -28,7 +28,7 @@ const subagents = {
 }
 
 test('the real host defineTool accepts the merged dispatch definition', { skip: defineTool === undefined }, () => {
-  const tool = createDispatchTool({ defineTool, subagents, config, deniedTools: [] })
+  const tool = createDispatchTool({ defineTool, subagents, config, allowedTools: [] })
 
   assert.equal(tool.name, 'dispatch')
   assert.equal(typeof tool.output.render, 'function')
@@ -50,7 +50,7 @@ test('the real host defineTool accepts the merged dispatch definition', { skip: 
 })
 
 test('the merged schema still refuses a single dispatch without a prompt', { skip: defineTool === undefined }, async () => {
-  const tool = createDispatchTool({ defineTool, subagents, config, deniedTools: [] })
+  const tool = createDispatchTool({ defineTool, subagents, config, allowedTools: [] })
   const exec = { agent: { id: 'parent-1', ctx: { tools: { get: () => ({}) } } }, signal: new AbortController().signal }
   await assert.rejects(() => tool.execute({ goal: '读 retry.js' }, exec), /invalid arguments/)
 })

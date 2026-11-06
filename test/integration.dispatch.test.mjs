@@ -16,6 +16,7 @@ const STUBS = {
       node.min = () => chain()
       node.max = () => chain()
       node.step = () => chain()
+      node.description = () => chain()
       return node
     }
     const z = { boolean: () => chain(), string: () => chain(), number: () => chain(), array: () => chain(), object: () => chain() }
@@ -103,8 +104,7 @@ function boot({ reviewText, started = [] }) {
   }
   const config = {
     enabled: { get: () => true },
-    deniedTools: { get: () => [] },
-    allowedTools: { get: () => [] },
+    allowedTools: { get: () => mod.DEFAULT_ALLOWED_TOOLS },
     workerProvider: { get: () => 'worker-provider' },
     workerModel: { get: () => 'worker-model' },
     workerReasoningEffort: { get: () => '' },

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { registerHooks } from 'node:module'
 import test from 'node:test'
-import { denyGuard } from '../lib/gate.js'
+import { allowGuard } from '../lib/gate.js'
 import { MAX_MESSAGE_BYTES, MAX_MESSAGE_QUEUE, checkInbound, composeMessage, deliverMessage } from '../lib/master-messaging.js'
 import { MEMORY_DOMAIN_NAME, MEMORY_INDEX_SECTION, MEMORY_SECTION_ORDER } from '../lib/memory.js'
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
@@ -42,6 +42,8 @@ const STUBS = {
         return node
       }
       node.step = () => node
+      node.description = () => node
+      node.describe = () => node
       return node
     }
     const z = {
@@ -92,17 +94,54 @@ registerHooks({
 const mod = await import(new URL('../lib/index.js', import.meta.url).href)
 
 /**
- * A minimal ctx: only the members `apply` touches, each recording what it got.
- * `enabled` is mutable so a test can flip the switch after installation.
+ * Every tool a host could register: the file/search/shell/web tools a main agent must not
+ * touch, the native delegation tools, an MCP tool, and the `run_code` transport. The gate
+ * hides all of them except the ones the whitelist names (and never `run_code`, which
+ * `tools.restrict` refuses).
+ */
+const HOST_TOOLS = [
+  'apply_patch',
+  'bash',
+  'create_goal',
+  'decompress',
+  'edit',
+  'glob',
+  'grep',
+  'list_agents',
+  'mcp__demo__ping',
+  'ops_bash',
+  'ops_read_files',
+  'pwsh',
+  'ralph',
+  'read',
+  'read_image',
+  'run_code',
+  'schedule_create',
+  'search_context',
+  'subagent',
+  'update_goal',
+  'web_fetch',
+  'web_search',
+  'workflow',
+  ...mod.DEFAULT_ALLOWED_TOOLS,
+]
+
+/** What a whitelist hides out of `HOST_TOOLS`: everything it does not name, transport aside. */
+function hiddenOf(allowed) {
+  return HOST_TOOLS.filter((name) => name !== 'run_code' && !allowed.includes(name))
+}
+
+/** A minimal ctx: only the members `apply` touches, each recording what it got.
+ *  `enabled` and the live `allowedTools` are mutable so a test can flip the switch or the
+ *  whitelist after installation, the way a panel write does.
  */
 function fakeCtx({
   enabled = true,
-  denied = ['edit', 'read'],
-  allowed = [],
+  allowed,
   agents,
   sessions,
   stateOf,
-  catalogNames = ['read', 'edit'],
+  catalogNames = HOST_TOOLS,
   memoryEnabled = false,
   panelEnabled = false,
   masterEnabled = false,
@@ -110,7 +149,7 @@ function fakeCtx({
   secretaryOrchestrators = [],
   storageDomain,
 } = {}) {
-  const state = { enabled, memoryEnabled, panelEnabled, masterEnabled, secretaryEnabled, secretaryOrchestrators }
+  const state = { enabled, allowed, memoryEnabled, panelEnabled, masterEnabled, secretaryEnabled, secretaryOrchestrators }
   const projections = []
   const tools = []
   const handlers = new Map()
@@ -197,8 +236,7 @@ function fakeCtx({
   }
   const config = {
     enabled: { get: () => state.enabled },
-    deniedTools: { get: () => denied },
-    allowedTools: { get: () => allowed },
+    allowedTools: { get: () => state.allowed },
     workerProvider: { get: () => '' },
     workerModel: { get: () => '' },
     workerReasoningEffort: { get: () => '' },
@@ -218,8 +256,6 @@ function fakeCtx({
     ctx,
     config,
     state,
-    denied,
-    allowed,
     projections,
     tools,
     handlers,
@@ -321,7 +357,7 @@ test('a delegated child gets a short role-neutral description, never the main-ag
     assert.equal(/main[- ]agent/i.test(tool.description), false, tool.name)
     assert.equal(tool.description.includes('Main-agent rule:'), false, tool.name)
     assert.equal(tool.description.includes('runs ONLY in a worker'), false, tool.name)
-    assert.equal(tool.description.includes(mod.DEFAULT_DENIED_TOOLS[0]), false, tool.name)
+    assert.equal(tool.description.includes(mod.DEFAULT_ALLOWED_TOOLS[0]), false, tool.name)
     assert.ok(tool.description.length < 400, tool.name)
   }
 })
@@ -351,59 +387,92 @@ test('a panel refresh still re-masks main agents and leaves a child shadow in pl
     return () => {}
   }
   const roots = () => [main.agent, child.agent]
-  const { handlers, created, allowed } = start({ agents: { get: () => undefined, roots } })
+  const { handlers, created, state } = start({ agents: { get: () => undefined, roots } })
   created({ agent: main.agent, source: 'create' })
   created({ agent: child.agent, source: 'startup' })
   assert.deepEqual(childShadows, ['dispatch'])
-  allowed.push('read')
+  state.allowed = [...mod.DEFAULT_ALLOWED_TOOLS, 'read']
   handlers.get('loader/volatile-update')()
   assert.equal(main.mask.has('read'), false, 'the main mask follows the panel write')
   assert.deepEqual(childShadows, ['dispatch'], 'a refresh must not register anything else')
 })
 
-test('a main agent is restricted and guarded, and its guard refuses the denied list', () => {
+test('a main agent is masked and guarded, and only the shipped whitelist passes', () => {
   const { created } = start()
   const { agent, restricted, guards } = fakeAgent()
   created({ agent, source: 'create' })
-  // `apply` always merges the shipped list in, so a profile can only extend it.
-  assert.deepEqual(restricted, mod.DEFAULT_DENIED_TOOLS)
+  // Whitelist-driven: every catalog name the shipped list does not cover is hidden, and
+  // `run_code` is never among them because `tools.restrict` refuses to hide the transport.
+  assert.deepEqual(restricted, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS))
+  assert.equal(restricted.includes('run_code'), false)
   assert.equal(guards.length, 1)
+  for (const name of mod.DEFAULT_ALLOWED_TOOLS) assert.equal(guards[0]({ name }), undefined, name)
   assert.match(guards[0]({ name: 'edit' }), /"edit" is not available to the main agent/)
-  assert.equal(guards[0]({ name: 'delegate' }), undefined)
+  assert.match(guards[0]({ name: 'subagent' }), /"subagent" is not available to the main agent/)
 })
 
-test('the shipped deny list lets compress through and still refuses the rest', () => {
-  // The main agent may compress its own context, so `compress` is the one ACP tool left out;
-  // every other entry stays denied so the gate can never be widened by accident.
-  assert.equal(mod.DEFAULT_DENIED_TOOLS.length, 42)
-  for (const name of ['session_search', 'session_trace', 'session_event_search', 'session_event_read', 'session_event_trace', 'interrupt_agent']) {
-    assert.equal(mod.DEFAULT_DENIED_TOOLS.includes(name), false, name)
-    assert.equal(denyGuard(mod.DEFAULT_DENIED_TOOLS)({ name }), undefined, name)
+test('the shipped whitelist is eleven planning tools, and every other name is refused', () => {
+  // The main agent keeps the one delegation entry, the session read-only tools and
+  // `compress`: the capabilities that make planning and review possible without touching
+  // the repo.
+  const shipped = mod.DEFAULT_ALLOWED_TOOLS
+  assert.equal(shipped.length, 11)
+  for (const name of [
+    'dispatch',
+    'send_message',
+    'interrupt_agent',
+    'todo_write',
+    'ask_user_question',
+    'compress',
+    'session_search',
+    'session_trace',
+    'session_event_search',
+    'session_event_read',
+    'session_event_trace',
+  ]) {
+    assert.equal(shipped.includes(name), true, name)
+    assert.equal(allowGuard(shipped)({ name }), undefined, name)
   }
-  for (const name of ['create_goal', 'update_goal', 'get_goal', 'list_agents', 'ops_bash', 'read', 'decompress', 'schedule_create']) {
-    assert.equal(mod.DEFAULT_DENIED_TOOLS.includes(name), true, name)
-    assert.match(denyGuard(mod.DEFAULT_DENIED_TOOLS)({ name }), /not available to the main agent/)
+  for (const name of [
+    'read',
+    'edit',
+    'write',
+    'apply_patch',
+    'grep',
+    'glob',
+    'bash',
+    'pwsh',
+    'ops_bash',
+    'web_fetch',
+    'web_search',
+    'subagent',
+    'workflow',
+    'ralph',
+    'decompress',
+    'search_context',
+    'acp_status',
+    'mcp_custom_tool',
+  ]) {
+    assert.equal(shipped.includes(name), false, name)
+    assert.match(allowGuard(shipped)({ name }), /is not available to the main agent/, name)
   }
-  assert.equal(mod.DEFAULT_DENIED_TOOLS.includes('compress'), false)
-  for (const name of ['decompress', 'search_context', 'acp_status', 'acp_cache']) {
-    assert.equal(mod.DEFAULT_DENIED_TOOLS.includes(name), true, name)
-  }
+
   const { created } = start()
   const { agent, restricted, guards } = fakeAgent()
   created({ agent, source: 'create' })
-  assert.equal(restricted.includes('compress'), false, 'compress must not be hidden')
+  assert.equal(restricted.includes('compress'), false, 'compress is whitelisted, so not hidden')
   assert.equal(guards[0]({ name: 'compress' }), undefined, 'compress must pass the guard')
   for (const name of ['ops_bash', 'read', 'decompress']) {
     assert.match(guards[0]({ name }), /is not available to the main agent/, name)
   }
-  assert.equal(guards[0]({ name: 'delegate' }), undefined)
+  assert.equal(guards[0]({ name: 'dispatch' }), undefined)
 })
 
 test('a resumed agent with a parentSession but no depth is gated and warns', () => {
   const { created, logs } = start()
   const { agent, restricted, guards } = fakeAgent({ id: 'cold-child', header: { parentSession: 'root-session' } })
   created({ agent, source: 'resume' })
-  assert.deepEqual(restricted, mod.DEFAULT_DENIED_TOOLS)
+  assert.deepEqual(restricted, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS))
   assert.equal(guards.length, 1)
   assert.equal(logs.warn.length, 1)
   assert.match(logs.warn[0], /cold-child/)
@@ -435,45 +504,47 @@ test('the switch being off still installs the guard and stays quiet', () => {
   assert.equal(logs.warn.length, 0)
 })
 
-test('allowedTools re-allows a shipped name for an open conversation, live', () => {
-  // Safety: every other shipped name stays denied, and the change is read per call, so a
-  // panel write reaches a conversation that was already open.
-  const denied = []
-  const allowed = ['read']
-  const { created } = start({ denied, allowed })
-  const { agent, restricted, guards } = fakeAgent()
+test('a whitelist written in the panel reaches an open conversation, live', () => {
+  // The whitelist is read per call, so a panel write lands in a conversation that was
+  // already open: checking `read` lets it through at once, unchecking `dispatch` blocks it.
+  const { created, state } = start()
+  const { agent, guards } = fakeAgent()
   created({ agent, source: 'create' })
-  assert.equal(restricted.includes('read'), false, 'an allowed name is not hidden either')
-  assert.equal(guards[0]({ name: 'read' }), undefined)
-  assert.match(guards[0]({ name: 'edit' }), /not available to the main agent/)
+  assert.match(guards[0]({ name: 'read' }), /not available to the main agent/)
+  assert.equal(guards[0]({ name: 'dispatch' }), undefined)
 
-  // Un-checking a box is a write to deniedTools; checking one is a write to allowedTools.
-  allowed.push('edit')
-  assert.equal(guards[0]({ name: 'edit' }), undefined)
-  assert.match(guards[0]({ name: 'ops_bash' }), /not available to the main agent/)
+  state.allowed = [...mod.DEFAULT_ALLOWED_TOOLS, 'read']
+  assert.equal(guards[0]({ name: 'read' }), undefined)
+
+  state.allowed = mod.DEFAULT_ALLOWED_TOOLS.filter((name) => name !== 'dispatch')
+  assert.match(guards[0]({ name: 'dispatch' }), /"dispatch" is not available to the main agent/)
+  assert.equal(guards[0]({ name: 'compress' }), undefined)
+
+  // Unchecking every box disables every tool: an empty whitelist is not "use the default".
+  state.allowed = []
+  for (const name of ['dispatch', 'send_message', 'compress', 'read']) {
+    assert.match(guards[0]({ name }), /is not available to the main agent/, name)
+  }
 })
 
-test('the blocked-tools clause follows the effective list without re-registering', () => {
+test('the whitelist clause follows the live config without re-registering', () => {
   // The description is a getter, so the same registered tool renders the new list: a
   // settings change reaches the prompt without a restart or a new session.
-  const denied = []
-  const allowed = []
-  const { tools } = start({ denied, allowed })
+  const { tools, state } = start()
   const dispatch = tools.find((tool) => tool.name === 'dispatch')
-  const blockedOf = (tool) => /Blocked for the main agent: ([^.]+)\./.exec(tool.description)?.[1]
-  assert.equal(blockedOf(dispatch), mod.DEFAULT_DENIED_TOOLS.join(', '))
+  const allowedOf = (tool) =>
+    /Allowed for the main agent \(whitelist-driven; every other tool is blocked\): ([^.]+)\./.exec(tool.description)?.[1]
+  assert.equal(allowedOf(dispatch), mod.DEFAULT_ALLOWED_TOOLS.join(', '))
 
-  allowed.push('read')
-  denied.push('custom_tool', 'dispatch')
-  // Nothing is exempt: the clause names exactly what the gate refuses, so a profile that
-  // denies the delegation tools sees them in the prompt too.
-  const expected = [
-    ...mod.DEFAULT_DENIED_TOOLS.filter((name) => name !== 'read'),
-    'custom_tool',
-    'dispatch',
-  ].join(', ')
-  assert.equal(blockedOf(dispatch), expected)
+  state.allowed = ['dispatch', 'read']
+  assert.equal(allowedOf(dispatch), 'dispatch, read')
+
+  // The rule has a second sentence for the case where the panel unchecks everything.
+  state.allowed = []
+  assert.match(dispatch.description, /No tools are currently allowed for the main agent\./)
+  assert.equal(allowedOf(dispatch), undefined)
 })
+
 /** Only the members supervision adapters use, with recording friendly defaults. */
 function fakeSupervisionHost({ parents = new Map(), sessions = new Map(), stateOf, flush } = {}) {
   const logs = []
@@ -739,7 +810,7 @@ test('deliver queues exactly one notice with followup, never steer', async () =>
  * An agent whose deny mask is a real set with real disposers. `lifts` counts released
  * handles, so a refresh that leaks (or double-disposes) one is visible here.
  */
-function maskAgent({ id = 'agent-1', globals = mod.DEFAULT_DENIED_TOOLS, depth, header = {} } = {}) {
+function maskAgent({ id = 'agent-1', globals = HOST_TOOLS, depth, header = {} } = {}) {
   const mask = new Set()
   const counts = { restrict: 0, lift: 0 }
   let guard
@@ -778,22 +849,22 @@ function maskAgent({ id = 'agent-1', globals = mod.DEFAULT_DENIED_TOOLS, depth, 
 test('a panel write re-applies the mask on every live main agent, in the open session', () => {
   const main = maskAgent()
   const child = maskAgent({ id: 'child-1', depth: 1 })
-  const { handlers, created, allowed } = start({ agents: { get: () => undefined, roots: () => [main.agent, child.agent] } })
+  const { handlers, created, state } = start({ agents: { get: () => undefined, roots: () => [main.agent, child.agent] } })
   created({ agent: main.agent, source: 'create' })
   assert.equal(main.mask.has('read'), true)
   assert.equal(child.mask.size, 0, 'a child is never gated')
 
-  // The panel un-checks `read`: allowedTools gains it, then the loader announces the write.
-  allowed.push('read')
+  // The panel checks `read`: allowedTools gains it, then the loader announces the write.
+  state.allowed = [...mod.DEFAULT_ALLOWED_TOOLS, 'read']
   const volatile = handlers.get('loader/volatile-update')
   assert.equal(typeof volatile, 'function', 'apply must subscribe to loader/volatile-update')
   volatile()
   assert.equal(main.mask.has('read'), false, 'the next request sees the table without read')
-  assert.equal(main.mask.has('ops_bash'), true, 'every other name stays denied')
+  assert.equal(main.mask.has('ops_bash'), true, 'every other name stays hidden')
   assert.equal(child.mask.size, 0, 'a refresh must not touch a child')
 
-  // Checking it again hides it again.
-  allowed.length = 0
+  // Unchecking it again hides it again.
+  state.allowed = mod.DEFAULT_ALLOWED_TOOLS
   volatile()
   assert.equal(main.mask.has('read'), true)
 })
@@ -803,7 +874,7 @@ test('the enable switch flips every restriction in the open session through the 
   const { handlers, created, state } = start({ agents: { get: () => undefined, roots: () => [main.agent] } })
   created({ agent: main.agent, source: 'create' })
   const volatile = handlers.get('loader/volatile-update')
-  assert.equal(main.mask.size, mod.DEFAULT_DENIED_TOOLS.length)
+  assert.equal(main.mask.size, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS).length)
 
   state.enabled = false
   volatile()
@@ -812,14 +883,14 @@ test('the enable switch flips every restriction in the open session through the 
 
   state.enabled = true
   volatile()
-  assert.equal(main.mask.size, mod.DEFAULT_DENIED_TOOLS.length, 'on restores the table')
+  assert.equal(main.mask.size, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS).length, 'on restores the table')
   assert.match(main.getGuard()({ name: 'edit' }), /not available to the main agent/)
 })
 
 test('a disposed agent releases its mask and is not refreshed afterwards', () => {
   const main = maskAgent()
   const roots = [main.agent]
-  const { handlers, created, allowed } = start({ agents: { get: () => undefined, roots: () => roots } })
+  const { handlers, created, state } = start({ agents: { get: () => undefined, roots: () => roots } })
   created({ agent: main.agent, source: 'create' })
   const volatile = handlers.get('loader/volatile-update')
   const disposed = handlers.get('agent/disposed')
@@ -827,11 +898,11 @@ test('a disposed agent releases its mask and is not refreshed afterwards', () =>
 
   disposed({ agent: main.agent })
   assert.equal(main.mask.size, 0, 'the mask is lifted when the agent goes away')
-  assert.equal(main.counts.lift, mod.DEFAULT_DENIED_TOOLS.length)
+  assert.equal(main.counts.lift, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS).length)
 
   // A later write with the agent gone has nothing to reinstall.
   roots.length = 0
-  allowed.push('read')
+  state.allowed = [...mod.DEFAULT_ALLOWED_TOOLS, 'read']
   volatile()
   assert.equal(main.mask.size, 0)
 })
@@ -839,10 +910,10 @@ test('a disposed agent releases its mask and is not refreshed afterwards', () =>
 test('an agent created before the plugin mounted is gated on the first panel write', () => {
   // The registry is the source of truth, so a missed creation hook self-heals.
   const main = maskAgent({ id: 'pre-existing' })
-  const { handlers, allowed } = start({ agents: { get: () => undefined, roots: () => [main.agent] } })
+  const { handlers, state } = start({ agents: { get: () => undefined, roots: () => [main.agent] } })
   const volatile = handlers.get('loader/volatile-update')
   assert.equal(main.mask.size, 0)
-  allowed.push('read')
+  state.allowed = [...mod.DEFAULT_ALLOWED_TOOLS, 'read']
   volatile()
   assert.equal(main.mask.has('edit'), true)
   assert.equal(main.mask.has('read'), false)
@@ -1788,13 +1859,13 @@ test('with the secretary switch off the master session gets the default gate, ex
   const { created, logs, handlers } = start()
   const { agent, restricted, guards } = masterAgent()
   created({ agent, source: 'create' })
-  assert.deepEqual(restricted, mod.DEFAULT_DENIED_TOOLS)
+  assert.deepEqual(restricted, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS))
   assert.equal(guards.length, 1)
   assert.match(guards[0]({ name: 'read' }), /is not available to the main agent/)
   assert.equal(logs.info.some((line) => line.includes('dispatch-command')), false)
   // A settings write while the switch is off must not claim anything either.
   handlers.get('loader/volatile-update')()
-  assert.deepEqual(restricted, mod.DEFAULT_DENIED_TOOLS)
+  assert.deepEqual(restricted, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS))
 })
 
 test('an unset master id designates nobody, even with the secretary switch on', () => {
@@ -1802,7 +1873,7 @@ test('an unset master id designates nobody, even with the secretary switch on', 
   harness.config.secretaryMasterSessionId = { get: () => '' }
   const { agent, restricted, guards } = masterAgent()
   harness.created({ agent, source: 'create' })
-  assert.deepEqual(restricted, mod.DEFAULT_DENIED_TOOLS)
+  assert.deepEqual(restricted, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS))
   assert.equal(guards.length, 1)
   assert.equal(harness.logs.info.some((line) => line.includes('dispatch-command')), false)
 })
@@ -1811,7 +1882,7 @@ test('a session that is not the master keeps the default gate while the switch i
   const harness = start({ secretaryEnabled: true })
   const { agent, restricted, guards } = fakeAgent({ id: 'someone-else' })
   harness.created({ agent, source: 'create' })
-  assert.deepEqual(restricted, mod.DEFAULT_DENIED_TOOLS)
+  assert.deepEqual(restricted, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS))
   assert.equal(guards.length, 1)
   assert.equal(harness.logs.info.some((line) => line.includes('dispatch-command')), false)
 })

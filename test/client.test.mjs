@@ -526,67 +526,79 @@ test('the interval field follows a value changed elsewhere', () => {
   assert.equal(field.input().props.value, '1200')
 })
 
-// ---- Denied tools -------------------------------------------------------------------
+// ---- Allowed tools ------------------------------------------------------------------
 
 // The panel cannot ask the host for a tool catalog (the session remote has no such
-// method), so it re-declares the shipped list. Reading the host constant out of the
+// method), so it re-declares the shipped whitelist. Reading the host constant out of the
 // source keeps the two copies honest without loading the host entry, whose packages
 // this test process does not install.
 const hostSource = fs.readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
-const hostListSource = /export const DEFAULT_DENIED_TOOLS = \[([\s\S]*?)\]/.exec(hostSource)
-const HOST_DEFAULT_DENIED_TOOLS = [...hostListSource[1].matchAll(/'([^']+)'/g)].map((match) => match[1])
+const hostListSource = /export const DEFAULT_ALLOWED_TOOLS = \[([\s\S]*?)\]/.exec(hostSource)
+// Strip `//` comments first: an apostrophe inside a comment ("the agent's surface")
+// would otherwise pair with a real string quote and skew the extraction.
+const hostListBody = hostListSource[1].replace(/\/\/[^\n]*/g, '')
+const HOST_DEFAULT_ALLOWED_TOOLS = [...hostListBody.matchAll(/'([^']+)'/g)].map((match) => match[1])
 
-test('the bundled copy of the shipped deny list matches the host constant', () => {
-  assert.deepEqual(plain(T.DEFAULT_DENIED_TOOLS), HOST_DEFAULT_DENIED_TOOLS)
-  assert.equal(HOST_DEFAULT_DENIED_TOOLS.length, 42)
+test('the bundled copy of the shipped whitelist matches the host constant', () => {
+  assert.deepEqual(plain(T.DEFAULT_ALLOWED_TOOLS), HOST_DEFAULT_ALLOWED_TOOLS)
+  assert.equal(HOST_DEFAULT_ALLOWED_TOOLS.length, 11)
+  // The whitelist names the planning and delegation tools only: no file, search, shell or
+  // web tool may appear here, or the main agent could work on the repo by itself.
+  for (const name of ['dispatch', 'send_message', 'interrupt_agent', 'todo_write', 'ask_user_question', 'compress']) {
+    assert.equal(HOST_DEFAULT_ALLOWED_TOOLS.includes(name), true, name)
+  }
+  for (const name of ['read', 'edit', 'write', 'bash', 'subagent', 'workflow', 'ralph', 'decompress', 'search_context']) {
+    assert.equal(HOST_DEFAULT_ALLOWED_TOOLS.includes(name), false, name)
+  }
 })
 
-test('the list holds every shipped name, with nothing locked out of it', () => {
+test('the rows start with the shipped whitelist, every box checked', () => {
   const shown = plain(T.toolListOf({}))
-  assert.deepEqual(shown, HOST_DEFAULT_DENIED_TOOLS)
-  // The tools the shipped list omits are not rows until the host catalog names them, but
-  // a profile may deny them like any other once it does.
-  for (const name of ['delegate', 'orchestrate', 'send_message', 'todo_write', 'compress']) {
+  assert.deepEqual(shown, HOST_DEFAULT_ALLOWED_TOOLS)
+  // A host tool the whitelist omits is not a row until the host catalog names it.
+  for (const name of ['read', 'edit', 'bash', 'subagent', 'workflow']) {
     assert.equal(shown.includes(name), false, name)
   }
-  const withCatalog = plain(T.toolListOf({ toolCatalog: ['delegate', 'todo_write'] }))
-  for (const name of ['delegate', 'todo_write']) assert.equal(withCatalog.includes(name), true, name)
+  const withCatalog = plain(T.toolListOf({ toolCatalog: ['edit', 'read'] }))
+  for (const name of ['edit', 'read']) assert.equal(withCatalog.includes(name), true, name)
 })
 
-test('config names join the list, extras after the shipped order and sorted', () => {
-  const shown = plain(T.toolListOf({ deniedTools: ['zeta', 'alpha'], allowedTools: ['edit'] }))
-  // An allowed shipped name stays listed (unchecked); it is not removed from the rows.
-  assert.equal(shown.includes('edit'), true)
-  assert.deepEqual(shown.slice(-2), ['alpha', 'zeta'])
+test('config and catalog names join the rows as extras, after the shipped order and sorted', () => {
+  const shown = plain(T.toolListOf({ allowedTools: ['zeta', 'alpha'], toolCatalog: ['read'] }))
+  assert.deepEqual(shown.slice(0, HOST_DEFAULT_ALLOWED_TOOLS.length), HOST_DEFAULT_ALLOWED_TOOLS)
+  assert.deepEqual(shown.slice(-3), ['alpha', 'read', 'zeta'])
   assert.equal(new Set(shown).size, shown.length)
-  // A name outside the shipped list is offered like any other: nothing is exempt.
-  assert.equal(plain(T.toolListOf({ deniedTools: ['delegate'] })).includes('delegate'), true)
+  // A name a profile checked is offered like any other, whatever it is called.
+  assert.equal(plain(T.toolListOf({ allowedTools: ['custom_tool'] })).includes('custom_tool'), true)
 })
 
 test('the live catalog from the host joins the rows, deduped and sorted after the shipped list', () => {
   const shown = plain(T.toolListOf({ toolCatalog: ['zeta', 'mcp__github__create_issue', 'edit', 'read'] }))
-  // A catalog name the shipped list also knows is listed once, in its shipped place.
+  // A catalog name the whitelist does not know becomes one extra row, once only.
   assert.equal(shown.filter((name) => name === 'edit').length, 1)
-  assert.deepEqual(shown.slice(-2), ['mcp__github__create_issue', 'zeta'])
-  // A delegation tool the catalog names is a row like any other.
-  assert.equal(plain(T.toolListOf({ toolCatalog: ['delegate'] })).includes('delegate'), true)
+  assert.equal(shown.filter((name) => name === 'dispatch').length, 1)
+  assert.deepEqual(shown.slice(-4), ['edit', 'mcp__github__create_issue', 'read', 'zeta'])
+  // A delegation tool the catalog names is a row like any other, once only.
+  assert.equal(plain(T.toolListOf({ toolCatalog: ['delegate'] })).filter((name) => name === 'delegate').length, 1)
 })
 
-test('a tool the shipped list never heard of is offered and defaults to available', () => {
+test('a tool the shipped whitelist never heard of is a row and defaults to disabled', () => {
   const catalog = { toolCatalog: ['mcp__demo__ping', 'ops_new'] }
   const shown = plain(T.toolListOf(catalog))
   assert.ok(shown.includes('mcp__demo__ping'))
   assert.ok(shown.includes('ops_new'))
-  // Unchecked, i.e. not denied: a tool another plugin adds is available unless configured.
-  const denied = T.deniedSetOf(catalog)
-  assert.equal(denied.has('mcp__demo__ping'), false)
-  assert.equal(denied.has('ops_new'), false)
-  // Once denied, the panel writes the name and the row reads checked.
-  assert.equal(T.deniedSetOf({ ...catalog, deniedTools: ['mcp__demo__ping'] }).has('mcp__demo__ping'), true)
+  // Unchecked, i.e. not allowed: a tool another plugin adds is blocked until the user
+  // checks it, which is what makes the whitelist a default-deny rule for new tools too.
+  const allowed = T.allowedSetOf(catalog)
+  assert.equal(allowed.has('mcp__demo__ping'), false)
+  assert.equal(allowed.has('ops_new'), false)
+  // Once checked, the panel writes the name and the row reads checked.
+  const checked = T.allowedSetOf({ ...catalog, allowedTools: [...HOST_DEFAULT_ALLOWED_TOOLS, 'mcp__demo__ping'] })
+  assert.equal(checked.has('mcp__demo__ping'), true)
 })
 
-test('an absent or empty catalog keeps the shipped fallback', () => {
-  const shipped = HOST_DEFAULT_DENIED_TOOLS
+test('an absent or empty catalog keeps the shipped rows', () => {
+  const shipped = HOST_DEFAULT_ALLOWED_TOOLS
   assert.deepEqual(plain(T.toolListOf({ toolCatalog: [] })), shipped)
   assert.deepEqual(plain(T.toolListOf({ toolCatalog: 'not-a-list' })), shipped)
   assert.deepEqual(plain(T.toolListOf({})), shipped)
@@ -594,73 +606,68 @@ test('an absent or empty catalog keeps the shipped fallback', () => {
   // Junk entries are dropped instead of rendering as empty rows.
   assert.deepEqual(plain(T.catalogOf({ toolCatalog: ['b', '', 7, 'a'] })), ['b', 'a'])
   assert.equal(T.CATALOG_KEY, 'toolCatalog')
+  assert.equal(T.ALLOW_KEY, 'allowedTools')
 })
 
-test('no name is exempt: anything the panel lists can be denied or re-allowed', () => {
-  const onlyShipped = T.deniedSetOf({})
-  assert.equal(onlyShipped.has('delegate'), false, 'not denied by default')
-  const denied = T.deniedSetOf({ deniedTools: ['delegate', 'orchestrate', 'todo_write'] })
-  for (const name of ['delegate', 'orchestrate', 'todo_write']) assert.equal(denied.has(name), true, name)
-  const allowed = T.deniedSetOf({ allowedTools: ['read', 'todo_write'] })
-  assert.equal(allowed.has('read'), false)
-  assert.equal(allowed.has('todo_write'), false)
+test('the default whitelist is the shipped eleven, and nothing else is checked', () => {
+  const shipped = T.allowedSetOf({})
+  assert.equal(shipped.size, HOST_DEFAULT_ALLOWED_TOOLS.length)
+  for (const name of HOST_DEFAULT_ALLOWED_TOOLS) assert.equal(shipped.has(name), true, name)
+  // A tool outside the shipped list starts unchecked: a new plugin tool is disabled.
+  assert.equal(shipped.has('read'), false)
+  assert.equal(shipped.has('mcp__demo__ping'), false)
+
+  // A catalog name is not an allowance: only the stored whitelist decides.
+  const withCatalog = T.allowedSetOf({ toolCatalog: ['read', 'mcp__demo__ping'] })
+  assert.equal(withCatalog.has('read'), false)
+  assert.equal(withCatalog.size, HOST_DEFAULT_ALLOWED_TOOLS.length)
 })
 
-test('checked means denied: the shipped list is checked, an allowance is not', () => {
-  const shipped = T.deniedSetOf({})
-  for (const name of HOST_DEFAULT_DENIED_TOOLS) assert.equal(shipped.has(name), true, name)
-  // Tools outside the shipped list start available: default denied is the shipped list.
-  assert.equal(shipped.has('delegate'), false)
-  assert.equal(shipped.has('compress'), false)
+test('an explicit whitelist replaces the default, the empty array included', () => {
+  const narrowed = T.allowedSetOf({ allowedTools: ['delegate', 'orchestrate'] })
+  assert.deepEqual([...narrowed].sort(), ['delegate', 'orchestrate'])
+  assert.equal(narrowed.has('compress'), false)
 
-  const tweaked = T.deniedSetOf({ allowedTools: ['edit'], deniedTools: ['custom'] })
-  assert.equal(tweaked.has('edit'), false)
-  assert.equal(tweaked.has('read'), true)
-  assert.equal(tweaked.has('custom'), true)
+  // Unchecking every box must disable every tool; falling back on the default here would
+  // silently re-arm the main agent.
+  assert.equal(T.allowedSetOf({ allowedTools: [] }).size, 0)
+
+  // Junk entries are dropped rather than becoming a checked row nobody can see.
+  assert.deepEqual([...T.allowedSetOf({ allowedTools: ['delegate', '', 7] })], ['delegate'])
+  assert.equal(T.allowedSetOf({ allowedTools: 'not-a-list' }).size, HOST_DEFAULT_ALLOWED_TOOLS.length)
 })
 
-test('a legacy deniedTools-only profile still adds to the shipped list', () => {
-  const legacy = ['session_search', 'interrupt_agent']
-  const denied = T.deniedSetOf({ deniedTools: legacy })
-  assert.equal(denied.size, HOST_DEFAULT_DENIED_TOOLS.length + 2)
-  for (const name of legacy) assert.equal(denied.has(name), true, name)
-})
-
-test('the checkbox state maps to the two keys, storing only the differences', () => {
-  const clear = [
-    { op: 'unset', path: ['deniedTools'] },
-    { op: 'unset', path: ['allowedTools'] },
-  ]
-  assert.deepEqual(plain(T.denyOps(HOST_DEFAULT_DENIED_TOOLS)), clear)
-
-  const withoutEdit = HOST_DEFAULT_DENIED_TOOLS.filter((name) => name !== 'edit')
-  assert.deepEqual(plain(T.denyOps(withoutEdit)), [
-    { op: 'unset', path: ['deniedTools'] },
-    { op: 'set', path: ['allowedTools'], value: ['edit'] },
-  ])
-
-  assert.deepEqual(plain(T.denyOps([...HOST_DEFAULT_DENIED_TOOLS, 'zeta', 'alpha'])), [
-    { op: 'set', path: ['deniedTools'], value: ['alpha', 'zeta'] },
+test('checking exactly the shipped eleven stores nothing, so the default applies again', () => {
+  // The stored value is only the difference from the shipped whitelist: a full default set
+  // is written as `unset`, so a later default change still reaches an untouched profile.
+  assert.deepEqual(plain(T.allowOps(HOST_DEFAULT_ALLOWED_TOOLS)), [{ op: 'unset', path: ['allowedTools'] }])
+  // Order and duplicates do not matter: the same set is the same default.
+  assert.deepEqual(plain(T.allowOps([...HOST_DEFAULT_ALLOWED_TOOLS].reverse())), [
     { op: 'unset', path: ['allowedTools'] },
   ])
-
-  // A name outside the shipped list is stored as an addition, exactly like any other, and
-  // both keys can move at once when one shipped name is unchecked while another is denied.
-  assert.deepEqual(plain(T.denyOps([...HOST_DEFAULT_DENIED_TOOLS, 'delegate'])), [
-    { op: 'set', path: ['deniedTools'], value: ['delegate'] },
+  assert.deepEqual(plain(T.allowOps([...HOST_DEFAULT_ALLOWED_TOOLS, 'dispatch'])), [
     { op: 'unset', path: ['allowedTools'] },
-  ])
-  assert.deepEqual(plain(T.denyOps([...withoutEdit, 'custom'])), [
-    { op: 'set', path: ['deniedTools'], value: ['custom'] },
-    { op: 'set', path: ['allowedTools'], value: ['edit'] },
   ])
 })
 
-test('reset clears both keys so the shipped list applies again', () => {
-  assert.deepEqual(plain(T.resetDenyOps()), [
-    { op: 'unset', path: ['deniedTools'] },
-    { op: 'unset', path: ['allowedTools'] },
+test('a narrowed or widened whitelist is stored as one explicit list, deduped', () => {
+  const narrowed = HOST_DEFAULT_ALLOWED_TOOLS.filter((name) => name !== 'compress')
+  assert.deepEqual(plain(T.allowOps(narrowed)), [{ op: 'set', path: ['allowedTools'], value: narrowed }])
+
+  // An added name joins the same list: there is no second key any more.
+  assert.deepEqual(plain(T.allowOps([...HOST_DEFAULT_ALLOWED_TOOLS, 'read'])), [
+    { op: 'set', path: ['allowedTools'], value: [...HOST_DEFAULT_ALLOWED_TOOLS, 'read'] },
   ])
+  // Duplicates collapse, and the click order is what gets stored.
+  assert.deepEqual(plain(T.allowOps(['read', 'read', 'delegate'])), [
+    { op: 'set', path: ['allowedTools'], value: ['read', 'delegate'] },
+  ])
+  // Unchecking every box stores the empty list, which means "allow nothing at all".
+  assert.deepEqual(plain(T.allowOps([])), [{ op: 'set', path: ['allowedTools'], value: [] }])
+})
+
+test('reset unsets the one key, so the shipped whitelist applies again', () => {
+  assert.deepEqual(plain(T.resetAllowOps()), [{ op: 'unset', path: ['allowedTools'] }])
 })
 
 test('the search matches a case-insensitive substring of the tool name', () => {
@@ -744,47 +751,54 @@ test('the switch draws a focus ring only while focused', () => {
   assert.equal(sw.track().props.style.boxShadow, 'none')
 })
 
-/** Mount the denied-tools column and expose the nodes the tests reach for. */
-function mountDenied(scope) {
-  const view = mount(T.DeniedToolsPanel, { scope, t })
+/** Mount the allowed-tools column and expose the nodes the tests reach for. */
+function mountAllowed(scope) {
+  const view = mount(T.AllowedToolsPanel, { scope, t })
   const rows = () => nodes(view.tree).filter((node) => node.type === 'label')
-  const search = () => nodes(view.tree).find((node) => node.props?.['data-search'] === 'denied-tools')
+  const search = () => nodes(view.tree).find((node) => node.props?.['data-search'] === 'allowed-tools')
   const button = () => nodes(view.tree).find((node) => node.type === 'button')
   const text = () => nodes(view.tree).map((node) => node.kids?.[0]).filter((kid) => typeof kid === 'string')
   return { view, rows, search, button, text }
 }
 
-test('the column is headed Denied Tools and lists one checkbox row per tool', () => {
-  const panel = mountDenied(fakeScope())
-  assert.equal(panel.text().includes('denied.title'), true)
-  // The heading is literally "Denied Tools" in both dictionaries.
-  const zhTitle = /'denied.title': '([^']+)'/.exec(src)?.[1]
-  assert.equal(zhTitle, 'Denied Tools')
+test('the column is headed Allowed Tools and lists one checked row per shipped tool', () => {
+  const panel = mountAllowed(fakeScope())
+  assert.equal(panel.text().includes('allowed.title'), true)
+  // The heading is literally "Allowed Tools" in the dictionary.
+  const title = /'allowed\.title': '([^']+)'/.exec(src)?.[1]
+  assert.equal(title, 'Allowed Tools')
+  // The column is addressable, so a host layout can find it without guessing a class.
+  assert.equal(panel.view.tree.props['data-panel'], 'allowed-tools')
 
   const rows = panel.rows()
-  assert.equal(rows.length, HOST_DEFAULT_DENIED_TOOLS.length)
+  assert.equal(rows.length, HOST_DEFAULT_ALLOWED_TOOLS.length)
   const first = rows[0]
   assert.equal(first.kids[0].type, 'input')
   assert.equal(first.kids[1].type, 'span')
   assert.equal(first.kids[0].props.type, 'checkbox')
+  // A checked box means "allowed for the main agent": the shipped eleven start checked.
   assert.equal(first.kids[0].props.checked, true)
   assert.equal(first.kids[0].props.disabled, false)
-  // The five tools the shipped list omits are ordinary rows once the catalog names them,
-  // with a working checkbox: the panel no longer locks anything.
-  const withCatalog = mountDenied(fakeScope({ initial: { toolCatalog: ['delegate', 'orchestrate', 'send_message', 'todo_write', 'compress'] } }))
-  const extra = withCatalog.rows().filter((row) => row.props['data-tool'] === 'delegate' || row.props['data-tool'] === 'compress')
-  assert.equal(extra.length, 2)
+  assert.deepEqual(rows.map((row) => row.props['data-tool']), HOST_DEFAULT_ALLOWED_TOOLS)
+
+  // A host tool the whitelist does not cover is a row too, unchecked: a new plugin or MCP
+  // tool is disabled by default instead of silently joining the main agent's kit.
+  const withCatalog = mountAllowed(fakeScope({ initial: { toolCatalog: ['read', 'edit', 'mcp__demo__ping'] } }))
+  const extra = withCatalog.rows().filter((row) => ['read', 'edit', 'mcp__demo__ping'].includes(row.props['data-tool']))
+  assert.equal(extra.length, 3)
   for (const row of extra) {
     assert.equal(row.kids[0].type, 'input')
     assert.equal(row.kids[0].props.disabled, false)
-    assert.equal(row.kids[0].props.checked, false)
+    assert.equal(row.kids[0].props.checked, false, row.props['data-tool'])
   }
   // The search box sits above the list.
   assert.equal(panel.search().props.type, 'search')
 })
 
 test('every row leads with the checkbox so a long name cannot scroll it out of the column', () => {
-  const panel = mountDenied(fakeScope({ initial: { toolCatalog: ['mcp__a_very_long_server__a_very_long_tool_name_that_will_not_fit'] } }))
+  const panel = mountAllowed(
+    fakeScope({ initial: { toolCatalog: ['mcp__a_very_long_server__a_very_long_tool_name_that_will_not_fit'] } }),
+  )
   const rows = panel.rows()
   assert.ok(rows.length > 0)
   // The list is one column pinned to the container, not an `auto` track that a long name
@@ -814,74 +828,88 @@ test('every row leads with the checkbox so a long name cannot scroll it out of t
 })
 
 test('the search narrows the rows case-insensitively and explains an empty result', () => {
-  const panel = mountDenied(fakeScope())
+  const panel = mountAllowed(
+    fakeScope({ initial: { toolCatalog: ['read', 'edit', 'ops_read_files', 'read_image', 'acp_read_original_image'] } }),
+  )
   panel.search().props.onChange({ target: { value: 'READ' } })
   assert.deepEqual(
     panel.rows().map((row) => row.props['data-tool']),
-    ['read', 'ops_read_files', 'read_image', 'acp_read_original_image'],
+    // `session_event_read` is a shipped row, so it comes first; the catalog extras follow sorted.
+    ['session_event_read', 'acp_read_original_image', 'ops_read_files', 'read', 'read_image'],
   )
   panel.search().props.onChange({ target: { value: 'zzz' } })
   assert.deepEqual(panel.rows(), [])
-  assert.equal(panel.text().includes('denied.empty'), true)
+  assert.equal(panel.text().includes('allowed.empty'), true)
 })
 
 test('a tool published by another plugin is listed, searchable and unchecked', async () => {
   const scope = fakeScope({ initial: { toolCatalog: ['mcp__demo__ping', 'ops_new_tool'] } })
-  const panel = mountDenied(scope)
+  const panel = mountAllowed(scope)
   panel.search().props.onChange({ target: { value: 'DEMO' } })
   const rows = panel.rows()
   assert.deepEqual(rows.map((row) => row.props['data-tool']), ['mcp__demo__ping'])
   assert.equal(rows[0].kids[0].props.type, 'checkbox')
-  assert.equal(rows[0].kids[0].props.checked, false)
+  assert.equal(rows[0].kids[0].props.checked, false, 'a new tool starts disabled')
 
-  // Checking it writes the name as a deny addition, not as an allowance.
+  // Checking it writes the name into the whitelist, on top of the shipped eleven.
   await rows[0].kids[0].props.onChange({ target: { checked: true } })
   assert.deepEqual(plain(scope.calls[0].ops), [
-    { op: 'set', path: ['deniedTools'], value: ['mcp__demo__ping'] },
-    { op: 'unset', path: ['allowedTools'] },
+    { op: 'set', path: ['allowedTools'], value: [...HOST_DEFAULT_ALLOWED_TOOLS, 'mcp__demo__ping'] },
   ])
 })
 
-test('unchecking a shipped name writes allowedTools and re-renders from the store', async () => {
+test('unchecking a shipped name drops it from the stored whitelist', async () => {
   const scope = fakeScope()
-  const panel = mountDenied(scope)
-  const row = () => panel.rows().find((entry) => entry.props['data-tool'] === 'edit')
+  const panel = mountAllowed(scope)
+  const row = () => panel.rows().find((entry) => entry.props['data-tool'] === 'dispatch')
   assert.equal(row().kids[0].props.checked, true)
   await row().kids[0].props.onChange({ target: { checked: false } })
   assert.equal(scope.calls.length, 1)
   assert.deepEqual(plain(scope.calls[0].ops), [
-    { op: 'unset', path: ['deniedTools'] },
-    { op: 'set', path: ['allowedTools'], value: ['edit'] },
+    { op: 'set', path: ['allowedTools'], value: HOST_DEFAULT_ALLOWED_TOOLS.filter((name) => name !== 'dispatch') },
   ])
   assert.equal(scope.calls[0].expected, 1)
   assert.equal(row().kids[0].props.checked, false)
 })
 
-test('unchecking a name a profile added removes it from deniedTools', async () => {
-  const scope = fakeScope({ initial: { deniedTools: ['custom_tool'] } })
-  const panel = mountDenied(scope)
-  const row = panel.rows().find((entry) => entry.props['data-tool'] === 'custom_tool')
-  assert.ok(row, 'a config-added name is listed')
-  await row.kids[0].props.onChange({ target: { checked: false } })
-  assert.deepEqual(plain(scope.calls[0].ops), [
-    { op: 'unset', path: ['deniedTools'] },
-    { op: 'unset', path: ['allowedTools'] },
-  ])
+test('checking the last unchecked name restores the default instead of storing a list', async () => {
+  // Re-checking everything must go back to `unset`, so the profile follows the shipped
+  // whitelist again rather than pinning today's copy of it.
+  const scope = fakeScope({ initial: { allowedTools: HOST_DEFAULT_ALLOWED_TOOLS.filter((name) => name !== 'compress') } })
+  const panel = mountAllowed(scope)
+  const row = panel.rows().find((entry) => entry.props['data-tool'] === 'compress')
+  assert.equal(row.kids[0].props.checked, false)
+  await row.kids[0].props.onChange({ target: { checked: true } })
+  assert.deepEqual(plain(scope.calls[0].ops), [{ op: 'unset', path: ['allowedTools'] }])
+  assert.equal(panel.rows().find((entry) => entry.props['data-tool'] === 'compress').kids[0].props.checked, true)
 })
 
-test('reset to defaults clears both keys', async () => {
-  const scope = fakeScope({ initial: { deniedTools: ['custom_tool'], allowedTools: ['edit'] } })
-  const panel = mountDenied(scope)
-  assert.equal(panel.button().kids[0], 'denied.reset')
+test('a name a profile checked but the catalog does not list is still a row', async () => {
+  const scope = fakeScope({ initial: { allowedTools: [...HOST_DEFAULT_ALLOWED_TOOLS, 'custom_tool'] } })
+  const panel = mountAllowed(scope)
+  const row = panel.rows().find((entry) => entry.props['data-tool'] === 'custom_tool')
+  assert.ok(row, 'a checked name is listed even without a catalog entry')
+  assert.equal(row.kids[0].props.checked, true)
+  await row.kids[0].props.onChange({ target: { checked: false } })
+  assert.deepEqual(plain(scope.calls[0].ops), [{ op: 'unset', path: ['allowedTools'] }])
+})
+
+test('reset unsets the whitelist so the shipped eleven apply again', async () => {
+  const scope = fakeScope({ initial: { allowedTools: ['delegate'] } })
+  const panel = mountAllowed(scope)
+  assert.equal(panel.button().kids[0], 'allowed.reset')
+  // Only one tool was allowed, so every other shipped row starts unchecked.
+  assert.equal(panel.rows().find((entry) => entry.props['data-tool'] === 'compress').kids[0].props.checked, false)
   await panel.button().props.onClick()
-  assert.deepEqual(plain(scope.calls[0].ops), plain(T.resetDenyOps()))
-  assert.equal(panel.rows().find((entry) => entry.props['data-tool'] === 'edit').kids[0].props.checked, true)
+  assert.deepEqual(plain(scope.calls[0].ops), plain(T.resetAllowOps()))
+  assert.deepEqual(plain(T.resetAllowOps()), [{ op: 'unset', path: ['allowedTools'] }])
+  assert.equal(panel.rows().find((entry) => entry.props['data-tool'] === 'compress').kids[0].props.checked, true)
 })
 
 test('a read-only scope disables the boxes and never writes', async () => {
   const scope = fakeScope({ writable: false })
-  const panel = mountDenied(scope)
-  const box = panel.rows().find((row) => row.props['data-tool'] === 'edit').kids[0]
+  const panel = mountAllowed(scope)
+  const box = panel.rows().find((row) => row.props['data-tool'] === 'dispatch').kids[0]
   assert.equal(box.props.disabled, true)
   assert.equal(panel.button().props.disabled, true)
   await panel.button().props.onClick()
@@ -890,15 +918,15 @@ test('a read-only scope disables the boxes and never writes', async () => {
 
 test('a rejected write is reported without dropping the stored state', async () => {
   const scope = fakeScope({ reject: 'settings changed since it was read' })
-  const panel = mountDenied(scope)
-  const row = () => panel.rows().find((entry) => entry.props['data-tool'] === 'edit')
+  const panel = mountAllowed(scope)
+  const row = () => panel.rows().find((entry) => entry.props['data-tool'] === 'dispatch')
   await row().kids[0].props.onChange({ target: { checked: false } })
   const alert = nodes(panel.view.tree).find((node) => node.props?.role === 'alert')
   assert.match(alert.kids[0], /settings changed/)
   assert.equal(row().kids[0].props.checked, true)
 })
 
-test('the popover is two columns, the original panel then the denied tools column', () => {
+test('the popover is two columns, the original panel then the allowed tools column', () => {
   const scopes = { main: fakeScope(), worker: fakeScope(), orch: fakeScope() }
   const view = mount(T.RoutePicker, {
     t,
@@ -915,7 +943,7 @@ test('the popover is two columns, the original panel then the denied tools colum
   assert.equal(left.type, 'div')
   assert.equal(left.props.style.width, '340px')
   assert.match(left.props.style.borderRight, /^1px solid/)
-  assert.equal(right.type, T.DeniedToolsPanel)
+  assert.equal(right.type, T.AllowedToolsPanel)
   assert.equal(right.props.scope, scopes.orch)
   // The enable row is label-then-switch, and the switch is the new component.
   const switchRow = nodes(left).find((node) => node.type === T.EnableSwitch)
@@ -938,16 +966,16 @@ test('catalogFor keeps the last non-empty catalog, because an empty read is a wr
   assert.deepEqual(plain(T.toolListOf({ toolCatalog: [] }, ['mcp__demo__ping'])).slice(-1), ['mcp__demo__ping'])
 })
 
-test('a catalog that reads empty mid-write does not collapse the panel to the shipped list', () => {
-  const scope = fakeScope({ initial: { toolCatalog: ['mcp__demo__ping', 'delegate'] } })
-  const panel = mountDenied(scope)
+test('a catalog that reads empty mid-write does not collapse the panel to the shipped rows', () => {
+  const scope = fakeScope({ initial: { toolCatalog: ['mcp__demo__ping', 'read'] } })
+  const panel = mountAllowed(scope)
   const names = () => panel.rows().map((row) => row.props['data-tool'])
   assert.ok(names().includes('mcp__demo__ping'))
 
   // The host's own settings write empties the field for an instant; the rows must survive it.
   scope.externalSet({ toolCatalog: [] })
   assert.ok(names().includes('mcp__demo__ping'))
-  assert.ok(names().includes('delegate'))
+  assert.ok(names().includes('dispatch'))
 
   // A genuinely different catalog still replaces the remembered one.
   scope.externalSet({ toolCatalog: ['ops_new'] })

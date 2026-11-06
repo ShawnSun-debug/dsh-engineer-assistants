@@ -15,6 +15,7 @@ const STUBS = {
       node.min = () => chain()
       node.max = () => chain()
       node.step = () => chain()
+      node.description = () => chain()
       return node
     }
     const z = { boolean: () => chain(), string: () => chain(), number: () => chain(), array: () => chain(), object: () => chain() }

@@ -26,6 +26,7 @@ const STUBS = {
       node.min = (value) => { node.minValue = value; return node }
       node.max = (value) => { node.maxValue = value; return node }
       node.step = () => node
+      node.description = () => node
       return node
     }
     const z = {

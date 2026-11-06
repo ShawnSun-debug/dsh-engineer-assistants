@@ -5,7 +5,7 @@
 
 **强模型主脑规划 + 便宜模型统一打工 —— DeepSeek Harness 的「硬隔离调度模式」插件**
 
-[![version](https://img.shields.io/badge/version-0.6.5-4176E6?style=flat-square)](https://github.com/SShiRkiT/dsh-orchestrator)
+[![version](https://img.shields.io/badge/version-0.8.0-4176E6?style=flat-square)](https://github.com/SShiRkiT/dsh-orchestrator)
 [![dsh-plugin](https://img.shields.io/badge/DeepSeek%20Harness-dsh--plugin-4176E6?style=flat-square)](https://github.com/deepseek-ai/deepseek-harness)
 [![platform](https://img.shields.io/badge/platform-Web%20GUI%20%7C%20Desktop-5c6bc0?style=flat-square)](https://github.com/SShiRkiT/dsh-orchestrator)
 [![node](https://img.shields.io/badge/node-%3E%3D22-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org)
@@ -26,7 +26,7 @@ DSH 客户端自带了 `subagent` / `workflow`，官方也有 `@deepseek-ai/dsh-
 | 痛点场景 | 原生 `subagent` / 官方 `Agent Team` | DSH Orchestrator（本插件独有） |
 | --- | --- | --- |
 | **如何省钱配模型？**<br>*(最核心差异)* | **无独立子代理面板**：子代理要么默认继承昂贵的主模型，要么靠主模型每次调用时自己传参选模型（容易忘传或乱选，改默认模型还得改静态配置） | **双路由独立面板 + 强制锁定便宜模型**：在 UI 面板直接把 Main Agent 设为昂贵强模型（如 `gemini-4-argon-high`），把 Subagent 统一锁死为廉价快模型（如 `gemini-3.8-flash`），改完下一次委派立即生效 |
-| **主代理总忍不住自己动手？** | **靠自觉（软提示词）**：主代理 / Team Lead 手里依然握有 `read`、`edit`、`bash` 等全套工具，聊几轮就经常脱轨亲自去读文件、跑命令，瞬间撑爆主上下文 | **底层闸门物理缴械（Hard Gate）**：直接对主代理隐藏并在执行层强制拦截 42 项读写/命令行工具（连 `run_code` 嵌套偷调也拦），**逼迫 Main Agent 100% 只做规划与验收，Subagent 100% 只干苦力活** |
+| **主代理总忍不住自己动手？** | **靠自觉（软提示词）**：主代理 / Team Lead 手里依然握有 `read`、`edit`、`bash` 等全套工具，聊几轮就经常脱轨亲自去读文件、跑命令，瞬间撑爆主上下文 | **白名单式驱动（Whitelist-Driven Hard Gate）**：主代理默认仅放行 11 项规划与派发核心工具（`allowedTools`），其余一切宿主读写/终端工具及未来新增的 MCP/第三方插件工具一律自动隐藏并在执行层强制拦截（连 `run_code` 嵌套偷调也拦），**逼迫 Main Agent 100% 只做规划与验收，Subagent 100% 只干苦力活** |
 | **便宜模型干活卡死/跑偏怎么办？** | **运行期黑盒**：派出后只能干等结束或超时，或者靠 `wait_agent` 阻塞轮询 | **零 Token 后台巡检唤醒**：后台定时静默扫描子代理事件日志（不调模型、零 Token 消耗），超时或卡壳时自动汇总摘要唤醒主代理，由强模型发消息精准纠偏 |
 | **大批量同构任务怎么跑？** | 原生 `workflow` 让模型手写任意 JS 脚本，容易失控且模型路由不统一 | **声明式 `dispatch` 流水线**：`items × stages` 结构化扇出与多阶段流水线，单项失败隔离、支持 JSON Schema 强校验，全部 Worker 强制走便宜的子代理路由 |
 
@@ -43,12 +43,12 @@ DSH 客户端自带了 `subagent` / `workflow`，官方也有 `@deepseek-ai/dsh-
 
 ![调度模式面板](docs/images/dispatch-panel.png)
 
-*调度模式面板：左侧独立配置主代理（如 `gemini-4-argon-high`）与子代理（如 `gemini-3.8-flash`）各自的模型、思考强度及巡检间隔；右侧 Denied Tools 实时拉取宿主全部工具（含 MCP 与其他插件工具），勾选/取消勾选无需重启，下一条消息立即对当前会话生效。*
+*调度模式面板：左侧独立配置主代理（如 `gemini-4-argon-high`）与子代理（如 `gemini-3.8-flash`）各自的模型、思考强度及巡检间隔；右侧 Allowed Tools（白名单式驱动）实时拉取宿主全部工具（含 MCP 与其他插件工具），勾选即放行给主代理、未勾选（含新装插件工具）默认自动禁用，无需重启，下一条消息立即对当前会话生效。*
 
-### 2. 主代理「规划与验收」、子代理「纯粹 Work」的硬性闸门
+### 2. 主代理「规划与验收」、子代理「纯粹 Work」的白名单式硬性闸门
 
-不同于靠 Prompt 劝主模型“多用子代理”，本插件在 DSH 工具层安装了双重守卫（`tools.restrict` + `tools.guard`）：
-- **主代理被彻底收缴执行工具**：默认封禁 42 项文件读写（`read` / `edit` / `write` / `apply_patch`）、搜索（`grep` / `glob`）、终端（`bash` / `pwsh`）、网页抓取乃至原生 `subagent` / `workflow`。主代理只保留 `dispatch`、`send_message`、`interrupt_agent`、`todo_write`、`ask_user_question`、`compress` 与只读会话日志工具。
+不同于靠 Prompt 劝主模型“多用子代理”，本插件在 DSH 工具层安装了双重守卫（`tools.restrict` + `tools.guard`），且采用**白名单式驱动**：
+- **主代理被彻底收缴执行工具**：`DEFAULT_ALLOWED_TOOLS` 默认只放行 11 项规划、派发与会话只读工具——`dispatch`、`send_message`、`interrupt_agent`、`todo_write`、`ask_user_question`、`compress` 与 5 项只读会话日志工具。所有文件读写（`read` / `edit` / `write` / `apply_patch`）、搜索（`grep` / `glob`）、终端（`bash` / `pwsh`）、网页抓取、原生 `subagent` / `workflow`，以及未来新增的任何 MCP / 第三方插件工具，一律自动隐藏并在执行层强制拦截（连 `run_code` 嵌套偷调也拦）。需要额外放行时，在面板右侧 Allowed Tools 勾选即可。
 - **子代理独享完整工具链**：被派出的 Worker 不受闸门限制，在各自独立的上下文中读写文件、跑测试、看报错，完工后只把干净的结论交回主代理验收。
 - **一键随时切换**：需要主代理临时亲自操作时，关掉面板上的「启用调度模式」开关即可立刻恢复主代理的全部工具，无需重开会话。
 
@@ -136,7 +136,7 @@ dsh plugin --profile desktop add SShiRkiT/dsh-orchestrator#main
 | `reviewProvider` / `reviewModel` | `""` | 评审者路由。两项都填才覆盖，否则整体跟随子代理路由——不做半套拼路由。 |
 | `reviewReasoningEffort` | `""` | 评审者思考强度，留空由所选模型决定。 |
 | `lastReview` | `""` | 最近一次评审的 `{ verdict, target, at }` 摘要，由插件写入、面板只读。 |
-| `deniedTools` / `allowedTools` | 42 项内置名单 | 主代理禁用/放行的工具清单；面板右侧可直接勾选任意宿主/MCP/插件工具，下一条消息即刻生效。 |
+| `allowedTools` | 11 项内置白名单 | 白名单式驱动：主代理仅可使用列表内的工具，其余宿主/MCP/插件工具自动隐藏并禁用；面板右侧 Allowed Tools 可直接勾选放行或取消勾选禁用，下一条消息即刻生效。 |
 | `superviseEnabled` | `true` | 子代理后台巡检总开关。 |
 | `superviseIntervalSeconds` | `600` | 巡检间隔（秒），范围 10–86400，运行中修改立即生效。 |
 | `superviseMaxNoticesPerChild` | `3` | 每个子代理最多发送几次巡检通知（0–20，`0` 表示不限）。 |

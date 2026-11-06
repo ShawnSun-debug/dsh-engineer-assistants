@@ -272,16 +272,21 @@ test('reasoning_effort passes through with the override and is trimmed', async (
   ])
 })
 
-test('the description keeps the main-agent rule and the deny list, and states the explicit-request condition', () => {
-  const denied = ['edit', 'read']
+test('the description keeps the main-agent rule and the whitelist, and states the explicit-request condition', () => {
+  // The rule names exactly what the gate lets through, so the test drives it with a
+  // whitelist rather than a deny list: every other tool is blocked by not being named.
+  const allowed = ['delegate', 'orchestrate', 'todo_write']
   const tool = createDelegateTool({
     defineTool: (d) => d,
     subagents: {},
     config: cfg('p', 'm'),
-    deniedTools: denied,
+    allowedTools: allowed,
   })
-  assert.equal(tool.description.startsWith(mainAgentRule(denied)), true)
-  assert.match(tool.description, /Blocked for the main agent: edit, read\./)
+  assert.equal(tool.description.startsWith(mainAgentRule(allowed)), true)
+  assert.match(
+    tool.description,
+    /Allowed for the main agent \(whitelist-driven; every other tool is blocked\): delegate, orchestrate, todo_write\./,
+  )
   assert.match(tool.description, /the main agent plans only/)
   assert.match(tool.description, /runs ONLY in a worker/i)
   assert.match(tool.description, /workers are not gated/i)
@@ -320,7 +325,7 @@ test('the description keeps the main-agent rule and the deny list, and states th
 test('the worker variant drops the main-agent rule and keeps the same contract', async () => {
   // A delegated child reads the global description too; its scoped shadow must not
   // repeat a rule about a role it does not have.
-  const denied = ['edit', 'read']
+  const allowed = ['delegate', 'orchestrate']
   const seen = []
   const subagents = {
     resolveMaxDepth: () => 1,
@@ -333,13 +338,13 @@ test('the worker variant drops the main-agent rule and keeps the same contract',
     defineTool: (definition) => definition,
     subagents,
     config: cfg('p', 'm'),
-    deniedTools: denied,
+    allowedTools: allowed,
     forWorker: true,
   })
   assert.equal(/main[- ]agent/i.test(tool.description), false)
   assert.equal(tool.description.includes('Main-agent rule:'), false)
   assert.equal(tool.description.includes('runs ONLY in a worker'), false)
-  assert.equal(tool.description.includes('edit, read'), false)
+  assert.equal(tool.description.includes('delegate, orchestrate'), false)
   assert.ok(tool.description.length < 400)
   assert.match(tool.description, /self-contained task/)
   assert.match(tool.description, /configured worker route/)

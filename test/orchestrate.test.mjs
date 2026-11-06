@@ -712,16 +712,20 @@ test('reasoning_effort passes through with the override for every worker', async
   })
 })
 
-test('the description keeps the main-agent rule and states the explicit-request condition', () => {
-  const denied = ['edit', 'read']
+test('the description keeps the main-agent rule and the whitelist, and states the explicit-request condition', () => {
+  // The rule names exactly what the gate lets through: the whitelist, and nothing else.
+  const allowed = ['delegate', 'orchestrate', 'todo_write']
   const definition = createOrchestrateTool({
     defineTool: (d) => d,
     subagents: {},
     config: cfg(),
-    deniedTools: denied,
+    allowedTools: allowed,
   })
-  assert.equal(definition.description.startsWith(mainAgentRule(denied)), true)
-  assert.match(definition.description, /Blocked for the main agent: edit, read\./)
+  assert.equal(definition.description.startsWith(mainAgentRule(allowed, ORCHESTRATE_TOOL)), true)
+  assert.match(
+    definition.description,
+    /Allowed for the main agent \(whitelist-driven; every other tool is blocked\): delegate, orchestrate, todo_write\./,
+  )
   assert.match(definition.description, /the main agent plans only/)
   assert.match(definition.description, /runs ONLY in a worker/i)
   assert.match(definition.description, /workers are not gated/i)
@@ -750,13 +754,13 @@ test('the worker variant drops the main-agent rule and keeps the same contract',
     defineTool: (x) => x,
     subagents: {},
     config: cfg(),
-    deniedTools: ['edit', 'read'],
+    allowedTools: ['delegate', 'orchestrate'],
     forWorker: true,
   })
   assert.equal(/main[- ]agent/i.test(definition.description), false)
   assert.equal(definition.description.includes('Main-agent rule:'), false)
   assert.equal(definition.description.includes('runs ONLY in a worker'), false)
-  assert.equal(definition.description.includes('edit, read'), false)
+  assert.equal(definition.description.includes('delegate, orchestrate'), false)
   assert.ok(definition.description.length < 400)
   assert.match(definition.description, /one worker per item/)
   assert.match(definition.description, /configured route/)

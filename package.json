@@ -1,6 +1,6 @@
 {
   "name": "dsh-orchestrator",
-  "version": "0.6.6",
+  "version": "0.8.0",
   "private": true,
   "description": "Main agent that plans and dispatches work through a single dispatch tool; long-running workers are supervised by reading session logs; an optional master layer adds AI memory, a state index and cross-session messages",
   "type": "module",
