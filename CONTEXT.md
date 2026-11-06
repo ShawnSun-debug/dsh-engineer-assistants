@@ -102,3 +102,41 @@ _Avoid_: 把状态索引说成「会话阶段」或「面板数据」——面�
 **跨会话消息**：
 会话与会话之间的纯文本投递：信封只有 `{ id, from, to, text, createdAt }`，不带发送方历史；单条 ≤ 8 KiB、接收方排队 ≤ 16 条；入站策略 `accept` / `hold` / `refuse`。
 _Avoid_: 把它与巡检通知混为一谈——巡检通知是另一个 source kind（`orchestrator-supervision`）；插件另有 master 通知（kind `orchestrator-master` + `form: 'notice'`，当前未接线），跨会话消息共用 master kind，但 `form` 是 `'relay'`。
+
+## 秘书层（本蓝图新增）
+
+**秘书（secretary）**：
+把登记过的 orchestrator 会话当作观察对象，按节拍写进度汇报、只在实质变化时冒泡、把待拍板的事做成催办草稿的角色。汇报由模板拼装，不调用模型；它不新开会话，也不替用户决定。
+_Avoid_: 把秘书叫成「第二个主代理」——主代理做规划与验收，秘书只读与汇报。
+
+**登记制（registry）**：
+秘书唯一的跟踪范围：只有被显式登记为 orchestrator 的会话会被读取，未登记的一律不读、不报、不碰；同一个会话只能占一个位置（Master 或 orchestrator，二选一），冲突时 Master 胜出。
+_Avoid_: 把「本机全部会话」当成默认范围——那是 handoff 的旧决策，已被 requirements §9 推翻。
+
+**节拍（beat）**：
+相邻两份汇报之间的固定间隔，缺省 180 秒；单个会话最长 7200 秒后自停，全部相关 worker 结束即停，停后不再回调。
+_Avoid_: 与「巡检间隔」混用——巡检看子代理是否卡住并唤醒主代理，节拍只决定秘书多久写一份。
+
+**实质变化（substantial change）**：
+值得打断用户的五类差异：状态翻转、步骤推进、阻塞待拍板、产出落地、超时异常。其余差异只落盘、不冒泡。
+
+**催办草稿（nudge draft）**：
+卡点被写成一条待确认的催办正文（≤300 字），状态只有 `pending` / `sent` / `discarded`；只有用户在视图里点确认、且投递真的成功，才离开 `pending`。
+_Avoid_: 把它叫「自动提醒」——草稿不是消息，生成草稿一次都不碰投递通道。
+
+模块清单（`lib/secretary-*.js`，一个文件只负责一层）：
+
+- **secretary-registry**：归一化登记表（`masterSessionId` + `orchestrators[{sessionId, workspace, title, trackedAt}]`）并维持 Master / orchestrator 互斥；未登记即读不到。
+- **secretary-beat**：按会话起停的定时器，180 秒一拍、7200 秒封顶，到点先判封顶再回调，`stop()` 幂等且保留首个停止原因。
+- **secretary-watch**：在登记会话的事件流里只认 `dispatch` 工具调用为出发信号；一个会话只起一次表，规划首报自带步骤、预估耗时、验收点、触发依据、已派 worker。
+- **secretary-report**：按固定六段模板把状态、步骤、worker、差异、产出、耗时与异常拼成 Markdown（规划首报换成步骤、验收点、触发依据、预计耗时），缺数据写「无」或「未提供」。
+- **secretary-archive**：把每份汇报写到 `<工作区>/.scratch/master-secretary/reports/<对话>/<HH-mm>.md`；同一节拍多会话时另写 `_summary.md`，写盘失败带路径抛出。
+- **secretary-diff**：比较相邻两份结构化摘要，输出 `{completed, blocked, flipped}` 三组与命中的五类变化；第一份按「Idle、无步骤、无 worker」的基线比较。
+- **secretary-deliver**：把命中的变化拼成一条 ≤300 字冒泡投给已声明的 Master 会话；没有 Master 就返回 `no-target`，不猜接收方。
+- **secretary-nudge**：按「同会话 + 同原因」去重地攒草稿，正文由固定模板生成；只有 `pending` 能迁移一次，投递失败不把草稿标成已发。
+- **secretary-panel**：只读端点 `orchestratorSecretary/secretaryState` 的五段数据（registry / orchestrators / reports / drafts / policy），外加 `confirmDraft` / `discardDraft` 两个写迁移；读时纯折叠，不写回。
+
+## 仓库基线（本蓝图新增）
+
+文档里凡出现提交号与用例数，以这一行为准，改动后请同步这一行：当前 HEAD `27e9e94`（`git rev-parse --short HEAD`），全量测试 `node --test --test-isolation=none` 为 573 个用例全绿（2026-11-06 实跑；这条命令比 `test/*.test.mjs` 多发现 `blueprint/test/pipeline.test.js` 的 9 个用例，只跑后者时为 564）。
+
