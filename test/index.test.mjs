@@ -8,6 +8,7 @@ import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MASTER_SESSION_ID } from '../lib/master-session.js'
+import { createDraftStore } from '../lib/secretary-nudge.js'
 
 /**
  * `lib/index.js` is the DSH plugin entry, and it imports three packages the host
@@ -1588,7 +1589,11 @@ test('the secretary endpoint is provided only while its switch is on', async () 
   assert.equal(payload.orchestrators[0].title, '修登录', 'an empty ledger title falls back to the session title')
   assert.equal(payload.orchestrators[0].live, true)
   assert.equal(payload.orchestrators[0].state, 'Working')
-  assert.equal(payload.orchestrators[0].step, null)
+  // No beat has started yet, so the row carries the zeroed beat shape; step and
+  // lastError are not part of the contract while they have no data source.
+  assert.deepEqual(payload.orchestrators[0].beats, { count: 0, startedAt: null, capped: false, stoppedReason: null })
+  assert.equal('step' in payload.orchestrators[0], false)
+  assert.equal('lastError' in payload.orchestrators[0], false)
   assert.deepEqual(payload.reports, [], 'a workspace that was never written lists no report')
   assert.deepEqual(payload.drafts, [], 'ticket 08 owns the drafts')
   assert.equal(payload.policy.beatSeconds, 180)
@@ -1603,7 +1608,7 @@ test('the secretary endpoint is provided only while its switch is on', async () 
   assert.deepEqual(closed.registry.orchestrators, [])
 })
 
-test('the secretary endpoint drafts a nudge for a Needs input session, dedupes it, and sends only on confirm', async () => {
+test('the mounted secretary drafts a nudge for a Needs input session, dedupes it, and sends only on confirm (why: reads no longer draft)', async () => {
   const session = { id: 'orch-1', title: '修登录', header: { id: 'orch-1' } }
   const harness = start({
     secretaryEnabled: true,
@@ -1633,10 +1638,41 @@ test('the secretary endpoint drafts a nudge for a Needs input session, dedupes i
   assert.equal(discarded.draft.status, 'discarded')
   const after = await service.secretaryState()
   assert.equal(after.drafts.find((draft) => draft.id === first.drafts[0].id).status, 'discarded')
-  // A decided draft does not block the next poll from drafting the still-existing blocker.
-  assert.equal(after.drafts.filter((draft) => draft.status === 'pending').length, 1)
+  // Reading no longer drafts: a decided draft stays decided until the next beat tick
+  // drafts the still-existing blocker again (covered in test/secretary-runtime.test.mjs).
+  assert.equal(after.drafts.filter((draft) => draft.status === 'pending').length, 0)
   const decided = await service.confirmDraft(first.drafts[0].id)
   assert.equal(decided.reason, 'draft-decided')
+})
+
+test('the view read is a pure snapshot: two reads never draft a nudge (why: the client polls every ten seconds)', async () => {
+  // A store with a trigger ready to fire (Needs input) but no beat and no mount
+  // initialization: the read function must not create the draft itself.
+  const stateOf = () => ({ workers: [{ id: 'orch-1', role: 'main', state: 'Needs input', summary: '等你拍板' }] })
+  const harness = fakeCtx({
+    secretaryEnabled: true,
+    secretaryOrchestrators: [{ sessionId: 'orch-1', workspace: '', title: '修登录', trackedAt: 1 }],
+    sessions: {
+      get: () => undefined,
+      list: () => [{ id: 'orch-1', title: '修登录', header: { id: 'orch-1' } }],
+      flush: async () => true,
+    },
+    stateOf,
+  })
+  const drafts = createDraftStore()
+  const read = mod.createSecretaryViewRead({
+    ctx: harness.ctx,
+    config: harness.config,
+    registration: Promise.resolve({ stateOf }),
+    drafts,
+  })
+
+  const first = await read()
+  const second = await read()
+  assert.deepEqual(first.drafts, [])
+  assert.deepEqual(second.drafts, [])
+  assert.equal(drafts.list().length, 0, 'the read path must not write into the draft store')
+  assert.equal(first.orchestrators[0].state, 'Needs input', 'and it still reports the state it read')
 })
 
 test('the secretary endpoint lists the archived reports of a registered workspace', async () => {

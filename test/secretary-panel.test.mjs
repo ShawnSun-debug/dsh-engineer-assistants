@@ -34,11 +34,9 @@ const ORCHESTRATOR = {
   workspace: 'w',
   live: true,
   state: 'Working',
-  step: { index: 2, total: 5, done: false },
   workers: [{ id: 'w-1', state: 'Working', summary: '写报告' }],
   beats: { count: 2, startedAt: 1000, capped: false, stoppedReason: null },
   lastReport: { path: '/r/12-03.md', at: 90, kind: 'delta' },
-  lastError: null,
 }
 
 // The diff is the three groups lib/secretary-diff.js produces, not a flat list of
@@ -84,21 +82,22 @@ test('the payload carries five segments with exactly the contract field names (w
   assert.deepEqual(Object.keys(payload.registry.orchestrators[0]), ['sessionId', 'workspace', 'title', 'trackedAt'])
   assert.deepEqual(payload.registry.orchestrators[0], { sessionId: 'orch-1', workspace: 'w', title: '日报', trackedAt: 7 })
 
+  // step / lastError are gone on purpose: with no data source they were always null
+  // and made the view's branches unreachable. They return with a ticket that has one.
   assert.deepEqual(Object.keys(payload.orchestrators[0]), [
     'sessionId',
     'title',
     'workspace',
     'live',
     'state',
-    'step',
     'workers',
     'beats',
     'lastReport',
-    'lastError',
   ])
   assert.deepEqual(Object.keys(payload.orchestrators[0].workers[0]), ['id', 'state', 'summary'])
   assert.deepEqual(Object.keys(payload.orchestrators[0].beats), ['count', 'startedAt', 'capped', 'stoppedReason'])
-  assert.deepEqual(Object.keys(payload.orchestrators[0].step), ['index', 'total', 'done'])
+  assert.equal('step' in payload.orchestrators[0], false)
+  assert.equal('lastError' in payload.orchestrators[0], false)
   assert.deepEqual(payload.orchestrators[0], ORCHESTRATOR)
 
   assert.deepEqual(Object.keys(payload.reports[0]), ['sessionId', 'at', 'kind', 'path', 'bytes', 'changes', 'error'])
@@ -283,14 +282,12 @@ test('orchestrator rows fold the ledger, the six-state projection and the archiv
     workspace: 'w',
     live: true,
     state: 'Working',
-    step: null,
     workers: [
       { id: 'child-1', state: 'Needs input', summary: '摘要-child-1' },
       { id: 'child-2', state: 'Completed', summary: '摘要-child-2' },
     ],
     beats: { count: 0, startedAt: null, capped: false, stoppedReason: null },
     lastReport: { path: '/r/12-03.md', at: 90, kind: 'delta' },
-    lastError: null,
   })
   // 会话已经没了：行还在（标题取登记行），live false，历史保留。
   assert.deepEqual(rows[1], {
@@ -299,12 +296,39 @@ test('orchestrator rows fold the ledger, the six-state projection and the archiv
     workspace: 'w2',
     live: false,
     state: 'Idle',
-    step: null,
     workers: [],
     beats: { count: 0, startedAt: null, capped: false, stoppedReason: null },
     lastReport: null,
-    lastError: null,
   })
+})
+
+test('an orchestrator row carries the real beat status: count follows ticks and capped means the cap was hit', () => {
+  const registry = { orchestrators: [{ sessionId: 'orch-1', workspace: 'w', title: '日报', trackedAt: 1 }] }
+  const getStatus = collectOrchestratorRows({
+    registry,
+    sessions: [{ id: 'orch-1' }],
+    beatStatus: () => ({ running: true, startedAt: 500, tickIndex: 3, stopReason: null }),
+  })
+  assert.deepEqual(getStatus[0].beats, { count: 3, startedAt: 500, capped: false, stoppedReason: null })
+
+  const capped = collectOrchestratorRows({
+    registry,
+    sessions: [{ id: 'orch-1' }],
+    beatStatus: () => ({ running: false, startedAt: 500, tickIndex: 4, stopReason: 'max-run' }),
+  })
+  assert.deepEqual(capped[0].beats, { count: 4, startedAt: 500, capped: true, stoppedReason: 'max-run' })
+
+  // A beat stopped because the run finished is not capped; an adapter that throws is
+  // the zeroed shape, not a broken endpoint.
+  const finished = collectOrchestratorRows({
+    registry,
+    sessions: [{ id: 'orch-1' }],
+    beatStatus: () => ({ running: false, startedAt: 500, tickIndex: 2, stopReason: 'finished' }),
+  })
+  assert.equal(finished[0].beats.capped, false)
+  assert.equal(finished[0].beats.stoppedReason, 'finished')
+  const throwing = collectOrchestratorRows({ registry, sessions: [{ id: 'orch-1' }], beatStatus: () => { throw new Error('boom') } })
+  assert.deepEqual(throwing[0].beats, { count: 0, startedAt: null, capped: false, stoppedReason: null })
 })
 
 test('a broken projection or agent registry degrades to Idle and live false instead of throwing', () => {

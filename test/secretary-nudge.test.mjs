@@ -123,6 +123,40 @@ test('discardDraft archives the draft, and a later confirm cannot send it', asyn
   assert.deepEqual(messaging.calls, [], 'a decided draft is never delivered twice')
 })
 
+test('a draft decided while the send is in flight reports the real state and is never sent twice', async () => {
+  const warnings = []
+  const store = createDraftStore({ warn: (message) => warnings.push(message) })
+  applyDraftTriggers({
+    store,
+    orchestrators: [{ sessionId: 's-1', title: '构建', state: 'Needs input', lastError: null }],
+    now: 1000,
+  })
+  const draft = store.list()[0]
+  const messaging = fakeMessaging()
+  const racing = {
+    calls: messaging.calls,
+    async deliver(target, text, senderSessionId) {
+      // The user archives the draft while the confirmation is in flight, so the
+      // 'sent' transition is refused after the message already went out.
+      await service.discardDraft(draft.id)
+      return messaging.deliver(target, text, senderSessionId)
+    },
+  }
+  const service = remoteOf(store, racing)
+
+  const result = await service.confirmDraft(draft.id)
+  assert.equal(result.delivered, true, 'the message really did go out')
+  assert.equal(result.reason, 'state-not-recorded')
+  assert.equal(result.draft.status, 'discarded', 'the returned draft carries the state the store actually has')
+  assert.equal(warnings.length, 1, 'the refused transition is recorded once as a warning')
+  assert.match(warnings[0], /not recorded/)
+
+  const again = await service.confirmDraft(draft.id)
+  assert.equal(again.delivered, false)
+  assert.equal(again.reason, 'draft-decided')
+  assert.equal(messaging.calls.length, 1, 'a delivered draft is never sent a second time')
+})
+
 test('an unknown draft id is a named failure, not a silent success', async () => {
   const store = seeded()
   const service = remoteOf(store, fakeMessaging())

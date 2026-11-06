@@ -209,9 +209,14 @@ test('an assigned master gets the section with the ticket name, order and no int
   assert.equal(section.text({ agent: { id: 'master-1' }, scope: { id: 'master-1' } }), '只汇报，不代做决定')
   assert.equal(section.text({ agent: { id: 'worker-1' }, scope: { id: 'worker-1' } }), '')
   assert.equal(section.text({ scope: { id: 'worker-1' } }), '')
-  // No session identity at all: the documented global fallback.
-  assert.equal(section.text(), '只汇报，不代做决定')
-  assert.equal(section.text({}), '只汇报，不代做决定')
+  // No session identity at all: inject nothing and say why. A global fallback would
+  // put the secretary prompt into every child's system prompt (ticket 09's semantics).
+  assert.equal(section.text(), '')
+  assert.equal(section.text({}), '')
+  assert.ok(
+    harness.logs.warn.some((message) => /cannot tell which session/.test(message)),
+    'the missing identity is warned about instead of silently widening the injection',
+  )
 })
 
 test('an edited text is read at the next assembly without registering again', () => {

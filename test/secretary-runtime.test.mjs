@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict'
 import { registerHooks } from 'node:module'
 import test from 'node:test'
+import * as fsp from 'node:fs/promises'
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createDraftStore } from '../lib/secretary-nudge.js'
+import { collectOrchestratorRows } from '../lib/secretary-panel.js'
 
 /**
  * 秘书的节拍（秘书 spec 票 05）在这里被真的跑一遍：dispatch 之后用假时钟把九分钟推完，
@@ -131,6 +134,8 @@ function harness({
   beatSeconds = 180,
   maxRunSeconds = 7200,
   messaging,
+  drafts,
+  fs,
 } = {}) {
   const timer = fakeClock(START)
   const messages = []
@@ -204,6 +209,8 @@ function harness({
     now: timer.now,
     schedule: timer.schedule,
     cancel: timer.cancel,
+    ...(drafts === undefined ? {} : { drafts }),
+    ...(fs === undefined ? {} : { fs }),
     ...(messaging === undefined
       ? {
           messaging: {
@@ -227,6 +234,7 @@ function harness({
     effects,
     handlers,
     rows,
+    drafts,
     reportDir,
     files,
     setState: (id, state) => {
@@ -419,5 +427,86 @@ test('unloading the plugin stops every beat and leaves no timer', async () => {
     await h.secretary.settled()
     assert.deepEqual(await h.files('orch-1'), ['09-00.md'], 'no report may be written after unload')
     assert.deepEqual(await h.files('orch-2'), ['09-00.md'])
+  })
+})
+
+test('a planning report that fails to write spends no trigger, so the next dispatch retries', async () => {
+  await withDir(async (dir) => {
+    // The first write fails the way a full disk would; the retry must still be allowed.
+    let failures = 1
+    const flaky = {
+      async mkdir(...args) {
+        return fsp.mkdir(...args)
+      },
+      async writeFile(...args) {
+        if (failures > 0) {
+          failures -= 1
+          throw new Error('disk full')
+        }
+        return fsp.writeFile(...args)
+      },
+    }
+    const h = harness({ dir, fs: flaky })
+
+    await h.dispatch()
+    assert.deepEqual(await h.files('orch-1'), [], 'the failed write left no planning report')
+    assert.equal(h.secretary.triggerState.has('orch-1'), false, 'the trigger was not spent')
+    assert.ok(
+      h.logs.some((message) => /cannot write the planning report/.test(message)),
+      'the failure is recorded in the log',
+    )
+
+    await h.dispatch()
+    assert.deepEqual(await h.files('orch-1'), ['09-00.md'], 'the second dispatch writes the planning report')
+    assert.equal(h.secretary.triggerState.has('orch-1'), true, 'and now the trigger is spent')
+  })
+})
+
+test('the beat drafts the blocker each tick, and a decided draft does not block the next tick', async () => {
+  await withDir(async (dir) => {
+    const drafts = createDraftStore()
+    const h = harness({ dir, orchestrators: [{ id: 'orch-1', state: 'Needs input' }], workers: [], drafts })
+
+    await h.dispatch()
+    assert.equal(drafts.list().length, 1, 'the mount initialization drafts the current blocker')
+    assert.equal(drafts.list()[0].status, 'pending')
+
+    h.timer.advance(BEAT)
+    await h.secretary.settled()
+    assert.equal(drafts.list().length, 1, 'the tick reuses the same pending draft')
+
+    const draft = drafts.list()[0]
+    drafts.decide(draft.id, 'discarded', 2)
+    h.timer.advance(BEAT)
+    await h.secretary.settled()
+    assert.equal(drafts.list().length, 2, 'a decided draft does not block the next tick from drafting again')
+    assert.equal(drafts.list().filter((row) => row.status === 'pending').length, 1)
+  })
+})
+
+test('the view beats follow the real beat: count grows per tick and capped after the run cap', async () => {
+  await withDir(async (dir) => {
+    const h = harness({ dir, maxRunSeconds: 600 })
+    const rowBeats = () =>
+      collectOrchestratorRows({
+        registry: { orchestrators: [{ sessionId: 'orch-1', workspace: dir, title: '修登录', trackedAt: 1 }] },
+        sessions: [{ id: 'orch-1', header: { id: 'orch-1' } }],
+        beatStatus: h.secretary.beatStatus,
+      })[0].beats
+
+    await h.dispatch()
+    assert.deepEqual(rowBeats(), { count: 0, startedAt: START, capped: false, stoppedReason: null })
+
+    h.timer.advance(BEAT)
+    await h.secretary.settled()
+    assert.equal(rowBeats().count, 1, 'one tick, one count')
+
+    // 180s / 360s / 540s tick; the 720s tick is past the 600s cap, so the beat stops itself.
+    h.timer.advance(9 * MINUTE)
+    await h.secretary.settled()
+    const capped = rowBeats()
+    assert.equal(capped.count, 3)
+    assert.equal(capped.capped, true)
+    assert.equal(capped.stoppedReason, 'max-run')
   })
 })
