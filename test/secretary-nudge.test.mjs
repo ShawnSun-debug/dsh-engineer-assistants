@@ -24,7 +24,7 @@ function fakeMessaging(outcome = { delivered: true }) {
 /** A store with one pending draft from a Needs-input session, seeded through the real trigger. */
 function seeded({ state = 'Needs input', now = 1000 } = {}) {
   const store = createDraftStore()
-  applyDraftTriggers({ store, orchestrators: [{ sessionId: 's-1', title: '构建', state, lastError: null }], now })
+  applyDraftTriggers({ store, orchestrators: [{ sessionId: 's-1', title: '构建', state }], now })
   return store
 }
 
@@ -40,7 +40,7 @@ function remoteOf(store, messaging, masterSessionId = 'master-1') {
 
 test('a Needs input session yields one pending draft and the next poll reuses it (why: the view re-reads every ten seconds)', () => {
   const store = createDraftStore()
-  const orchestrators = [{ sessionId: 's-1', title: '构建', state: 'Needs input', lastError: null }]
+  const orchestrators = [{ sessionId: 's-1', title: '构建', state: 'Needs input' }]
   applyDraftTriggers({ store, orchestrators, conflict: null, now: 1000 })
   applyDraftTriggers({ store, orchestrators, conflict: null, now: 2000 })
 
@@ -57,19 +57,18 @@ test('a Needs input session yields one pending draft and the next poll reuses it
   assert.ok([...drafts[0].text].length <= DRAFT_MAX_CHARS)
 })
 
-test('a registry conflict yields its own draft, and a lastError yields another reason for the same session', () => {
+test('a registry conflict yields its own draft and a calm working session adds nothing', () => {
   const store = createDraftStore()
   applyDraftTriggers({
     store,
-    orchestrators: [{ sessionId: 's-2', title: '冲突', state: 'Working', lastError: 'boom' }],
+    orchestrators: [{ sessionId: 's-2', title: '冲突', state: 'Working' }],
     conflict: { masterSessionId: 'm-1', conflictingOrchestratorIds: ['s-2'] },
     now: 10,
   })
-  const reasons = store.list().map((draft) => draft.reason).sort()
-  assert.deepEqual(reasons, ['conflict', 'error'])
+  assert.deepEqual(store.list().map((draft) => draft.reason), ['conflict'])
   // A calm working session and an empty conflict make nothing.
-  applyDraftTriggers({ store, orchestrators: [{ sessionId: 's-3', title: '安静', state: 'Working', lastError: null }], conflict: null, now: 20 })
-  assert.equal(store.list().length, 2)
+  applyDraftTriggers({ store, orchestrators: [{ sessionId: 's-3', title: '安静', state: 'Working' }], conflict: null, now: 20 })
+  assert.equal(store.list().length, 1)
 })
 
 test('generating a draft sends no message; confirmDraft alone delivers it to the master session', async () => {
@@ -128,7 +127,7 @@ test('a draft decided while the send is in flight reports the real state and is 
   const store = createDraftStore({ warn: (message) => warnings.push(message) })
   applyDraftTriggers({
     store,
-    orchestrators: [{ sessionId: 's-1', title: '构建', state: 'Needs input', lastError: null }],
+    orchestrators: [{ sessionId: 's-1', title: '构建', state: 'Needs input' }],
     now: 1000,
   })
   const draft = store.list()[0]

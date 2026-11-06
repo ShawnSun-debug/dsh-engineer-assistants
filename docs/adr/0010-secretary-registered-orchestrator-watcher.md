@@ -38,10 +38,10 @@ master 层已经能回答「现在有哪些 worker、各自什么状态」，但
 **以后改动要连带改什么：**
 
 - 改报告小节标题或「类型」标签 → `lib/secretary-panel.js` 的 `KIND_BY_HEADING` / `KIND_BY_LABEL` / `DIFF_GROUPS` 必须同步；否则历史行被读成 `unknown`、差异降级回扁平数组。
-- 改五类变化的判定或顺序 → `lib/secretary-diff.js` 的 `CHANGE_KINDS`、`lib/secretary-deliver.js` 的 `KIND_LABELS`、`lib/secretary-panel.js` 的 `NOTIFY_SWITCHES` 三处一起改；配置里 `secretaryNotifyOn` 存的是这些名字，是持久化值。
+- 改五类变化的判定或顺序 → `lib/secretary-constants.js` 的 `NOTIFY_SWITCHES`（`CHANGE_KINDS` 由它派生）、`lib/secretary-deliver.js` 的 `KIND_LABELS`、`lib/client.js` 的 `SECRETARY_NOTIFY_NAMES` 三处一起改；客户端不能 import 服务端模块，`test/client.test.mjs` 会断言镜像一致。配置里 `secretaryNotifyOn` 存的是这些名字，是持久化值。
 - 改登记表字段或配置键 → registry 归一化、视图端点、设置页、Config schema 四处；`orchestrators` 的行形状是视图契约。
 - 改节拍 / 上限缺省 → `secretary-beat.js` 的两个常量、Config 里 `secretaryBeatSeconds` / `secretaryMaxRunSeconds` 的默认值、端点 policy 段三处一起改。
-- 改归档根或文件名粒度 → `secretary-archive.js` 的 `REPORT_ROOT`、`secretary-panel.js` 的 `DEFAULT_REPORTS_ROOT`、policy 与读取方四处；已落盘的路径不会迁移。
+- 改归档根或文件名粒度 → `lib/master-state.js` 的 `DEFAULT_REPORTS_ROOT`（及派生的 `REPORT_ROOT`）、`secretary-archive.js` 的文件名粒度、policy 与读取方一起改；已落盘的路径不会迁移。
 - 改视图座位 id → `main` 的 key 与 `sidebar.panellist` 的 id 必须同一个字符串（`selectPanel` 靠它），三页签 id 是客户端契约。
 - 下线 `lib/master-panel.js` 或 `orchestratorMaster/masterState` 时，Config 里的 `masterPanelEnabled` 与 `apply()` 里的 `ctx.provide` 要一起删；票 10 的原始范围包含这一步。
 

@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import test from 'node:test'
 import vm from 'node:vm'
+import { WORKER_STATE } from '../lib/master-state.js'
+import { NOTIFY_SWITCHES } from '../lib/secretary-constants.js'
 
 const src = fs.readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
 
@@ -185,6 +187,19 @@ const T = mod.__test
 const t = (k) => k
 // Values built inside the vm context have another Object.prototype; compare them as plain JSON.
 const plain = (v) => JSON.parse(JSON.stringify(v))
+
+test('the client mirrors the shared worker-state and notify vocabularies exactly', () => {
+  // The client bundle cannot import a server module, so lib/client.js keeps a copy of each
+  // vocabulary. The copy is only safe while its keys, values and order match the server's.
+  for (const [mirror, server] of [
+    [T.WORKER_STATE, WORKER_STATE],
+    [T.SECRETARY_NOTIFY_NAMES, NOTIFY_SWITCHES],
+  ]) {
+    const copy = plain(mirror)
+    assert.deepEqual(Object.keys(copy), Object.keys(server))
+    assert.deepEqual(Object.values(copy), Object.values(server))
+  }
+})
 /** Run every pending microtask; the hook shim commits effects after each render. */
 const flush = async (rounds = 10) => {
   for (let i = 0; i < rounds; i += 1) await Promise.resolve()
