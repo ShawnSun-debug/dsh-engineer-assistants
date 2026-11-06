@@ -318,12 +318,8 @@ test('saveRoute surfaces a rejected write and a write that did not land', async 
   assert.equal(await T.saveRoute(dropped, T.MAIN.fields, { provider: 'p', model: 'm', effort: '' }, t), 'route.saveFailed')
 })
 
-test('apply puts the toggle in the left slot, the picker and the master panel in input.right', async () => {
+test('apply puts the toggle in the left slot, the picker in input.right and the secretary view in main + sidebar', () => {
   const regs = []
-  const projection = { enabled: true, byState: { Working: 1 }, workers: [{ id: 'w-1', role: 'worker', state: 'Working', summary: 'wired' }] }
-  // The Gateway installs a mounted namespace as the Cordis service `remote.<namespace>`;
-  // ctx.get is the inject-free read, and $mount is what installs it.
-  let installed
   const ctx = {
     effect: (fn) => fn(),
     locale: { register: () => {} },
@@ -331,34 +327,29 @@ test('apply puts the toggle in the left slot, the picker and the master panel in
     remote: {
       commands: { execute: async () => ({ ok: true, value: 'x' }) },
       session: { modelCatalog: async () => ({ ok: true, value: { groups: [] } }) },
-      $mount: async () => {
-        installed = { masterState: async () => ({ ok: true, value: projection }) }
-      },
     },
-    get: (name) => (name === 'remote.orchestratorMaster' ? installed : undefined),
+    get: () => undefined,
     slots: { inject: (_n, cb) => cb(), register: (opts, comp) => regs.push({ opts, comp }) },
   }
   mod.apply(ctx)
   assert.deepEqual(regs.map((r) => [r.opts.name, r.opts.id, r.opts.order]), [
     ['conversation.input.left', 'orchestrator-plan-toggle', 20],
     ['conversation.input.right', 'orchestrator-route-picker', 11],
-    ['conversation.input.right', 'orchestrator-master-panel', 12],
     // The secretary view: one keyless-identity registration into the main seat, then the sidebar
     // row that selects it by the same id.
     ['main', undefined, undefined],
     ['sidebar.panellist', 'secretary', 40],
   ])
+  // Ticket 10 retired the legacy master panel: no slot carries its id any more, and the two
+  // secretary seats are the only other registrations apply makes.
+  assert.equal(regs.some((r) => r.opts.id === 'orchestrator-master-panel'), false)
+  assert.deepEqual(
+    regs.filter((r) => r.opts.id === 'secretary' || r.opts.key === 'secretary').map((r) => r.opts.name),
+    ['main', 'sidebar.panellist'],
+  )
   const props = regs[1].opts.inject('S1')
   assert.deepEqual([props.scopes.main.ns, props.scopes.worker.ns, props.scopes.orch.ns], ['agent-default-model', 'orchestrator', 'orchestrator'])
   assert.equal(props.setPlan, undefined)
-  // The master panel gets the same config scope plus one loader; it owns no writer.
-  const master = regs[2].opts.inject('S1')
-  assert.equal(master.orch.ns, 'orchestrator')
-  assert.equal(typeof master.loadState, 'function')
-  assert.equal(master.setPlan, undefined)
-  // The loader is wired to the ctx (not ctx.remote) and reads the namespace through ctx.get;
-  // a `remote.orchestratorMaster` property read would throw "cannot get property … without inject".
-  assert.deepEqual(plain(await master.loadState()), projection)
   assert.deepEqual(plain(mod.inject), [
     'slots',
     'locale',
@@ -1149,262 +1140,41 @@ test('the panel shows a review route row and the last verdict', async () => {
   view.unmount()
 })
 
-test('masterGroups keeps the six-state order, counts every group and filters rows by state', () => {
-  const { MASTER_STATES, masterGroups } = mod.__test
-  assert.deepEqual(plain(MASTER_STATES), ['Working', 'Needs input', 'Idle', 'Completed', 'Failed', 'Stopped'])
-  const groups = masterGroups({
-    byState: { Working: 2, Idle: 1 },
-    workers: [
-      { id: 'a', role: 'worker', state: 'Working', summary: 'one' },
-      { id: 'b', role: 'worker', state: 'Idle', summary: '' },
-      { id: 'c', role: 'worker', state: 'Working', summary: 'two' },
-    ],
-  })
-  assert.deepEqual(plain(groups.map((group) => [group.state, group.count, group.workers.map((worker) => worker.id)])), [
-    ['Working', 2, ['a', 'c']],
-    ['Needs input', 0, []],
-    ['Idle', 1, ['b']],
-    ['Completed', 0, []],
-    ['Failed', 0, []],
-    ['Stopped', 0, []],
-  ])
-  // A missing or malformed snapshot is the empty six-state shape, never a crash.
-  assert.equal(masterGroups(null).length, 6)
-  assert.equal(masterGroups({ byState: null, workers: null }).every((group) => group.count === 0), true)
-})
-
-test('the master contribution declares its result as an src-json codec', () => {
-  const { MASTER_CONTRIBUTION } = mod.__test
-  const [descriptor] = MASTER_CONTRIBUTION.descriptors
-  // The host validates every mounted result codec: `src-json` returns before the
-  // create() check, while a strict codec must carry its own create() factory, which a
-  // hand-written plugin contribution cannot supply. Declaring strict makes $mount throw
-  // "strict codec has no create() factory" and the panel never reads its state.
-  assert.deepEqual(plain(descriptor.result), { mode: 'src-json' })
-  assert.equal('typeSymbol' in descriptor.result, false)
-  assert.equal('create' in descriptor.result, false)
-})
-
-test('the master panel renders nothing and makes no request while its switch is off', () => {
-  const { MasterPanel } = mod.__test
-  const scope = fakeScope({ initial: { masterPanelEnabled: false } })
-  let loads = 0
-  const view = mount(MasterPanel, {
-    t,
-    orch: scope,
-    loadState: () => {
-      loads += 1
-      return Promise.resolve({ enabled: true, byState: {}, workers: [] })
-    },
-  })
-  assert.equal(view.tree, null)
-  assert.equal(loads, 0)
-  view.unmount()
-})
-
-test('the master panel shows its empty state when the endpoint has no workers', async () => {
-  const { MasterPanel } = mod.__test
-  const scope = fakeScope({ initial: { masterPanelEnabled: true } })
-  const view = mount(MasterPanel, {
-    t,
-    orch: scope,
-    loadState: async () => ({ enabled: true, byState: { Working: 0 }, workers: [] }),
-  })
-  const trigger = nodes(view.tree).find((node) => node.type === 'button')
-  assert.ok(trigger, 'the panel renders its trigger once enabled')
-  trigger.props.onClick()
-  await flush()
-  assert.ok(
-    nodes(view.tree).some((node) => node.props?.['data-testid'] === 'orchestrator-master-empty'),
-    'the empty state is a visible element, not an error',
-  )
-  assert.equal(nodes(view.tree).some((node) => node.props?.role === 'alert'), false)
-  view.unmount()
-})
-
-test('the master panel groups worker rows under their state with the projection summary', async () => {
-  const { MasterPanel } = mod.__test
-  const scope = fakeScope({ initial: { masterPanelEnabled: true } })
-  const view = mount(MasterPanel, {
-    t,
-    orch: scope,
-    loadState: async () => ({
-      enabled: true,
-      byState: { Working: 1, 'Needs input': 1 },
-      workers: [
-        { id: 'w-1234567890', role: 'worker', state: 'Working', summary: 'build the panel' },
-        { id: 'w2', role: 'worker', state: 'Needs input', summary: '' },
-      ],
-    }),
-  })
-  nodes(view.tree).find((node) => node.type === 'button').props.onClick()
-  await flush()
-  const text = textOf(view.tree)
-  assert.match(text, /Working · 1/)
-  assert.match(text, /Needs input · 1/)
-  assert.match(text, /build the panel/)
-  assert.match(text, /w-123456/)
-  assert.match(text, /master\.summaryEmpty/)
-  view.unmount()
-})
-
-test('a failed master read shows an alert instead of crashing the toolbar', async () => {
-  const { MasterPanel } = mod.__test
-  const scope = fakeScope({ initial: { masterPanelEnabled: true } })
-  const view = mount(MasterPanel, {
-    t,
-    orch: scope,
-    loadState: async () => {
-      throw new Error('remote down')
-    },
-  })
-  nodes(view.tree).find((node) => node.type === 'button').props.onClick()
-  await flush()
-  const alert = nodes(view.tree).find((node) => node.props?.role === 'alert')
-  assert.ok(alert, 'the failure is shown as an alert')
-  assert.match(textOf(alert), /master\.failed/)
-  assert.match(textOf(alert), /remote down/)
-  view.unmount()
-})
-
-
-test('every expansion asks the endpoint again, and a closed panel never reads', async () => {
-  const { MasterPanel } = mod.__test
-  const scope = fakeScope({ initial: { masterPanelEnabled: true } })
-  let loads = 0
-  const view = mount(MasterPanel, {
-    t,
-    orch: scope,
-    loadState: async () => {
-      loads += 1
-      return { enabled: true, byState: {}, workers: [] }
-    },
-  })
-  await flush()
-  assert.equal(loads, 0, 'mounting the toolbar entry alone no longer reads the endpoint')
-
-  const trigger = () => nodes(view.tree).find((node) => node.type === 'button')
-  trigger().props.onClick()
-  await flush()
-  assert.equal(loads, 1, 'opening the panel reads it once')
-
-  trigger().props.onClick()
-  await flush()
-  assert.equal(loads, 1, 'closing the panel reads nothing')
-
-  trigger().props.onClick()
-  await flush()
-  assert.equal(loads, 2, 'the second expansion reads it again instead of replaying the mount snapshot')
-  view.unmount()
-})
-
-/**
- * A stand-in for the host's client ctx. `get(name)` is the inject-free service read Cordis
- * offers and `$mount` installs `remote.<namespace>`, exactly like the Gateway does, so the
- * real `loadMasterState` runs end to end. The `remote` view answers `$mount` and throws on
- * every other property — the way the host's traced Remote service throws
- * `cannot get property "remote.orchestratorMaster" without inject` for a namespace the
- * plugin never declared. Any regression back to that property read fails loudly.
- */
-function fakeCtx({ value, result, failFirstMount = false, remoteViaGet = false } = {}) {
-  let namespace
-  const mounts = []
-  const remote = {
-    $mount(contribution) {
-      mounts.push(contribution)
-      if (failFirstMount === true && mounts.length === 1) {
-        return Promise.reject(new Error('the host is not ready yet'))
-      }
-      namespace = { masterState: async () => result ?? { ok: true, value } }
-      return Promise.resolve(() => {})
-    },
+test('ticket 10 leaves no trace of the legacy master panel in the client bundle', () => {
+  // The input.right button, its component, its poll and its endpoint descriptor are gone.
+  // Matching the source keeps a dead copy from creeping back: any of these names returning
+  // means the retired panel was reintroduced, and fails here before it reaches a session.
+  for (const name of [
+    'MASTER_CONTRIBUTION',
+    'MASTER_STATES',
+    'MASTER_POLL_MS',
+    'MASTER_SERVICE',
+    'masterGroups',
+    'masterNamespaceOf',
+    'mountMasterRemote',
+    'loadMasterState',
+    'MasterPanel',
+    'masterPanelEnabled',
+    'orchestrator-master-panel',
+  ]) {
+    assert.equal(src.includes(name), false, name)
   }
-  const guarded = new Proxy(remote, {
-    get(target, prop) {
-      if (prop === '$mount') return target.$mount.bind(target)
-      throw new Error(`cannot get property "remote.${String(prop)}" without inject`)
-    },
-  })
-  const ctx = {
-    mounts,
-    get(name) {
-      if (name === 'remote.orchestratorMaster') return namespace
-      if (name === 'remote' && remoteViaGet) return remote
-      return undefined
-    },
+  for (const name of ['MASTER_CONTRIBUTION', 'MASTER_STATES', 'MasterPanel', 'masterGroups', 'loadMasterState']) {
+    assert.equal(name in T, false, '__test still exports ' + name)
   }
-  if (!remoteViaGet) ctx.remote = guarded
-  return ctx
-}
-
-test('loadMasterState reads the namespace through ctx.get and mounts once', async () => {
-  const { loadMasterState } = mod.__test
-  const value = { enabled: true, byState: { Working: 1 }, workers: [{ id: 'w-1', role: 'worker', state: 'Working', summary: 'ok' }] }
-  const ctx = fakeCtx({ value })
-
-  assert.deepEqual(plain(await loadMasterState(ctx)), value)
-  assert.deepEqual(plain(await loadMasterState(ctx)), value)
-  assert.equal(ctx.mounts.length, 1, 'one mount serves every read')
-  assert.equal(ctx.mounts[0].descriptors[0].id, 'dsh-orchestrator-master#orchestratorMaster/masterState')
+  // The deleted panel owned the only master.* copy, so both dictionaries dropped those keys.
+  for (const dict of [T.zh, T.en]) {
+    assert.deepEqual(Object.keys(dict).filter((key) => key.startsWith('master.')), [])
+  }
+  // The helpers the secretary view reuses survived the deletion.
+  assert.equal(typeof T.loadSecretaryState, 'function')
 })
 
-test('the remote service is reachable through ctx.get as well as the injected property', async () => {
-  const { loadMasterState } = mod.__test
-  const value = { enabled: false, byState: {}, workers: [] }
-  // No `remote` property at all: the service lookup alone has to carry the mount.
-  const ctx = fakeCtx({ value, remoteViaGet: true })
-  assert.deepEqual(plain(await loadMasterState(ctx)), value)
-  assert.equal(ctx.mounts.length, 1)
-})
-
-test('an unavailable namespace is a clear error instead of a property read', async () => {
-  const { loadMasterState } = mod.__test
-  // $mount succeeds but installs nothing: ctx.get keeps answering undefined.
-  const ctx = { mounts: [], remote: { $mount: async () => {} }, get: () => undefined }
-  await assert.rejects(loadMasterState(ctx), /orchestratorMaster\/masterState is unavailable/)
-})
-
-test('a failed RemoteResult becomes a rejection with the host message', async () => {
-  const { loadMasterState } = mod.__test
-  const ctx = fakeCtx({ result: { ok: false, error: { message: 'projection is not ready' } } })
-  await assert.rejects(loadMasterState(ctx), /projection is not ready/)
-})
-
-test('a failed mount is retried on the next read instead of being cached forever', async () => {
-  const { loadMasterState } = mod.__test
-  const ctx = fakeCtx({ value: { enabled: true, byState: {}, workers: [] }, failFirstMount: true })
-
-  await assert.rejects(loadMasterState(ctx), /host is not ready yet/)
-  assert.deepEqual(plain(await loadMasterState(ctx)), { enabled: true, byState: {}, workers: [] })
-  assert.equal(ctx.mounts.length, 2, 'the rejection is not the cached answer for the rest of the page')
-})
-
-test('the panel reads through the real loader and the host mount, not an injected snapshot', async () => {
-  const { MasterPanel, loadMasterState } = mod.__test
-  const ctx = fakeCtx({
-    value: {
-      enabled: true,
-      byState: { Working: 1 },
-      workers: [{ id: 'w-1234567890', role: 'worker', state: 'Working', summary: 'from the remote endpoint' }],
-    },
-  })
-  const scope = fakeScope({ initial: { masterPanelEnabled: true } })
-  const view = mount(MasterPanel, { t, orch: scope, loadState: () => loadMasterState(ctx) })
-
-  nodes(view.tree).find((node) => node.type === 'button').props.onClick()
-  await flush(14)
-
-  assert.equal(ctx.mounts.length, 1, 'the panel mounted the contribution itself')
-  const text = textOf(view.tree)
-  assert.match(text, /from the remote endpoint/)
-  assert.match(text, /Working · 1/)
-  view.unmount()
-})
 
 // ---- 秘书视图（票 07） -------------------------------------------------------------------
 //
 // The view reads the ticket-06 payload and nothing else. These cases mount the real components
-// over the same hook shim the master-panel cases use, so a regression in the mapping, the empty
+// over the same hook shim the cases above use, so a regression in the mapping, the empty
 // state or the error path fails here instead of only in the browser.
 
 /** A payload with one waiting session, one running one, a report and a conflict row. */
@@ -1542,7 +1312,7 @@ test('the secretary contribution declares the two draft transitions with one dra
   }
 })
 
-test('the secretary contribution mirrors the master one: src-json, zero parameters', () => {
+test('the secretary contribution stays src-json with zero parameters', () => {
   const [descriptor] = T.SECRETARY_CONTRIBUTION.descriptors
   assert.deepEqual(plain(descriptor.result), { mode: 'src-json' })
   assert.deepEqual(plain(descriptor.parameters), [])
