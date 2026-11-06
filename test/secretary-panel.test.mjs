@@ -41,30 +41,33 @@ const ORCHESTRATOR = {
   lastError: null,
 }
 
+// The diff is the three groups lib/secretary-diff.js produces, not a flat list of
+// sentences the view has to reverse-engineer. Why changed with ticket 08: the view now
+// reads completed/blocked/flipped directly.
 const REPORT = {
   sessionId: 'orch-1',
   at: 90,
   kind: 'delta',
   path: '/r/12-03.md',
   bytes: 120,
-  changes: ['w-1：Working → Completed'],
+  changes: { completed: ['w-1：Working → Completed'], blocked: [], flipped: [] },
   error: null,
 }
 
+// Ticket 08's draft shape: the stuck session, why it is stuck, the generated body and
+// the confirm transition. Why changed: the store keys drafts by id and only records
+// sentAt when confirmDraft actually delivered the text.
 const DRAFT = {
   id: 'd-1',
-  createdAt: 80,
-  orchestratorId: 'orch-1',
-  targetSessionId: 'orch-1',
-  targetTitle: '日报',
-  reason: 'blocked',
+  sessionId: 'orch-1',
+  reason: 'needs-input',
   text: '需要你拍板',
   status: 'pending',
-  decidedAt: null,
-  error: null,
+  createdAt: 80,
+  sentAt: null,
 }
 
-test('the payload carries five segments with exactly the contract field names', () => {
+test('the payload carries five segments with exactly the contract field names (why: ticket 08 grouped the diff and reshaped the draft row)', () => {
   const payload = composeViewState({
     enabled: true,
     registry: { masterSessionId: 'm-1', orchestrators: [{ sessionId: 'orch-1', workspace: 'w', title: '日报', trackedAt: 7 }] },
@@ -103,15 +106,12 @@ test('the payload carries five segments with exactly the contract field names', 
 
   assert.deepEqual(Object.keys(payload.drafts[0]), [
     'id',
-    'createdAt',
-    'orchestratorId',
-    'targetSessionId',
-    'targetTitle',
+    'sessionId',
     'reason',
     'text',
     'status',
-    'decidedAt',
-    'error',
+    'createdAt',
+    'sentAt',
   ])
   assert.deepEqual(payload.drafts[0], DRAFT)
 
@@ -223,7 +223,16 @@ test('composing never writes into the input it was handed', () => {
     enabled: true,
     registry: { masterSessionId: 'm-1', orchestrators: [{ sessionId: 'orch-1', workspace: 'w', title: '日报', trackedAt: 7 }] },
     orchestrators: [{ ...ORCHESTRATOR, workers: [...ORCHESTRATOR.workers] }],
-    reports: [{ ...REPORT, changes: [...REPORT.changes] }],
+    reports: [
+      {
+        ...REPORT,
+        changes: {
+          completed: [...REPORT.changes.completed],
+          blocked: [...REPORT.changes.blocked],
+          flipped: [...REPORT.changes.flipped],
+        },
+      },
+    ],
     drafts: [{ ...DRAFT }],
     policy: { beatSeconds: 300 },
   }
@@ -317,12 +326,16 @@ test('a broken projection or agent registry degrades to Idle and live false inst
   assert.equal(collectOrchestratorRows({}).length, 0)
 })
 
-test('the Remote exposes one zero-argument direct method at the expected endpoint', () => {
+test('the Remote exposes the read method plus the two draft transitions (why: ticket 08 adds confirm and discard)', () => {
   const service = new SecretaryRemote({ enabled: () => false, read: async () => ({}) })
   assert.equal(SECRETARY_SERVICE_KEY, 'orchestratorSecretary')
   assert.equal(SECRETARY_METHOD, 'secretaryState')
   assert.equal(SECRETARY_ENDPOINT, 'orchestratorSecretary/secretaryState')
   assert.equal(service.secretaryState.length, 0, 'SRC reflection reads a zero-parameter method')
+  // SRC reflection reads the parameter names from the method source, so both writes take
+  // exactly one plain parameter named draftId.
+  assert.equal(service.confirmDraft.length, 1)
+  assert.equal(service.discardDraft.length, 1)
   assert.deepEqual(service.typertRemote, {
     service,
     serviceKey: SECRETARY_SERVICE_KEY,
@@ -333,7 +346,11 @@ test('the Remote exposes one zero-argument direct method at the expected endpoin
     '@deepseek-ai/dsh-typert-protocol/remote-methods',
   )?.value
   assert.equal(marker.version, 1)
-  assert.deepEqual(marker.methods, [{ method: 'secretaryState', invocation: { kind: 'direct' } }])
+  assert.deepEqual(marker.methods, [
+    { method: 'secretaryState', invocation: { kind: 'direct' } },
+    { method: 'confirmDraft', invocation: { kind: 'direct' } },
+    { method: 'discardDraft', invocation: { kind: 'direct' } },
+  ])
 })
 
 test('the switch off returns the empty payload and reads neither the host nor the archive', async () => {
@@ -421,7 +438,7 @@ test('a reports directory that was never written is an empty list, not a failure
   }
 })
 
-test('archived reports are listed newest first with what the history tab renders', async () => {
+test('archived reports are listed newest first with what the history tab renders (why: the report sections are the groups now)', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'secretary-reports-'))
   try {
     const root = join(dir, '.scratch', 'master-secretary', 'reports')
@@ -466,12 +483,52 @@ test('archived reports are listed newest first with what the history tab renders
     )
     assert.equal(rows[0].path, deltaPath)
     assert.equal(rows[0].at, Date.UTC(2026, 0, 2, 3, 3))
-    assert.deepEqual(rows[0].changes, ['w-1：Working → Completed', 'w-2 等回话'])
+    // Why changed (ticket 08): the report's ### 新完成 / ### 新卡住 / ### 状态翻转 sections
+    // are the grouping now, so the endpoint hands over the same three arrays
+    // lib/secretary-diff.js returns instead of one flat sentence list.
+    assert.deepEqual(rows[0].changes, {
+      completed: ['w-1：Working → Completed'],
+      blocked: ['w-2 等回话'],
+      flipped: [],
+    })
     assert.equal(rows[0].bytes, (await readFile(deltaPath)).length)
     assert.equal(rows[0].error, null)
-    // 规划首报没有差异段，所以 changes 为空——不是"没有变化"的编造值。
-    assert.deepEqual(rows[1].changes, [])
-    assert.deepEqual(rows[2].changes, [])
+    // 规划首报没有差异段，所以三组都是空的——不是"没有变化"的编造值。
+    assert.deepEqual(rows[1].changes, { completed: [], blocked: [], flipped: [] })
+    assert.deepEqual(rows[2].changes, { completed: [], blocked: [], flipped: [] })
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a report written before the sectioned diff keeps its flat list (why: older archives have no ### groups)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'secretary-legacy-'))
+  try {
+    const conversation = join(dir, '.scratch', 'master-secretary', 'reports', 'orch-1')
+    await mkdir(conversation, { recursive: true })
+    const legacy = [
+      '# 秘书汇报',
+      '',
+      '- 时间：2026-01-02 03:03',
+      '- 会话：orch-1',
+      '- 类型：增量',
+      '',
+      '## 差异',
+      '',
+      '- w-1：Working → Completed',
+      '- w-2 等回话',
+      '',
+      '## 产出',
+      '',
+      '无',
+      '',
+    ].join('\n')
+    await writeFile(join(conversation, '12-03.md'), legacy, 'utf8')
+    const rows = await listReportRows({ fs: fsp, workspaces: [dir] })
+    assert.equal(rows.length, 1)
+    // The endpoint cannot tell which group an unlabeled bullet belongs to, so it keeps the
+    // old flat shape for the view's fallback instead of mislabeling it under "completed".
+    assert.deepEqual(rows[0].changes, ['w-1：Working → Completed', 'w-2 等回话'])
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

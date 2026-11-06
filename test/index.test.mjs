@@ -1603,6 +1603,42 @@ test('the secretary endpoint is provided only while its switch is on', async () 
   assert.deepEqual(closed.registry.orchestrators, [])
 })
 
+test('the secretary endpoint drafts a nudge for a Needs input session, dedupes it, and sends only on confirm', async () => {
+  const session = { id: 'orch-1', title: '修登录', header: { id: 'orch-1' } }
+  const harness = start({
+    secretaryEnabled: true,
+    secretaryOrchestrators: [{ sessionId: 'orch-1', workspace: '', title: '', trackedAt: 1 }],
+    sessions: { get: () => undefined, list: () => [session], flush: async () => true },
+    stateOf: () => ({ workers: [{ id: 'orch-1', role: 'main', state: 'Needs input', summary: '等你拍板' }] }),
+  })
+  const service = harness.services.get('orchestratorSecretary')
+  assert.equal(typeof service.confirmDraft, 'function')
+  assert.equal(typeof service.discardDraft, 'function')
+
+  const first = await service.secretaryState()
+  assert.equal(first.drafts.length, 1)
+  assert.equal(first.drafts[0].status, 'pending')
+  assert.equal(first.drafts[0].sessionId, 'orch-1')
+  assert.equal(first.drafts[0].reason, 'needs-input')
+  // The view re-reads on a timer; the same blocker stays one draft.
+  assert.equal((await service.secretaryState()).drafts.length, 1)
+
+  // No live master agent in this fake host, so the send fails loudly and the draft stays pending.
+  const failed = await service.confirmDraft(first.drafts[0].id)
+  assert.equal(failed.delivered, false)
+  assert.match(failed.reason, /no live agent for session master-1/)
+  assert.equal((await service.secretaryState()).drafts[0].status, 'pending')
+
+  const discarded = await service.discardDraft(first.drafts[0].id)
+  assert.equal(discarded.draft.status, 'discarded')
+  const after = await service.secretaryState()
+  assert.equal(after.drafts.find((draft) => draft.id === first.drafts[0].id).status, 'discarded')
+  // A decided draft does not block the next poll from drafting the still-existing blocker.
+  assert.equal(after.drafts.filter((draft) => draft.status === 'pending').length, 1)
+  const decided = await service.confirmDraft(first.drafts[0].id)
+  assert.equal(decided.reason, 'draft-decided')
+})
+
 test('the secretary endpoint lists the archived reports of a registered workspace', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'secretary-view-'))
   try {
@@ -1625,7 +1661,8 @@ test('the secretary endpoint lists the archived reports of a registered workspac
     assert.equal(payload.reports[0].sessionId, 'orch-1')
     assert.equal(payload.reports[0].kind, 'plan')
     assert.match(payload.reports[0].path, /\.scratch[\\/]master-secretary[\\/]reports[\\/]orch-1[\\/]\d{2}-\d{2}\.md$/)
-    assert.deepEqual(payload.reports[0].changes, [])
+    // Ticket 08: the report's diff is the structured shape (here all three groups empty).
+    assert.deepEqual(payload.reports[0].changes, { completed: [], blocked: [], flipped: [] })
     assert.equal(payload.reports[0].error, null)
     assert.ok(payload.reports[0].bytes > 0)
     assert.deepEqual(payload.orchestrators[0].lastReport, {

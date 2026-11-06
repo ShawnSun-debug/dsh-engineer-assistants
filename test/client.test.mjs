@@ -1456,13 +1456,12 @@ function secretaryPayload(overrides = {}) {
           kind: 'delta',
           path: 'r/1.md',
           bytes: 10,
-          changes: [
-            '进度：第 3 步 / 共 5 步',
-            '写测试：完成',
-            '会话进入 Needs input',
-            '会话：Idle → Working',
-            '一句对不上模板的话',
-          ],
+          // Ticket 08: the endpoint sends the three groups lib/secretary-diff.js returns.
+          changes: {
+            completed: ['进度：第 3 步 / 共 5 步', '写测试：完成'],
+            blocked: ['会话进入 Needs input'],
+            flipped: ['会话：Idle → Working'],
+          },
           error: null,
         },
       ],
@@ -1481,13 +1480,14 @@ function secretaryPayload(overrides = {}) {
 }
 
 /** Mount the panel over the hook shim; the scope is enabled unless a case says otherwise. */
-function mountSecretary({ payload = secretaryPayload(), loadState, scope, openSession, mutate } = {}) {
+function mountSecretary({ payload = secretaryPayload(), loadState, scope, openSession, mutate, nudge } = {}) {
   return mount(mod.__test.SecretaryPanel, {
     t,
     orch: scope ?? fakeScope({ initial: { secretaryEnabled: true } }),
     loadState: loadState ?? (async () => payload),
     openSession,
     mutate,
+    nudge,
   })
 }
 
@@ -1524,6 +1524,22 @@ test('the three tabs are the fixed vocabulary and both dictionaries label them',
     .sort()
   assert.deepEqual(zhKeys, enKeys)
   assert.ok(zhKeys.length > 40)
+})
+
+test('the secretary contribution declares the two draft transitions with one draftId each (why: ticket 08 adds a write seam)', () => {
+  const descriptors = plain(T.SECRETARY_CONTRIBUTION.descriptors)
+  assert.deepEqual(
+    descriptors.map((descriptor) => descriptor.method),
+    ['secretaryState', 'confirmDraft', 'discardDraft'],
+  )
+  for (const descriptor of descriptors.slice(1)) {
+    assert.equal(descriptor.id, 'dsh-orchestrator-secretary#orchestratorSecretary/' + descriptor.method)
+    assert.equal(descriptor.service, 'orchestratorSecretary')
+    assert.equal(descriptor.namespace, 'orchestratorSecretary')
+    assert.equal(descriptor.invocation.kind, 'direct')
+    assert.deepEqual(descriptor.parameters, [{ name: 'draftId', source: 'json', codec: { mode: 'src-json' } }])
+    assert.deepEqual(descriptor.result, { mode: 'src-json' })
+  }
 })
 
 test('the secretary contribution mirrors the master one: src-json, zero parameters', () => {
@@ -1691,6 +1707,120 @@ test('the overview maps the payload to its blockers, its current run and its wor
   assert.match(textOf(byTestId(ended.tree, 'orchestrator-secretary-row-gone')), /secretary\.ended/)
 })
 
+/** A pending draft card's payload row, ticket 08 shape. */
+const PENDING_DRAFT = {
+  id: 'd-1',
+  sessionId: 's-1',
+  reason: 'needs-input',
+  text: '秘书催办：会话「s-1」正在等你确认。',
+  status: 'pending',
+  createdAt: 1,
+  sentAt: null,
+}
+
+test('the blocker area renders the draft card and its two buttons call the nudge seam (why: a draft sends only on confirm)', async () => {
+  const calls = []
+  const refreshes = []
+  const view = mount(T.SecretaryOverview, {
+    t,
+    payload: secretaryPayload({ drafts: [PENDING_DRAFT] }),
+    width: 1200,
+    nudge: (draftId, action) => {
+      calls.push([draftId, action])
+      return Promise.resolve({ delivered: true, draft: { id: draftId, status: 'sent', sentAt: 5 } })
+    },
+    refresh: () => refreshes.push(1),
+  })
+
+  const card = byTestId(view.tree, 'orchestrator-secretary-draft-d-1')
+  assert.ok(card, 'a pending draft is a card in the blocker area')
+  assert.match(textOf(card), /秘书催办：会话「s-1」/)
+  assert.match(textOf(card), /secretary\.draft\.pending/)
+
+  const confirm = byTestId(view.tree, 'orchestrator-secretary-draft-confirm-d-1')
+  assert.equal(confirm.props.disabled, false)
+  confirm.props.onClick()
+  await flush()
+  assert.deepEqual(calls, [['d-1', 'confirm']], 'the confirm button calls confirm with the draft id')
+  assert.equal(refreshes.length, 1, 'a confirmed send re-reads the endpoint')
+
+  byTestId(view.tree, 'orchestrator-secretary-draft-discard-d-1').props.onClick()
+  await flush()
+  assert.deepEqual(calls, [
+    ['d-1', 'confirm'],
+    ['d-1', 'discard'],
+  ])
+  assert.equal(refreshes.length, 2)
+  view.unmount()
+})
+
+test('a refused send keeps the draft card pending and shows the reason (why: a failed send must not look sent)', async () => {
+  const refreshes = []
+  const view = mount(T.SecretaryOverview, {
+    t,
+    payload: secretaryPayload({ drafts: [PENDING_DRAFT] }),
+    width: 1200,
+    nudge: () =>
+      Promise.resolve({ delivered: false, draft: { id: 'd-1', status: 'pending' }, reason: 'target-missing' }),
+    refresh: () => refreshes.push(1),
+  })
+
+  byTestId(view.tree, 'orchestrator-secretary-draft-confirm-d-1').props.onClick()
+  await flush()
+  const error = byTestId(view.tree, 'orchestrator-secretary-draft-error-d-1')
+  assert.ok(error, 'the reason is visible under the card')
+  assert.equal(error.props.role, 'alert')
+  assert.match(textOf(error), /target-missing/)
+  assert.ok(byTestId(view.tree, 'orchestrator-secretary-draft-confirm-d-1'), 'the draft is still there')
+  assert.equal(refreshes.length, 0, 'a failed send does not refresh as if it worked')
+})
+
+test('a sent draft shows when it was sent, and a discarded one offers no buttons', () => {
+  const view = mount(T.SecretaryOverview, {
+    t,
+    width: 1200,
+    payload: secretaryPayload({
+      drafts: [
+        { id: 'd-sent', sessionId: 's-1', status: 'sent', text: '已发送的正文', createdAt: 1, sentAt: 1700000000000 },
+        { id: 'd-gone', sessionId: 's-1', status: 'discarded', text: '丢弃的正文', createdAt: 2 },
+      ],
+    }),
+  })
+  const sent = byTestId(view.tree, 'orchestrator-secretary-draft-d-sent')
+  assert.match(textOf(sent), /secretary\.draft\.sentAt/)
+  assert.equal(byTestId(view.tree, 'orchestrator-secretary-draft-confirm-d-sent'), undefined)
+  const gone = byTestId(view.tree, 'orchestrator-secretary-draft-d-gone')
+  assert.match(textOf(gone), /secretary\.draft\.discarded/)
+  assert.equal(byTestId(view.tree, 'orchestrator-secretary-draft-confirm-d-gone'), undefined)
+})
+
+test('the panel hands the overview the nudge seam and its refresh re-reads the endpoint', async () => {
+  let loads = 0
+  const nudges = []
+  const view = mountSecretary({
+    payload: secretaryPayload({ drafts: [PENDING_DRAFT] }),
+    loadState: async () => {
+      loads += 1
+      return secretaryPayload({ drafts: [PENDING_DRAFT] })
+    },
+    nudge: (draftId, action) => {
+      nudges.push([draftId, action])
+      return Promise.resolve({ delivered: true, draft: { id: draftId, status: 'sent', sentAt: 5 } })
+    },
+  })
+  await flush()
+  const body = bodyOf(view.tree)
+  assert.equal(body.type, T.SecretaryOverview)
+  assert.equal(typeof body.props.nudge, 'function')
+  assert.equal(typeof body.props.refresh, 'function')
+
+  body.props.refresh()
+  await flush()
+  assert.equal(loads, 2, 'the refresh callback re-reads the endpoint')
+  assert.deepEqual(nudges, [])
+  view.unmount()
+})
+
 test('the blockers and the tracker rows come from the payload, not from the view', () => {
   const payload = secretaryPayload()
   const blockers = plain(T.secretaryBlockersOf(payload))
@@ -1707,8 +1837,8 @@ test('the blockers and the tracker rows come from the payload, not from the view
         { sessionId: 'z', title: '安静的', state: 'Idle', lastError: null, beats: { capped: false } },
       ],
       drafts: [
-        { id: 'd-1', targetSessionId: 'x', targetTitle: '坏掉的', reason: '等待拍板', status: 'pending' },
-        { id: 'd-2', targetSessionId: 'x', reason: '已发过', status: 'sent' },
+        { id: 'd-1', sessionId: 'x', reason: '等待拍板', text: '等你拍板', status: 'pending' },
+        { id: 'd-2', sessionId: 'x', reason: '已发过', status: 'sent' },
       ],
     }),
   )
@@ -1722,6 +1852,7 @@ test('the blockers and the tracker rows come from the payload, not from the view
   )
   assert.equal(more[0].text, 'boom')
   assert.equal(more[1].text, '达到上限')
+  assert.equal(more[2].text, '等你拍板', 'a draft blocker carries the generated body')
 
   const rows = plain(T.secretaryRowsOf(payload))
   assert.deepEqual(
@@ -1743,7 +1874,7 @@ test('the blockers and the tracker rows come from the payload, not from the view
   assert.deepEqual(plain(T.draftRowsOf(undefined)), [])
 })
 
-test('the history tab groups the newest report and lists the timeline', () => {
+test('the history tab groups the newest report and lists the timeline (why: it reads the structured changes field)', () => {
   const view = mount(T.SecretaryHistory, { t, payload: secretaryPayload() })
   const diff = byTestId(view.tree, 'orchestrator-secretary-diff')
   const text = textOf(diff)
@@ -1753,9 +1884,8 @@ test('the history tab groups the newest report and lists the timeline', () => {
   assert.match(text, /进度：第 3 步 \/ 共 5 步/)
   assert.match(text, /会话进入 Needs input/)
   assert.match(text, /会话：Idle → Working/)
-  // A bullet that matches none of the writer's shapes stays visible under "other".
-  assert.match(text, /secretary\.diff\.other/)
-  assert.match(text, /一句对不上模板的话/)
+  // The structured payload has no unclassified group, so "other" is not rendered.
+  assert.equal(text.includes('secretary.diff.other'), false, 'the structured diff needs no fallback bucket')
   const timeline = byTestId(view.tree, 'orchestrator-secretary-timeline')
   assert.match(textOf(timeline), /secretary\.reportKind\.delta/)
   assert.match(textOf(timeline), /r\/1\.md/)
@@ -1770,6 +1900,46 @@ test('diffGroupsOf separates the writer shapes and keeps the unknown ones', () =
   assert.deepEqual(groups.blocked, ['worker：等确认', '会话进入 Needs input'])
   assert.deepEqual(groups.flipped, ['worker：Idle → Working'])
   assert.deepEqual(groups.other, ['别的话'])
+})
+
+test('a legacy flat diff is grouped by the fallback, marked degraded, and the settings tab says so (why: an older host still sends strings)', () => {
+  // A host that predates the structured field answers the old flat list. The page must keep
+  // rendering it — and flag it, so a missing group is never mistaken for "no change".
+  const legacy = secretaryPayload({
+    reports: [
+      {
+        sessionId: 's-1',
+        at: 1,
+        kind: 'delta',
+        path: 'r/1.md',
+        bytes: 1,
+        changes: ['写测试：完成', 'worker：等确认', 'worker：Idle → Working'],
+        error: null,
+      },
+    ],
+  })
+  const lines = plain(T.reportLinesOf(legacy))
+  assert.deepEqual(lines[0].changes, {
+    completed: ['写测试：完成'],
+    blocked: ['worker：等确认'],
+    flipped: ['worker：Idle → Working'],
+    other: [],
+  })
+  assert.equal(lines[0].degraded, true, 'the fallback is visible, not silent')
+  assert.equal(plain(T.reportLinesOf(secretaryPayload()))[0].degraded, false, 'the structured field is not degraded')
+
+  // The history tab still shows the recovered groups...
+  const history = mount(T.SecretaryHistory, { t, payload: legacy })
+  const diff = textOf(byTestId(history.tree, 'orchestrator-secretary-diff'))
+  assert.match(diff, /worker：等确认/)
+  assert.match(diff, /worker：Idle → Working/)
+  // ...and the settings tab carries the one-line notice.
+  const scope = fakeScope()
+  const settings = mount(T.SecretarySettings, { t, orch: scope, payload: legacy, mutate: scope.mutate })
+  assert.match(textOf(byTestId(settings.tree, 'orchestrator-secretary-degraded')), /secretary\.degraded/)
+  const cleanScope = fakeScope()
+  const clean = mount(T.SecretarySettings, { t, orch: cleanScope, payload: secretaryPayload(), mutate: cleanScope.mutate })
+  assert.equal(byTestId(clean.tree, 'orchestrator-secretary-degraded'), undefined)
 })
 
 test('the layout is two columns at 1100 and scrolls only inside the list regions', () => {
@@ -1954,16 +2124,27 @@ test('the icon and the main panel share one id so the sidebar row can select it'
  * installed it, and the injected remote property throws on every other read, exactly like the
  * host's traced Remote service.
  */
-function fakeSecretaryCtx({ value, result, failFirstMount = false, remoteViaGet = false } = {}) {
+function fakeSecretaryCtx({ value, result, nudgeResult, failFirstMount = false, remoteViaGet = false } = {}) {
   let namespace
   const mounts = []
+  const nudgeCalls = []
   const remote = {
     $mount(contribution) {
       mounts.push(contribution)
       if (failFirstMount === true && mounts.length === 1) {
         return Promise.reject(new Error('the host is not ready yet'))
       }
-      namespace = { secretaryState: async () => result ?? { ok: true, value } }
+      namespace = {
+        secretaryState: async () => result ?? { ok: true, value },
+        confirmDraft: async (draftId) => {
+          nudgeCalls.push(['confirm', draftId])
+          return nudgeResult ?? { ok: true, value: { delivered: true, draft: { id: draftId, status: 'sent', sentAt: 5 } } }
+        },
+        discardDraft: async (draftId) => {
+          nudgeCalls.push(['discard', draftId])
+          return nudgeResult ?? { ok: true, value: { draft: { id: draftId, status: 'discarded' } } }
+        },
+      }
       return Promise.resolve(() => {})
     },
   }
@@ -1975,6 +2156,7 @@ function fakeSecretaryCtx({ value, result, failFirstMount = false, remoteViaGet 
   })
   const ctx = {
     mounts,
+    nudgeCalls,
     get(name) {
       if (name === 'remote.orchestratorSecretary') return namespace
       if (name === 'remote' && remoteViaGet) return remote
@@ -2008,6 +2190,32 @@ test('an unavailable secretary namespace and a failed result both reject', async
   await assert.rejects(loadSecretaryState(unavailable), /orchestratorSecretary\/secretaryState is unavailable/)
   const failed = fakeSecretaryCtx({ result: { ok: false, error: { message: 'projection is not ready' } } })
   await assert.rejects(loadSecretaryState(failed), /projection is not ready/)
+})
+
+test('loadNudge confirms and discards through the mounted namespace (why: the card buttons need one write seam)', async () => {
+  const { loadNudge } = mod.__test
+  const ctx = fakeSecretaryCtx({ value: secretaryPayload() })
+
+  const confirmed = await loadNudge(ctx, 'd-1', 'confirm')
+  assert.equal(confirmed.delivered, true)
+  const discarded = await loadNudge(ctx, 'd-1', 'discard')
+  assert.equal(discarded.draft.status, 'discarded')
+  assert.deepEqual(ctx.nudgeCalls, [
+    ['confirm', 'd-1'],
+    ['discard', 'd-1'],
+  ])
+  assert.equal(ctx.mounts.length, 1, 'one mount serves the read and both writes')
+  // An action the endpoint does not have is refused before any call is made.
+  await assert.rejects(loadNudge(ctx, 'd-1', 'later'), /unknown nudge action/)
+  assert.equal(ctx.nudgeCalls.length, 2)
+})
+
+test('a failed nudge result becomes a rejection with the host message', async () => {
+  const ctx = fakeSecretaryCtx({
+    value: secretaryPayload(),
+    nudgeResult: { ok: false, error: { message: 'draft is gone' } },
+  })
+  await assert.rejects(mod.__test.loadNudge(ctx, 'd-1', 'confirm'), /draft is gone/)
 })
 
 test('a failed mount is retried on the next read instead of poisoning the panel', async () => {
