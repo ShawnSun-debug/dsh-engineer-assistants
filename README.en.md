@@ -1,6 +1,6 @@
 # DSH Orchestrator
 
-[![version](https://img.shields.io/badge/version-0.8.3-4176E6?style=flat-square)](https://github.com/SShiRkiT/dsh-orchestrator)
+[![version](https://img.shields.io/badge/version-0.9.0-4176E6?style=flat-square)](https://github.com/SShiRkiT/dsh-orchestrator)
 
 The "dispatch mode" plugin for DeepSeek Harness.
   
@@ -29,7 +29,7 @@ The "dispatch mode" plugin for DeepSeek Harness.
 
 - **The main agent only plans, enforced by a gate**:
   
-     a whitelist of 11 built-in planning and dispatch tools (`DEFAULT_ALLOWED_TOOLS` / `allowedTools`) is all the main agent may call; every read, write, shell, web, and other host tool — plus any MCP or third-party plugin tool registered later — is hidden and refused at execution time (even a nested call smuggled through `run_code`); the main agent keeps only `dispatch`, `send_message`, `todo_write`, `ask_user_question`, `compress`, `interrupt_agent`, plus the read-only session log tools (`session_*`).
+     a whitelist of 11 built-in planning and dispatch tools (`DEFAULT_ALLOWED_TOOLS` / `allowedTools`) is all the main agent may call; every read, write, shell, web, and other host tool — plus any MCP or third-party plugin tool registered later — is filtered out of the tool table per request by the `tools.definitions()` wrapper in `lib/tool-surface.js` (`installToolSurface`), and refused at execution time by `tools.guard` (even a nested call smuggled through `run_code`). The main agent's surface never goes through `tools.restrict`: it only masks inherited global tools and cannot hide scope-local ones such as the native `subagent`, and every restriction broadcasts `tools/change` and churns the table, so `restrict` is kept only for the dispatch-claimed control layer (`lib/secretary-authority.js`). The main agent keeps only `dispatch`, `send_message`, `todo_write`, `ask_user_question`, `compress`, `interrupt_agent`, plus the read-only session log tools (`session_*`).
   
 - **One dispatch entry**:
 
@@ -129,7 +129,8 @@ Every field is volatile: the host stores it and the plugin re-reads it on each u
 | `lastReview` | `""` | The `{ verdict, target, at }` summary of the latest review, written by the plugin and shown read-only in the panel. |
 | `superviseEnabled` | `true` | Master switch for supervision. |
 | `superviseIntervalSeconds` | `600` | Supervision interval in seconds, an integer 10–86400. |
-| `superviseMaxNoticesPerChild` | `3` | Most notices per subagent, an integer 0–20; `0` means unlimited. |
+| `superviseMaxNoticesPerChild` | `3` | Most notices per subagent, an integer 0–20; `0` switches supervision off unless `superviseUnlimited` is on. |
+| `superviseUnlimited` | `false` | Ignores the notice cap and keeps supervising until the child stops, delivers or ends; the panel's "Unlimited checks" switch writes this field. |
 | `superviseNotifyOnNoProgress` | `false` | Whether to also notify when the log has no new activity. |
 | `masterMemoryEnabled` | `false` | AI memory: opens the storage domain and injects the compact index. Read at mount, so changing it needs a plugin reload. |
 | `masterPanelEnabled` | `false` | Master status panel. When off the button is not rendered and the endpoint returns an empty projection. |

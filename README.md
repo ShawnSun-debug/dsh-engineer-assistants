@@ -5,7 +5,7 @@
 
 **强模型主脑规划 + 便宜模型统一打工 —— DeepSeek Harness 的「硬隔离调度模式」插件**
 
-[![version](https://img.shields.io/badge/version-0.8.3-4176E6?style=flat-square)](https://github.com/SShiRkiT/dsh-orchestrator)
+[![version](https://img.shields.io/badge/version-0.9.0-4176E6?style=flat-square)](https://github.com/SShiRkiT/dsh-orchestrator)
 [![dsh-plugin](https://img.shields.io/badge/DeepSeek%20Harness-dsh--plugin-4176E6?style=flat-square)](https://github.com/deepseek-ai/deepseek-harness)
 [![platform](https://img.shields.io/badge/platform-Web%20GUI%20%7C%20Desktop-5c6bc0?style=flat-square)](https://github.com/SShiRkiT/dsh-orchestrator)
 [![node](https://img.shields.io/badge/node-%3E%3D22-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org)
@@ -47,7 +47,7 @@ DSH 客户端自带了 `subagent` / `workflow`，官方也有 `@deepseek-ai/dsh-
 
 ### 2. 主代理「规划与验收」、子代理「纯粹 Work」的白名单式硬性闸门
 
-不同于靠 Prompt 劝主模型“多用子代理”，本插件在 DSH 工具层安装了双重守卫（`tools.restrict` + `tools.guard`），且采用**白名单式驱动**：
+不同于靠 Prompt 劝主模型“多用子代理”，本插件在 DSH 工具层装了两道闸门、采用**白名单式驱动**：模型可见的工具面由 `tools.definitions()` 的包装按请求现读白名单裁掉（`installToolSurface`，`lib/tool-surface.js`），执行期再由 `tools.guard` 拒绝表外调用。主代理面上不调用 `tools.restrict`——它只能藏住继承来的全局工具（agent 自己 scope 里注册的原生 `subagent`、`ops_*` 藏不住），而且每次 `restrict`/dispose 都广播 `tools/change`、让工具表来回抖动；`restrict` 只保留给 dispatch 认领的指挥层（`lib/secretary-authority.js` 经 `restrictEach` 使用）。
 - **主代理被彻底收缴执行工具**：`DEFAULT_ALLOWED_TOOLS` 默认只放行 11 项规划、派发与会话只读工具——`dispatch`、`send_message`、`interrupt_agent`、`todo_write`、`ask_user_question`、`compress` 与 5 项只读会话日志工具。所有文件读写（`read` / `edit` / `write` / `apply_patch`）、搜索（`grep` / `glob`）、终端（`bash` / `pwsh`）、网页抓取、原生 `subagent` / `workflow`，以及未来新增的任何 MCP / 第三方插件工具，一律自动隐藏并在执行层强制拦截（连 `run_code` 嵌套偷调也拦）。需要额外放行时，在面板右侧 Allowed Tools 勾选即可。
 - **子代理独享完整工具链**：被派出的 Worker 不受闸门限制，在各自独立的上下文中读写文件、跑测试、看报错，完工后只把干净的结论交回主代理验收。
 - **一键随时切换**：需要主代理临时亲自操作时，关掉面板上的「启用调度模式」开关即可立刻恢复主代理的全部工具，无需重开会话。
@@ -139,7 +139,8 @@ dsh plugin --profile desktop add SShiRkiT/dsh-orchestrator#main
 | `allowedTools` | 11 项内置白名单 | 白名单式驱动：主代理仅可使用列表内的工具，其余宿主/MCP/插件工具自动隐藏并禁用；面板右侧 Allowed Tools 可直接勾选放行或取消勾选禁用，下一条消息即刻生效。 |
 | `superviseEnabled` | `true` | 子代理后台巡检总开关。 |
 | `superviseIntervalSeconds` | `600` | 巡检间隔（秒），范围 10–86400，运行中修改立即生效。 |
-| `superviseMaxNoticesPerChild` | `3` | 每个子代理最多发送几次巡检通知（0–20，`0` 表示不限）。 |
+| `superviseMaxNoticesPerChild` | `3` | 每个子代理最多发送几次巡检通知（0–20；`0` 关闭巡检，除非同时打开 `superviseUnlimited`）。 |
+| `superviseUnlimited` | `false` | 打开后忽略上面的次数上限，一直巡检到子代理停止、交付或结束；设置页的「无限巡检」开关写的就是这个键。 |
 | `superviseNotifyOnNoProgress` | `false` | 子代理日志无新活动时是否仍然发送通知。 |
 | `masterMemoryEnabled` | `false` | AI 记忆层：打开存储域并注入紧凑索引。**挂载时读取**，改动需重载插件。 |
 | `masterPanelEnabled` | `false` | Master 状态面板。关闭时按钮不渲染，服务端端点只返回空投影。 |

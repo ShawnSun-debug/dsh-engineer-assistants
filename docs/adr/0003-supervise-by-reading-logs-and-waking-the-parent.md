@@ -17,7 +17,7 @@
 - 巡检器只读 worker 的会话日志生成进度摘要，不调用模型，因此巡检本身不产生 token 成本。
 - 扫描周期固定 5 秒，只做到期时间比较；只有某个 worker 到期时才读它的日志。巡检间隔由配置决定，默认 600 秒（10 分钟），最短 10 秒，可在右下角「调度模式」面板里直接修改。
 - 同一父代理名下到期的 worker 合并成一条「【插件巡检…】」通知，经 `followup` 投递给主代理；空闲时立即开新回合，忙时排到当前回合边界。不使用 `steer`。
-- 每个 worker 默认最多通知 3 次（可配为 0 表示不限），避免对同一个卡住的 worker 反复唤醒主代理。
+- 每个 worker 默认最多通知 3 次；0 现在是关闭巡检，要“不限”须打开 superviseUnlimited，避免对同一个卡住的 worker 反复唤醒主代理。
 - 只巡检 `delegate` 的 worker；`orchestrate` 的 worker 不巡检。
 - 定时器用 `ctx.effect` + `setInterval` 自建，不依赖 `cordis-plugin-timer`。
 - 不提供终止能力：`interrupt_agent` 仍在拒绝名单里，主代理只能通过 `send_message` 纠偏。
