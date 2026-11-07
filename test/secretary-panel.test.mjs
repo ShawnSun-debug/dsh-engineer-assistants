@@ -20,14 +20,21 @@ import {
 import { applyDraftTriggers, createDraftStore } from '../lib/secretary-nudge.js'
 import { renderPlanReport, renderReport } from '../lib/secretary-report.js'
 
-// Four fields, all of them read from config by the endpoint. The report root and the view limit
-// are constants of the reader, not policy: a field the endpoint never sends would be a lie in the
-// settings tab, and neither of them can be changed from there.
+// Four config fields plus the three model routes, all read by the endpoint. The report root and the
+// view limit are constants of the reader, not policy: a field the endpoint never sends would be a
+// lie in the settings tab, and neither of them can be changed from there. Every route string is
+// empty here because empty is "not set" — a default model name would be a decision nobody made.
+const EMPTY_ROUTES = {
+  main: { provider: '', model: '', effort: '' },
+  worker: { provider: '', model: '', effort: '' },
+  review: { provider: '', model: '', effort: '' },
+}
 const EMPTY_POLICY = {
   beatSeconds: 180,
   maxRunSeconds: 7200,
   notifyOn: { state: true, step: true, block: true, deliverable: true, timeout: true },
   promptText: '',
+  routes: EMPTY_ROUTES,
 }
 
 const ORCHESTRATOR = {
@@ -36,6 +43,7 @@ const ORCHESTRATOR = {
   workspace: 'w',
   live: true,
   state: 'Working',
+  step: { index: 2, total: 5 },
   workers: [{ id: 'w-1', state: 'Working', summary: '写报告' }],
   beats: { count: 2, startedAt: 1000, capped: false, stoppedReason: null },
   lastReport: { path: '/r/12-03.md', at: 90, kind: 'delta' },
@@ -50,6 +58,11 @@ const REPORT = {
   kind: 'delta',
   path: '/r/12-03.md',
   bytes: 120,
+  // The body now reaches the view (why: the timeline unfolds it inline instead of
+  // sending the reader to the archive); the fixture keeps a head line so the contract
+  // test pins that it survives both composition paths.
+  content: '# 秘书汇报\n\n- 会话：orch-1\n',
+  contentTruncated: false,
   changes: { completed: ['w-1：Working → Completed'], blocked: [], flipped: [] },
   error: null,
 }
@@ -98,25 +111,41 @@ test('the payload carries five segments with exactly the contract field names (w
   // The stored list, ids only and in storage order: the view edits by this index.
   assert.deepEqual(payload.registry.raw, [{ sessionId: 'orch-1' }])
 
-  // step / lastError are gone on purpose: with no data source they were always null
-  // and made the view's branches unreachable. They return with a ticket that has one.
+  // Step is part of the row contract since the todos projection became a real source.
+  // Why changed: the old assertion was `'step' in payload.orchestrators[0] === false` —
+  // the six-state projection had no step and an always-null field made the view's step
+  // branch unreachable. Now step is always present: { index, total } from the caller's
+  // todos read, null when that read has no list. lastError still has no source, so it
+  // stays absent (an always-null field is still a lie).
   assert.deepEqual(Object.keys(payload.orchestrators[0]), [
     'sessionId',
     'title',
     'workspace',
     'live',
     'state',
+    'step',
     'workers',
     'beats',
     'lastReport',
   ])
   assert.deepEqual(Object.keys(payload.orchestrators[0].workers[0]), ['id', 'state', 'summary'])
   assert.deepEqual(Object.keys(payload.orchestrators[0].beats), ['count', 'startedAt', 'capped', 'stoppedReason'])
-  assert.equal('step' in payload.orchestrators[0], false)
-  assert.equal('lastError' in payload.orchestrators[0], false)
+  assert.equal('step' in payload.orchestrators[0], true, 'the key is always present')
+  assert.deepEqual(payload.orchestrators[0].step, { index: 2, total: 5 }, 'one shape: { index, total }')
+  assert.equal('lastError' in payload.orchestrators[0], false, 'lastError still has no source')
   assert.deepEqual(payload.orchestrators[0], ORCHESTRATOR)
 
-  assert.deepEqual(Object.keys(payload.reports[0]), ['sessionId', 'at', 'kind', 'path', 'bytes', 'changes', 'error'])
+  assert.deepEqual(Object.keys(payload.reports[0]), [
+    'sessionId',
+    'at',
+    'kind',
+    'path',
+    'bytes',
+    'content',
+    'contentTruncated',
+    'changes',
+    'error',
+  ])
   assert.deepEqual(payload.reports[0], REPORT)
 
   assert.deepEqual(Object.keys(payload.drafts[0]), [
@@ -130,12 +159,13 @@ test('the payload carries five segments with exactly the contract field names (w
   ])
   assert.deepEqual(payload.drafts[0], DRAFT)
 
-  assert.deepEqual(Object.keys(payload.policy), ['beatSeconds', 'maxRunSeconds', 'notifyOn', 'promptText'])
+  assert.deepEqual(Object.keys(payload.policy), ['beatSeconds', 'maxRunSeconds', 'notifyOn', 'promptText', 'routes'])
   assert.deepEqual(payload.policy, {
     beatSeconds: 300,
     maxRunSeconds: 900,
     notifyOn: { state: false, step: false, block: false, deliverable: false, timeout: false },
     promptText: '口径',
+    routes: EMPTY_ROUTES,
   })
 })
 
@@ -182,9 +212,9 @@ test('a session registered as both master and orchestrator is reported as a conf
   assert.deepEqual(payload.registry.conflict, { masterSessionId: 'x', conflictingOrchestratorIds: ['x'] })
 })
 
-test('the policy segment carries the four real fields and nothing else', () => {
+test('the policy segment carries the four config fields and the three routes, and nothing else', () => {
   assert.deepEqual(emptyViewState().policy, EMPTY_POLICY)
-  assert.deepEqual(Object.keys(EMPTY_POLICY), ['beatSeconds', 'maxRunSeconds', 'notifyOn', 'promptText'])
+  assert.deepEqual(Object.keys(EMPTY_POLICY), ['beatSeconds', 'maxRunSeconds', 'notifyOn', 'promptText', 'routes'])
   assert.deepEqual(notifyOnFrom(['state-flip', 'blocked', 'later-additions']), {
     state: true,
     step: false,
@@ -204,6 +234,52 @@ test('the policy segment carries the four real fields and nothing else', () => {
   // The reader's own constants stay constants.
   assert.equal(DEFAULT_REPORTS_ROOT, '.scratch/master-secretary/reports')
   assert.equal(VIEW_REPORT_LIMIT, 50)
+})
+
+test('the policy segment hands over the three model routes as three string fields each', () => {
+  const routes = composeViewState({
+    policy: {
+      routes: {
+        main: { provider: 'anthropic', model: 'claude-sonnet', effort: 'high' },
+        worker: { provider: 'openai', model: 'gpt-5', effort: '' },
+        review: { provider: 'mine', model: 'small', effort: 'low' },
+      },
+    },
+  }).policy.routes
+
+  assert.deepEqual(routes, {
+    main: { provider: 'anthropic', model: 'claude-sonnet', effort: 'high' },
+    worker: { provider: 'openai', model: 'gpt-5', effort: '' },
+    review: { provider: 'mine', model: 'small', effort: 'low' },
+  })
+  for (const segment of Object.values(routes)) {
+    assert.deepEqual(Object.keys(segment), ['provider', 'model', 'effort'])
+    for (const value of Object.values(segment)) assert.equal(typeof value, 'string')
+  }
+  // 空串就是「未设」：main 跟宿主默认、worker 未配置、review 跟 worker。这里不编默认值。
+  assert.deepEqual(composeViewState({}).policy.routes, EMPTY_ROUTES)
+})
+
+test('junk route input degrades to three all-empty segments while the other policy fields survive', () => {
+  const junk = [
+    { main: 42, worker: { provider: { nested: true }, model: ['x'], effort: true }, review: 'nope' },
+    { provider: 'flat' }, // 段名写在 routes 上，而不在段里
+    [],
+    'routes',
+    null,
+  ]
+  for (const routes of junk) {
+    const policy = composeViewState({ policy: { routes, beatSeconds: 300, promptText: '口径' } }).policy
+    assert.deepEqual(policy.routes, EMPTY_ROUTES, 'routes=' + JSON.stringify(routes))
+    assert.equal(policy.beatSeconds, 300)
+    assert.equal(policy.promptText, '口径')
+  }
+
+  // 段内只坏一个字段：其余字段照常，坏的那个补空串——不整段丢弃，也不猜值。
+  assert.deepEqual(
+    composeViewState({ policy: { routes: { main: { provider: 'p', model: 7 } } } }).policy.routes.main,
+    { provider: 'p', model: '', effort: '' },
+  )
 })
 
 test('reports and drafts arrive newest first and the report list stops at the reader limit', () => {
@@ -344,6 +420,8 @@ test('orchestrator rows fold the ledger, the six-state projection and the archiv
     workspace: 'w',
     live: true,
     state: 'Working',
+    // No stepOf adapter was passed: the field is present and null, never missing.
+    step: null,
     workers: [
       { id: 'child-1', state: 'Needs input', summary: '摘要-child-1' },
       { id: 'child-2', state: 'Completed', summary: '摘要-child-2' },
@@ -358,6 +436,7 @@ test('orchestrator rows fold the ledger, the six-state projection and the archiv
     workspace: 'w2',
     live: false,
     state: 'Idle',
+    step: null,
     workers: [],
     beats: { count: 0, startedAt: null, capped: false, stoppedReason: null },
     lastReport: null,
@@ -391,6 +470,68 @@ test('an orchestrator row carries the real beat status: count follows ticks and 
   assert.equal(finished[0].beats.stoppedReason, 'finished')
   const throwing = collectOrchestratorRows({ registry, sessions: [{ id: 'orch-1' }], beatStatus: () => { throw new Error('boom') } })
   assert.deepEqual(throwing[0].beats, { count: 0, startedAt: null, capped: false, stoppedReason: null })
+})
+
+test('the step reaches the row from the caller\'s todos read, and null — not a missing key — when there is none (why: the panel showed 未提供)', () => {
+  const registry = { orchestrators: [{ sessionId: 'orch-1', workspace: 'w', title: '日报', trackedAt: 1 }] }
+  const session = { id: 'orch-1', header: { id: 'orch-1' } }
+
+  // With todos: the row carries the one shape the client reads, { index, total }.
+  const withTodos = collectOrchestratorRows({ registry, sessions: [session], stepOf: () => ({ index: 2, total: 5 }) })
+  assert.deepEqual(withTodos[0].step, { index: 2, total: 5 })
+
+  // Without todos: null, and the key is present. A missing key would read as undefined in
+  // the client and blur "no todos this turn" with "this endpoint predates steps".
+  const withoutTodos = collectOrchestratorRows({ registry, sessions: [session], stepOf: () => null })
+  assert.equal('step' in withoutTodos[0], true)
+  assert.equal(withoutTodos[0].step, null)
+
+  // No adapter, a throwing adapter or junk from the adapter all degrade to null.
+  assert.equal(collectOrchestratorRows({ registry, sessions: [session] })[0].step, null)
+  const throwing = collectOrchestratorRows({
+    registry,
+    sessions: [session],
+    stepOf: () => {
+      throw new Error('boom')
+    },
+  })
+  assert.equal(throwing[0].step, null)
+  assert.equal(collectOrchestratorRows({ registry, sessions: [session], stepOf: () => ({ index: 'x', total: 5 }) })[0].step, null)
+  assert.equal(collectOrchestratorRows({ registry, sessions: [session], stepOf: () => 3 })[0].step, null)
+
+  // The adapter is handed the Session, not the id: it is the same object the projection reads.
+  let seen
+  collectOrchestratorRows({
+    registry,
+    sessions: [session],
+    stepOf: (value) => {
+      seen = value
+      return null
+    },
+  })
+  assert.equal(seen, session)
+})
+
+test('composeViewState normalizes the step to { index, total } or null, never a second shape', () => {
+  const payload = composeViewState({
+    enabled: true,
+    registry: { orchestrators: [{ sessionId: 'orch-1' }] },
+    orchestrators: [{ sessionId: 'orch-1', step: { index: 1, total: 4 } }],
+  })
+  assert.deepEqual(payload.orchestrators[0].step, { index: 1, total: 4 })
+
+  // index 0 is a real answer (nothing done yet), not "no data".
+  const zero = composeViewState({ enabled: true, orchestrators: [{ sessionId: 'x', step: { index: 0, total: 3 } }] })
+  assert.deepEqual(zero.orchestrators[0].step, { index: 0, total: 3 })
+
+  // The client also tolerates totalSteps and a bare number, but the endpoint emits one shape:
+  // anything else becomes null here instead of being silently translated into a second one.
+  const otherShape = composeViewState({ enabled: true, orchestrators: [{ sessionId: 'x', step: 3, totalSteps: 5 }] })
+  assert.equal(otherShape.orchestrators[0].step, null)
+
+  const missing = composeViewState({ enabled: true, orchestrators: [{ sessionId: 'x' }] })
+  assert.equal('step' in missing.orchestrators[0], true)
+  assert.equal(missing.orchestrators[0].step, null)
 })
 
 test('a broken projection or agent registry degrades to Idle and live false instead of throwing', () => {
@@ -657,6 +798,58 @@ test('archived reports are listed newest first with what the history tab renders
     // 规划首报没有差异段，所以三组都是空的——不是"没有变化"的编造值。
     assert.deepEqual(rows[1].changes, { completed: [], blocked: [], flipped: [] })
     assert.deepEqual(rows[2].changes, { completed: [], blocked: [], flipped: [] })
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a report row carries its body so the timeline can unfold it (why: the row had no content to expand)', () => {
+  const body = '# 秘书汇报\n\n- 时间：2026-01-02 03:03\n- 会话：orch-1\n- 类型：增量\n\n## 差异\n'
+  const payload = composeViewState({ reports: [{ ...REPORT, content: body, contentTruncated: false }] })
+  assert.equal(payload.reports[0].contentTruncated, false)
+  assert.ok(payload.reports[0].content.includes('# 秘书汇报'), 'the first line of the body reaches the view')
+  assert.equal(payload.reports[0].content, body, 'the body is handed over verbatim')
+})
+
+test('the archive reader keeps the report body per row (why: fileRow read it and dropped it)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'secretary-content-'))
+  try {
+    const conversation = join(dir, '.scratch', 'master-secretary', 'reports', 'orch-1')
+    await mkdir(conversation, { recursive: true })
+    const expected = renderReport({
+      kind: 'delta',
+      at: Date.UTC(2026, 0, 2, 3, 3),
+      session: 'orch-1',
+      orchestrator: { state: 'Working', summary: '在写报告' },
+      diff: { completed: [], blocked: [], flipped: [] },
+    })
+    await writeFile(join(conversation, '12-03.md'), expected, 'utf8')
+    const rows = await listReportRows({ fs: fsp, workspaces: [dir] })
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0].content, expected, 'the whole body, not only its kind and diff')
+    assert.equal(rows[0].contentTruncated, false)
+
+    // The body reaches the endpoint payload through the same composition.
+    const payload = composeViewState({ reports: rows })
+    assert.ok(payload.reports[0].content.includes('# 秘书汇报'))
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a report body over 8 KiB is cut to 8192 bytes and says so (why: one row must not pour a whole archive into the payload)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'secretary-content-cap-'))
+  try {
+    const conversation = join(dir, '.scratch', 'master-secretary', 'reports', 'orch-1')
+    await mkdir(conversation, { recursive: true })
+    const huge = '# 秘书汇报\n\n' + 'x'.repeat(9000) + '\n'
+    await writeFile(join(conversation, '12-03.md'), huge, 'utf8')
+    const rows = await listReportRows({ fs: fsp, workspaces: [dir] })
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0].contentTruncated, true, 'the view can tell the body is partial')
+    assert.equal(Buffer.byteLength(rows[0].content, 'utf8'), 8192, 'exactly the cap, not the whole file')
+    assert.ok(rows[0].content.startsWith('# 秘书汇报'), 'the cut keeps the head of the report')
+    assert.ok(rows[0].content.length < huge.length)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

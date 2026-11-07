@@ -1675,18 +1675,35 @@ test('the secretary endpoint is provided only while its switch is on', async () 
   assert.equal(payload.orchestrators[0].title, '修登录', 'an empty ledger title falls back to the session title')
   assert.equal(payload.orchestrators[0].live, true)
   assert.equal(payload.orchestrators[0].state, 'Working')
-  // No beat has started yet, so the row carries the zeroed beat shape; step and
-  // lastError are not part of the contract while they have no data source.
+  // No beat has started yet, so the row carries the zeroed beat shape. Step is part of
+  // the contract now (the todos projection is a real source); this fake host answers no
+  // todos, so the key is present and null. lastError still has no source, so it stays out.
   assert.deepEqual(payload.orchestrators[0].beats, { count: 0, startedAt: null, capped: false, stoppedReason: null })
-  assert.equal('step' in payload.orchestrators[0], false)
+  assert.deepEqual(Object.keys(payload.orchestrators[0]), [
+    'sessionId',
+    'title',
+    'workspace',
+    'live',
+    'state',
+    'step',
+    'workers',
+    'beats',
+    'lastReport',
+  ])
+  assert.equal(payload.orchestrators[0].step, null)
   assert.equal('lastError' in payload.orchestrators[0], false)
   assert.deepEqual(payload.reports, [], 'a workspace that was never written lists no report')
   assert.deepEqual(payload.drafts, [], 'ticket 08 owns the drafts')
   assert.equal(payload.policy.beatSeconds, 180)
   assert.equal(payload.policy.maxRunSeconds, 7200)
-  // Only the four fields the endpoint really reads: a report root and a view limit were never
-  // config keys, and showing them in the settings tab was a lie about what can be changed.
-  assert.deepEqual(Object.keys(payload.policy), ['beatSeconds', 'maxRunSeconds', 'notifyOn', 'promptText'])
+  // Only the fields the endpoint really reads: four config scalars plus the three model routes.
+  // This fake host ships no agentDefaultModel service, so main is empty rather than a guessed model.
+  assert.deepEqual(Object.keys(payload.policy), ['beatSeconds', 'maxRunSeconds', 'notifyOn', 'promptText', 'routes'])
+  assert.deepEqual(payload.policy.routes, {
+    main: { provider: '', model: '', effort: '' },
+    worker: { provider: '', model: '', effort: '' },
+    review: { provider: '', model: '', effort: '' },
+  })
 
   // 开关是 volatile 的：关掉之后同一个服务返回稳定空结构，不读任何会话。
   harness.state.secretaryEnabled = false
@@ -1694,6 +1711,43 @@ test('the secretary endpoint is provided only while its switch is on', async () 
   assert.equal(closed.enabled, false)
   assert.deepEqual(closed.orchestrators, [])
   assert.deepEqual(closed.registry.orchestrators, [])
+})
+
+// 步骤入库（缺口二）：行上的 step 必须来自节拍报告用的同一份 todos 投影。这里让投影按
+// key 分叉：todos 键回答步骤，其余键回答六态行——两个读法走同一个 ctx.sessionProjections，
+// 端点若自己造第二个来源，这条用例会看到编出来的值。
+const TODOS_ROW = (session, key) =>
+  key === 'todos'
+    ? [
+        { content: '读代码', status: 'completed' },
+        { content: '写修复', status: 'in_progress' },
+        { content: '跑测试', status: 'pending' },
+      ]
+    : { workers: [{ id: session?.id, role: 'main', state: 'Working', summary: '在写修复' }] }
+
+test('the orchestrator row carries the step from the same todos projection the beat report reads', async () => {
+  const session = { id: 'orch-1', header: { id: 'orch-1', cwd: '' } }
+  const harness = start({
+    secretaryEnabled: true,
+    secretaryOrchestrators: [{ sessionId: 'orch-1', workspace: 'w', title: '日报', trackedAt: 1 }],
+    sessions: { get: () => session, list: () => [session], flush: async () => true },
+    stateOf: TODOS_ROW,
+  })
+  const payload = await harness.services.get('orchestratorSecretary').secretaryState()
+  assert.deepEqual(payload.orchestrators[0].step, { index: 2, total: 3 }, 'first in_progress is step 2 of 3')
+})
+
+test('with no todos projection answer the row still carries step, as null (why: a missing key reads as undefined)', async () => {
+  const session = { id: 'orch-1', header: { id: 'orch-1', cwd: '' } }
+  const harness = start({
+    secretaryEnabled: true,
+    secretaryOrchestrators: [{ sessionId: 'orch-1', workspace: 'w', title: '日报', trackedAt: 1 }],
+    sessions: { get: () => session, list: () => [session], flush: async () => true },
+    stateOf: (session, key) => (key === 'todos' ? null : { workers: [{ id: session?.id, role: 'main', state: 'Working', summary: '在写' }] }),
+  })
+  const payload = await harness.services.get('orchestratorSecretary').secretaryState()
+  assert.equal('step' in payload.orchestrators[0], true)
+  assert.equal(payload.orchestrators[0].step, null)
 })
 
 test('a row registered without a workspace reads its reports from the session cwd (why: the history stayed blank forever)', async () => {
@@ -1945,7 +1999,7 @@ test('the secretary payload carries the authority refusals as policy.violations'
   const service = harness.services.get('orchestratorSecretary')
   const clean = await service.secretaryState()
   assert.equal('violations' in clean.policy, false, 'no record, no extra key: the payload is what it was')
-  assert.deepEqual(Object.keys(clean.policy), ['beatSeconds', 'maxRunSeconds', 'notifyOn', 'promptText'])
+  assert.deepEqual(Object.keys(clean.policy), ['beatSeconds', 'maxRunSeconds', 'notifyOn', 'promptText', 'routes'])
 
   const { agent, guards } = masterAgent()
   harness.created({ agent, source: 'create' })
@@ -1956,5 +2010,86 @@ test('the secretary payload carries the authority refusals as policy.violations'
   assert.deepEqual(Object.keys(payload.policy.violations[0]).sort(), ['action', 'agentId', 'at', 'reason'])
   assert.equal(payload.policy.violations[0].action, 'pwsh')
   assert.equal(payload.policy.violations[0].agentId, 'master-1')
+})
+
+// ---------------------------------------------------------------------------
+// 三组模型路由（设置页可改，读侧必须透出）：main 跟宿主默认选择，worker / review 是插件
+// 自己的 Config 键。空串 = 未设；读不到时降级成空串，绝不让可选服务把整页弄白。
+// ---------------------------------------------------------------------------
+
+test('the policy segment carries the main route from agentDefaultModel, renaming reasoningEffort to effort (why: the settings tab shows the real default)', async () => {
+  const harness = start({
+    secretaryEnabled: true,
+    // 只有 provider / model：宿主的 currentSelection() 在未设 effort 时省略 reasoningEffort 键。
+    services: { agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) } },
+  })
+  const service = harness.services.get('orchestratorSecretary')
+  const payload = await service.secretaryState()
+  assert.deepEqual(payload.policy.routes.main, { provider: 'p', model: 'm', effort: '' })
+  // 没配置时 worker / review 也是空串，不是编出来的默认模型。
+  assert.deepEqual(payload.policy.routes.worker, { provider: '', model: '', effort: '' })
+  assert.deepEqual(payload.policy.routes.review, { provider: '', model: '', effort: '' })
+
+  // 设了 effort 时字段名统一成 effort（宿主的键叫 reasoningEffort）。
+  harness.ctx.agentDefaultModel.currentSelection = () => ({ provider: 'p', model: 'm', reasoningEffort: 'high' })
+  const withEffort = await service.secretaryState()
+  assert.deepEqual(withEffort.policy.routes.main, { provider: 'p', model: 'm', effort: 'high' })
+})
+
+test('the worker and review routes come from the plugin config keys, and an empty review follows worker', async () => {
+  const harness = start({ secretaryEnabled: true })
+  harness.config.workerProvider = { get: () => 'openai' }
+  harness.config.workerModel = { get: () => 'gpt-5' }
+  harness.config.workerReasoningEffort = { get: () => 'medium' }
+  // review 留空即跟随 worker（ADR 0004），读侧原样透出空串，不替用户复制一份 worker。
+  harness.config.reviewProvider = { get: () => '' }
+  harness.config.reviewModel = { get: () => '' }
+  harness.config.reviewReasoningEffort = { get: () => '' }
+
+  const payload = await harness.services.get('orchestratorSecretary').secretaryState()
+  assert.deepEqual(payload.policy.routes, {
+    main: { provider: '', model: '', effort: '' },
+    worker: { provider: 'openai', model: 'gpt-5', effort: 'medium' },
+    review: { provider: '', model: '', effort: '' },
+  })
+})
+
+test('a missing, throwing or non-object agentDefaultModel degrades the main route to empty and the read still answers', async () => {
+  // 服务不存在：可选服务缺席是常态，不是错误。
+  const absent = start({ secretaryEnabled: true })
+  absent.config.workerModel = { get: () => 'gpt-5' }
+  const absentPayload = await absent.services.get('orchestratorSecretary').secretaryState()
+  assert.deepEqual(absentPayload.policy.routes.main, { provider: '', model: '', effort: '' })
+  assert.deepEqual(absentPayload.policy.routes.worker, { provider: '', model: 'gpt-5', effort: '' })
+  // 其他四个 policy 键照常返回。
+  assert.equal(absentPayload.policy.beatSeconds, 180)
+  assert.equal(absentPayload.policy.maxRunSeconds, 7200)
+  assert.equal(typeof absentPayload.policy.promptText, 'string')
+  assert.deepEqual(Object.keys(absentPayload.policy.notifyOn), ['state', 'step', 'block', 'deliverable', 'timeout'])
+
+  // currentSelection 抛错：捕获、记日志、main 退化为空串。
+  const throwing = start({
+    secretaryEnabled: true,
+    services: {
+      agentDefaultModel: {
+        currentSelection: () => {
+          throw new Error('model catalog unavailable')
+        },
+      },
+    },
+  })
+  const throwingPayload = await throwing.services.get('orchestratorSecretary').secretaryState()
+  assert.deepEqual(throwingPayload.policy.routes.main, { provider: '', model: '', effort: '' })
+  assert.equal(throwingPayload.policy.beatSeconds, 180)
+  assert.ok(
+    throwing.logs.warn.some((line) => line.includes('model catalog unavailable')),
+    'the degradation is logged, not silent',
+  )
+
+  // 返回非对象（字符串）：和缺席一样，不猜。
+  throwing.ctx.agentDefaultModel.currentSelection = () => 'p/m'
+  const junkPayload = await throwing.services.get('orchestratorSecretary').secretaryState()
+  assert.deepEqual(junkPayload.policy.routes.main, { provider: '', model: '', effort: '' })
+  assert.deepEqual(junkPayload.policy.routes.worker, { provider: '', model: '', effort: '' })
 })
 

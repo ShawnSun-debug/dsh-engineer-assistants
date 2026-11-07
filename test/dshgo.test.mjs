@@ -127,6 +127,21 @@ function draft(sessionId, overrides = {}) {
   }
 }
 
+/** The three model routes as the payload carries them: three strings each, '' = not set. */
+const ROUTES = Object.freeze({
+  main: { provider: 'nexus-deepseek', model: 'deepseek-v4.1-pro', effort: 'high' },
+  worker: { provider: 'nexus-deepseek', model: 'flash', effort: '' },
+  review: { provider: '', model: '', effort: '' },
+})
+
+function overviewRows(view) {
+  return pageOf(view, '总览').children[0].items
+}
+
+function routeRow(view, label) {
+  return overviewRows(view).find((item) => item.label === label)
+}
+
 function stateOf(parts = {}) {
   return {
     enabled: true,
@@ -273,6 +288,7 @@ test('no settings-input component ever appears in the native view (why: settings
     buildView({}),
     buildView({ state: stateOf() }),
     buildView({ state: stateOf(), scope: { sessionId: 'orch-1', features: [] } }),
+    buildView({ state: stateOf({ policy: { ...POLICY, routes: ROUTES } }) }),
   ]
   for (const view of views) {
     for (const component of componentsOf(view)) {
@@ -281,6 +297,90 @@ test('no settings-input component ever appears in the native view (why: settings
       assert.ok(!Object.hasOwn(component, 'placeholder'), 'no component may carry an input placeholder')
     }
   }
+})
+
+test('the overview shows the three model routes as read-only rows (why: the native side reports, it never sets)', () => {
+  const view = buildView({ state: stateOf({ policy: { ...POLICY, routes: ROUTES } }) })
+
+  assert.deepEqual(routeRow(view, '主代理'), { label: '主代理', value: 'nexus-deepseek/deepseek-v4.1-pro · high' })
+  assert.deepEqual(routeRow(view, 'worker'), { label: 'worker', value: 'nexus-deepseek/flash' })
+  assert.deepEqual(routeRow(view, '评审'), { label: '评审', value: '未设' })
+
+  for (const label of ['主代理', 'worker', '评审']) {
+    const row = routeRow(view, label)
+    assert.ok(row !== undefined, label + ' row must exist')
+    // A route row is exactly { label, value }: no action, no control field, so the native side cannot set a model.
+    assert.deepEqual(Object.keys(row).sort(), ['label', 'value'], label + ' must be a read-only row')
+    assert.ok(!row.value.endsWith(' · '), label + ' must not end with a dangling separator: ' + row.value)
+  }
+})
+
+test('a missing, junk or empty route reads 未设, never a blank or an undefined', () => {
+  const views = [
+    // No policy.routes at all: the payload predates the field, or the secretary never composed it.
+    buildView({ state: stateOf() }),
+    buildView({ state: stateOf({ policy: { ...POLICY, routes: {} } }) }),
+    buildView({
+      state: stateOf({ policy: { ...POLICY, routes: { main: {}, worker: { provider: '  ', model: 42 }, review: null } } }),
+    }),
+    buildView({ state: stateOf({ policy: { ...POLICY, routes: 'junk' } }) }),
+  ]
+  for (const view of views) {
+    for (const label of ['主代理', 'worker', '评审']) {
+      assert.equal(routeRow(view, label).value, '未设', label + ' with no route set')
+    }
+    const serialized = JSON.stringify(view)
+    assert.ok(!serialized.includes('undefined'))
+    assert.ok(!serialized.includes('[object Object]'))
+  }
+
+  // A single unset segment is not the whole line: a provider with no effort still renders.
+  const partial = buildView({ state: stateOf({ policy: { ...POLICY, routes: { main: { provider: 'p', model: '', effort: 'high' } } } }) })
+  assert.equal(routeRow(partial, '主代理').value, 'p · high')
+  const effortOnly = buildView({ state: stateOf({ policy: { ...POLICY, routes: { main: { provider: '', model: '', effort: 'low' } } } }) })
+  assert.equal(routeRow(effortOnly, '主代理').value, 'low')
+})
+
+test('the route rows keep the view inside nodes, bytes and keyValue (why: those caps are contract)', () => {
+  const long = '路由'.repeat(200)
+  const routes = {
+    main: { provider: long, model: long, effort: long },
+    worker: { provider: 'nexus-deepseek', model: long, effort: '' },
+    review: { provider: long, model: '', effort: 'high' },
+  }
+  const overload = {
+    orchestrators: Array.from({ length: 80 }, (_, index) =>
+      orchestrator('s' + index, {
+        title: '长会话 ' + index + ' ' + '很长'.repeat(40),
+        workspace: 'D:/' + '很长的路径'.repeat(30),
+        workers: [
+          { id: 'w-a-' + index, state: 'Working', summary: 'x' },
+          { id: 'w-b-' + index, state: 'Needs input', summary: 'y' },
+        ],
+      }),
+    ),
+    reports: Array.from({ length: 80 }, (_, index) =>
+      report('s' + (index % 5), 1_700_000_000_000 + index * 60_000, {
+        completed: ['完成'.repeat(60)],
+        blocked: ['卡住'.repeat(60)],
+        flipped: ['翻转'.repeat(60)],
+      }),
+    ),
+    drafts: Array.from({ length: 80 }, (_, index) => draft('s' + (index % 5), { text: '待拍板'.repeat(100) })),
+    policy: { ...POLICY, promptText: '提示'.repeat(500), routes },
+  }
+  const view = buildView({ state: { ...stateOf(), ...overload } })
+  const measured = countNodes(view)
+  const bytes = Buffer.byteLength(JSON.stringify(view), 'utf8')
+
+  assert.ok(measured.nodes <= PANEL_LIMITS.nodes, 'got ' + measured.nodes + ' nodes')
+  assert.ok(bytes <= PANEL_LIMITS.bytes, 'got ' + bytes + ' bytes')
+  assert.ok(measured.depth <= PANEL_LIMITS.depth, 'got depth ' + measured.depth)
+  assert.ok(overviewRows(view).length <= PANEL_LIMITS.keyValue, 'got ' + overviewRows(view).length + ' keyValue rows')
+
+  // Trimming shortens data rows (lists, tables, timelines); the route rows are structural and stay.
+  for (const label of ['主代理', 'worker', '评审']) assert.ok(routeRow(view, label) !== undefined, label + ' survives trimming')
+  assert.ok(routeRow(view, '主代理').value.length <= 80, 'a route value is clipped, not rendered whole: ' + routeRow(view, '主代理').value.length)
 })
 
 test('the view builders are pure: the payload is not mutated and two calls differ only by input', () => {

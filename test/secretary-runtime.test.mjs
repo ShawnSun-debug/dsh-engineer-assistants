@@ -137,6 +137,7 @@ function harness({
   messaging,
   drafts,
   fs,
+  projectionStateOf,
 } = {}) {
   const timer = fakeClock(START)
   const messages = []
@@ -203,6 +204,9 @@ function harness({
       flush: async () => true,
     },
     agents: { get: () => ({ id: 'master-1', status: 'idle' }) },
+    // registry 级投影读法 `(session, key)`：生产里由 dsh-session-projection 提供，
+    // 秘书用 `todos` 填步骤。不给就当作宿主没有这份投影。
+    ...(projectionStateOf === undefined ? {} : { sessionProjections: { stateOf: projectionStateOf } }),
   }
 
   const secretary = mod.attachSecretary(ctx, config, {
@@ -509,5 +513,106 @@ test('the view beats follow the real beat: count grows per tick and capped after
     assert.equal(capped.count, 3)
     assert.equal(capped.capped, true)
     assert.equal(capped.stoppedReason, 'max-run')
+  })
+})
+// ---- 步骤来源（交接文档 Next 第 3 条）：六态投影的 step 读宿主 `todos` 投影 --------
+//
+// 语义钉死在这里：total = 列表长度；index = 第一个 status 为 in_progress 的条目
+// 1-based 下标；没有 in_progress 时 index = 已 completed 条数（不超过 total）；
+// 空列表 / null / undefined / 抛错 / 非数组一律保持 step: null。
+// 报告里的「## 步骤」段是这条语义唯一的可观察出口，所以断言落在落盘的文件上。
+
+const STEPS_LINE = /## 步骤\n\n([^\n]*)/
+
+test('the step is the first in_progress todo, over the whole list length (why: the six-state projection hardcoded step: null)', async () => {
+  await withDir(async (dir) => {
+    const todos = [
+      { id: 'a', status: 'completed' },
+      { id: 'b', status: 'in_progress' },
+      { id: 'c', status: 'pending' },
+    ]
+    const h = harness({ dir, projectionStateOf: (session, key) => (key === 'todos' ? todos : undefined) })
+    await h.dispatch()
+    h.timer.advance(BEAT)
+    await h.secretary.settled()
+
+    const body = await readFile(join(h.reportDir('orch-1'), '09-03.md'), 'utf8')
+    assert.equal(STEPS_LINE.exec(body)[1], '第 2 步 / 共 3 步', 'total 是列表长度，index 是 in_progress 的 1-based 下标')
+    // 第一拍没有上一份，空基线 → 这一步就是一次真实的步骤推进。
+    assert.equal(h.messages.length, 1)
+    assert.match(h.messages[0].text, /步骤推进/)
+    assert.match(h.messages[0].text, /第 2 步 \/ 共 3 步/)
+  })
+})
+
+test('with no in_progress entry the step index is the completed count', async () => {
+  await withDir(async (dir) => {
+    const todos = [
+      { id: 'a', status: 'completed' },
+      { id: 'b', status: 'completed' },
+      { id: 'c', status: 'completed' },
+    ]
+    const h = harness({ dir, projectionStateOf: (session, key) => (key === 'todos' ? todos : undefined) })
+    await h.dispatch()
+    h.timer.advance(BEAT)
+    await h.secretary.settled()
+
+    const body = await readFile(join(h.reportDir('orch-1'), '09-03.md'), 'utf8')
+    assert.equal(STEPS_LINE.exec(body)[1], '第 3 步 / 共 3 步', '全 completed：index = 已完成的条数，不超过 total')
+  })
+})
+
+test('a null todos state keeps the step empty and still writes the report', async () => {
+  await withDir(async (dir) => {
+    // 宿主对没写过的 todos 投影返回 null（init 值）。
+    const h = harness({ dir, projectionStateOf: () => null })
+    await h.dispatch()
+    h.timer.advance(BEAT)
+    await h.secretary.settled()
+
+    const body = await readFile(join(h.reportDir('orch-1'), '09-03.md'), 'utf8')
+    assert.equal(STEPS_LINE.exec(body)[1], '未提供', 'null 不能变成一个编出来的步骤')
+    assert.deepEqual(await h.files('orch-1'), ['09-00.md', '09-03.md'], '投影缺一份可选字段，这一拍照旧落盘')
+  })
+})
+
+test('an undefined todos state keeps the step empty', async () => {
+  await withDir(async (dir) => {
+    // 宿主对未注册或已释放的 key 返回 undefined。
+    const h = harness({ dir, projectionStateOf: () => undefined })
+    await h.dispatch()
+    h.timer.advance(BEAT)
+    await h.secretary.settled()
+
+    const body = await readFile(join(h.reportDir('orch-1'), '09-03.md'), 'utf8')
+    assert.equal(STEPS_LINE.exec(body)[1], '未提供')
+    assert.deepEqual(await h.files('orch-1'), ['09-00.md', '09-03.md'])
+  })
+})
+
+test('a throwing todos read never fails the tick: the step is empty and the report lands', async () => {
+  await withDir(async (dir) => {
+    const h = harness({
+      dir,
+      projectionStateOf: () => {
+        throw new Error('the todos projection is unavailable')
+      },
+    })
+    await h.dispatch()
+    h.timer.advance(BEAT)
+    await h.secretary.settled()
+
+    const body = await readFile(join(h.reportDir('orch-1'), '09-03.md'), 'utf8')
+    assert.equal(STEPS_LINE.exec(body)[1], '未提供', '抛错也退回 null，不硬塞步骤')
+    assert.deepEqual(await h.files('orch-1'), ['09-00.md', '09-03.md'], '读不到 todos 不能让整拍失败')
+    assert.ok(
+      h.logs.some((message) => /todos/.test(message)),
+      '降级读法进日志，下一次协议坏了能看见',
+    )
+    assert.equal(
+      h.logs.some((message) => /a beat tick of orch-1 failed/.test(message)),
+      false,
+      '整拍不能因为这一步失败',
+    )
   })
 })

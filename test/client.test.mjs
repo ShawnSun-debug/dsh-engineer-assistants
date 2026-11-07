@@ -1365,10 +1365,10 @@ test('the permissions zone names the dispatch-command level and its four read-on
   ])
   assert.deepEqual(scopeLines, ['不能写文件', '不能改插件配置', '不能直接改 orchestrator 会话内容', '不能越出登记名单'])
 
-  // The model row is the pending line: no payload or config field names a model, so there are
-  // no choices to fake.
-  assert.match(text, /模型选择待接（当前跟随宿主默认）/)
-  assert.match(text, /跟随宿主默认模型/)
+  // The model row points at the Routes zone above: the three routes are edited there, and a
+  // picker in this read-only zone would be a second writer for one value.
+  assert.match(text, /模型在上方的「路由」区设置/)
+  assert.match(text, /主代理、子代理与评审者三行模型都在上方的「路由」区/)
   assert.equal(nodes(inner.tree).some((node) => node.type === 'select'), false)
   assert.equal(nodes(inner.tree).some((node) => node.type === 'input'), false)
   assert.equal(nodes(inner.tree).some((node) => node.type === 'button'), false)
@@ -1761,7 +1761,7 @@ test('the overview maps the payload to its blockers, its current run and its wor
   assert.match(textOf(byTestId(view.tree, 'orchestrator-secretary-conflict')), /s-9/)
 
   // The current run is the Working row, with its state, its step line and its worker table.
-  // The six-state projection has no step source, so the line says 未提供 (secretary.stepNone)
+  // This fixture's rows carry no step (null), so the line says 未提供 (secretary.stepNone)
   // instead of inventing a step — the reason this assertion replaced "no step line at all".
   const current = byTestId(view.tree, 'orchestrator-secretary-current')
   assert.match(textOf(current), /收尾/)
@@ -2484,7 +2484,7 @@ test('the current run shows its step highlighted with the elapsed time from the 
   const view = mount(T.SecretaryOverview, { t, width: 1200, now, payload: at(run()) })
   const current = byTestId(view.tree, 'orchestrator-secretary-current')
   assert.match(textOf(current), /secretary.currentStep/)
-  // The six-state projection has no step source: the highlighted value is 未提供, never blank.
+  // No step in this fixture (null): the highlighted value is 未提供, never blank.
   assert.equal(textOf(byTestId(view.tree, 'orchestrator-secretary-current-step')).trim(), 'secretary.stepNone')
   assert.match(textOf(current), /secretary.elapsed/)
   assert.equal(textOf(byTestId(view.tree, 'orchestrator-secretary-current-elapsed')).trim(), '06:12')
@@ -2693,6 +2693,183 @@ test('the tracking switch shows the host answer and writes both directions (why:
   offToggle.props.onChange()
   await flush()
   assert.deepEqual(plain(offScope.calls[0].ops), [{ op: 'set', path: ['secretaryEnabled'], value: true }])
+})
+
+// ---- 秘书设置区：模型路由、卡点唤醒与正文截断 ----------------------------------------------
+
+/** Mount the secretary settings tab over the three route scopes and one model catalog. */
+function mountSecretarySettings({
+  initial = {},
+  mainInitial = {},
+  workerInitial = {},
+  groups = ROW_GROUPS,
+  payload = secretaryPayload(),
+  catalog,
+} = {}) {
+  const orch = fakeScope({ initial })
+  const scopes = {
+    main: fakeScope({ initial: mainInitial }),
+    worker: fakeScope({ initial: workerInitial }),
+    orch,
+    // REVIEW.ns 与 NS 同值：评审路由和 worker 路由存在同一个 orchestrator 条目里，所以设置区
+    // 递的是同一个 controller，这里也照实情写。
+    review: orch,
+  }
+  const view = mount(T.SecretarySettings, {
+    t,
+    orch: scopes.orch,
+    payload,
+    mutate: scopes.orch.mutate,
+    scopes,
+    catalog: catalog ?? (async () => ({ ok: true, value: { groups } })),
+  })
+  return { view, scopes }
+}
+
+test('the settings tab renders the three route rows from their config scopes', async () => {
+  const { view } = mountSecretarySettings({
+    mainInitial: { provider: 'nexus-claude', model: 'claude/opus:5.5', reasoningEffort: 'high' },
+    workerInitial: { workerProvider: 'nexus-deepseek', workerModel: 'deepseek-v4.1-flash' },
+  })
+  await flush()
+  const rows = () => nodes(view.tree).filter((node) => node.type === T.RouteRow)
+  assert.deepEqual(rows().map((row) => row.props.label), ['route.main', 'route.worker', 'route.review'])
+  // The shown value is the scope's snapshot, mapped through that route's field table.
+  assert.deepEqual(plain(rows()[0].props.route), { provider: 'nexus-claude', model: 'claude/opus:5.5', effort: 'high' })
+  assert.deepEqual(plain(rows()[1].props.route), {
+    provider: 'nexus-deepseek',
+    model: 'deepseek-v4.1-flash',
+    effort: '',
+  })
+  // The reviewer starts empty, which is how "follow the worker" is stored.
+  assert.deepEqual(plain(rows()[2].props.route), { provider: '', model: '', effort: '' })
+  // Each row carries its own test id so a browser can address it.
+  for (const key of ['main', 'worker', 'review']) {
+    assert.ok(byTestId(view.tree, 'orchestrator-secretary-route-' + key), key)
+  }
+  // One catalog feeds all three rows; a writable scope and an idle tab leave them enabled.
+  assert.equal(rows()[0].props.groups.length, ROW_GROUPS.length)
+  assert.equal(rows()[2].props.groups, rows()[0].props.groups)
+  assert.equal(rows()[0].props.disabled, false)
+})
+
+test('the three route rows write the same config keys the plugin settings page writes', async () => {
+  const { view, scopes } = mountSecretarySettings()
+  await flush()
+  const rows = () => nodes(view.tree).filter((node) => node.type === T.RouteRow)
+
+  // Main: the host's agent-default-model entry, three ops under its own field names.
+  await rows()[0].props.onChange({ provider: 'nexus-deepseek', model: 'deepseek-v4.1-pro', effort: 'high' })
+  await flush()
+  assert.deepEqual(plain(scopes.main.calls[0].ops), [
+    { op: 'set', path: ['provider'], value: 'nexus-deepseek' },
+    { op: 'set', path: ['model'], value: 'deepseek-v4.1-pro' },
+    { op: 'set', path: ['reasoningEffort'], value: 'high' },
+  ])
+  assert.equal(scopes.main.calls[0].expected, 1)
+
+  // Worker: this plugin's own entry.
+  await rows()[1].props.onChange({ provider: 'p', model: 'm', effort: 'low' })
+  await flush()
+  assert.deepEqual(plain(scopes.worker.calls[0].ops), [
+    { op: 'set', path: ['workerProvider'], value: 'p' },
+    { op: 'set', path: ['workerModel'], value: 'm' },
+    { op: 'set', path: ['workerReasoningEffort'], value: 'low' },
+  ])
+
+  // Reviewer: the review fields in the same entry. No effort stores '' rather than an unset,
+  // because an unset would bring the bundled default back.
+  await rows()[2].props.onChange({ provider: 'p2', model: 'm2', effort: '' })
+  await flush()
+  assert.deepEqual(plain(scopes.orch.calls[0].ops), [
+    { op: 'set', path: ['reviewProvider'], value: 'p2' },
+    { op: 'set', path: ['reviewModel'], value: 'm2' },
+    { op: 'set', path: ['reviewReasoningEffort'], value: '' },
+  ])
+  assert.equal(byTestId(view.tree, 'orchestrator-secretary-settings-error'), undefined)
+})
+
+test('the wake-on-blocked switch reads the scope and writes both directions (why: the payload omits the key)', async () => {
+  // The server's composePolicy whitelists four keys only, so a payload copy of this one never
+  // arrives; the stored value has to come from the scope snapshot.
+  const payload = secretaryPayload()
+  assert.equal('secretaryWakeOnBlocked' in (payload.policy ?? {}), false)
+
+  const off = mountSecretarySettings({ initial: { secretaryWakeOnBlocked: false }, payload })
+  await flush()
+  const offSwitch = byTestId(off.view.tree, 'orchestrator-secretary-wake-on-blocked')
+  assert.equal(offSwitch.props.checked, false, 'the switch shows the stored false')
+  offSwitch.props.onChange()
+  await flush()
+  assert.deepEqual(plain(off.scopes.orch.calls[0].ops), [{ op: 'set', path: ['secretaryWakeOnBlocked'], value: true }])
+
+  const on = mountSecretarySettings({ initial: { secretaryWakeOnBlocked: true }, payload })
+  await flush()
+  const onSwitch = byTestId(on.view.tree, 'orchestrator-secretary-wake-on-blocked')
+  assert.equal(onSwitch.props.checked, true, 'and the stored true')
+  onSwitch.props.onChange()
+  await flush()
+  assert.deepEqual(plain(on.scopes.orch.calls[0].ops), [{ op: 'set', path: ['secretaryWakeOnBlocked'], value: false }])
+})
+
+test('a truncated report body says so instead of showing a silently shortened text', () => {
+  const report = {
+    sessionId: 's-1',
+    at: 2,
+    kind: 'delta',
+    path: 'r/2.md',
+    content: '正文的前半段',
+    contentTruncated: true,
+    changes: { completed: [], blocked: [], flipped: [] },
+    error: null,
+  }
+  const payload = secretaryPayload({
+    reports: [report, { ...report, at: 1, path: 'r/1.md', contentTruncated: false }],
+  })
+  assert.deepEqual(
+    plain(T.reportLinesOf(payload)).map((line) => line.truncated),
+    [true, false],
+  )
+
+  const history = mount(T.SecretaryHistory, { t, payload })
+  const row = (index) => byTestId(history.tree, 'orchestrator-secretary-timeline-row-' + String(index))
+  row(0).props.onClick()
+  const hint = byTestId(history.tree, 'orchestrator-secretary-timeline-truncated-0')
+  assert.ok(hint, 'a truncated body must say so')
+  assert.match(textOf(hint), /secretary\.reportTruncated/)
+  row(1).props.onClick()
+  assert.equal(
+    byTestId(history.tree, 'orchestrator-secretary-timeline-truncated-1'),
+    undefined,
+    'a complete body carries no warning',
+  )
+  history.unmount()
+})
+
+test('a tab handed no route scopes renders no editable row instead of writing to the wrong entry', async () => {
+  // 缺 main/worker/review 的 controller 时，退回 orch 会把 MAIN 的字段名写进 orchestrator
+  // 条目——写错地方比不显示更糟，所以这一段干脆不出现。
+  const scope = fakeScope()
+  const bare = mount(T.SecretarySettings, {
+    t,
+    orch: scope,
+    payload: secretaryPayload(),
+    mutate: scope.mutate,
+    catalog: async () => ({ ok: true, value: { groups: ROW_GROUPS } }),
+  })
+  await flush()
+  assert.equal(nodes(bare.tree).some((node) => node.type === T.RouteRow), false)
+  assert.equal(byTestId(bare.tree, 'orchestrator-secretary-routes'), undefined)
+  bare.unmount()
+})
+
+test('a failed catalog read is said out loud instead of looking like an empty model list', async () => {
+  const { view } = mountSecretarySettings({ catalog: async () => ({ ok: false, error: { message: 'no catalog' } }) })
+  await flush()
+  const alert = byTestId(view.tree, 'orchestrator-secretary-routes-error')
+  assert.equal(alert.props.role, 'alert')
+  assert.match(textOf(alert), /route\.catalogFailed/)
+  assert.equal(nodes(view.tree).some((node) => node.type === T.RouteRow), false)
 })
 
 test('the sidebar glyph is decorative: no second button inside the row', () => {
