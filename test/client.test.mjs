@@ -1673,12 +1673,13 @@ test('the overview maps the payload to its blockers, its current run and its wor
   assert.match(textOf(blocker), /构建视图/)
   assert.match(textOf(byTestId(view.tree, 'orchestrator-secretary-conflict')), /s-9/)
 
-  // The current run is the Working row, with its state and its worker table. There is no step
-  // label: the endpoint has no source for a step counter, so the row no longer invents one.
+  // The current run is the Working row, with its state, its step line and its worker table.
+  // The six-state projection has no step source, so the line says 未提供 (secretary.stepNone)
+  // instead of inventing a step — the reason this assertion replaced "no step line at all".
   const current = byTestId(view.tree, 'orchestrator-secretary-current')
   assert.match(textOf(current), /收尾/)
   assert.match(textOf(current), /Working/)
-  assert.equal(textOf(current).includes('secretary.step'), false, 'no step line without a step field')
+  assert.match(textOf(byTestId(view.tree, 'orchestrator-secretary-current-step')), /secretary.stepNone/)
   const worker = byTestId(view.tree, 'orchestrator-secretary-worker-w-3')
   assert.ok(worker, 'the running session lists its workers')
   assert.match(textOf(worker), /整理提交/)
@@ -2002,6 +2003,178 @@ test('the layout is two columns at 1100 and scrolls only inside the list regions
   assert.equal(narrow.columns.gridTemplateColumns, 'minmax(0, 1fr)')
   assert.equal(T.secretaryStyleOf(undefined).wide, false)
   assert.equal(T.secretaryStyleOf(Number.NaN).wide, false)
+})
+
+test('the overview status bar derives every number from the payload (why: a hardcoded bar would lie)', () => {
+  const now = 1_700_000_000_000
+  const clock = (ms) => {
+    const date = new Date(ms)
+    const pad = (part) => String(part).padStart(2, '0')
+    return pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds())
+  }
+  const run = (beats) => ({
+    sessionId: 's-2',
+    title: '收尾',
+    workspace: '',
+    live: true,
+    state: 'Working',
+    workers: [],
+    beats,
+    lastReport: null,
+  })
+  const status = (tree, id) => textOf(byTestId(tree, 'orchestrator-secretary-status-' + id)).trim()
+  const withPolicy = (orchestrators, policy, reports = []) =>
+    secretaryPayload({
+      registry: { masterSessionId: '', orchestrators: [], conflict: null },
+      orchestrators,
+      reports,
+      policy: Object.assign({ notifyOn: {}, promptText: '' }, policy),
+    })
+
+  // The beat is 300s in (count 2 of a 120s cadence), so its next tick is 60s away; the 600s cap
+  // leaves 300s. The next-report clock is the beat's next tick, computed locally by the view.
+  const view = mount(T.SecretaryOverview, {
+    t,
+    width: 1200,
+    now,
+    payload: withPolicy(
+      [run({ count: 2, startedAt: now - 300000, capped: false, stoppedReason: null })],
+      { beatSeconds: 120, maxRunSeconds: 600 },
+    ),
+  })
+  assert.match(textOf(byTestId(view.tree, 'orchestrator-secretary-status-tracking')), /secretary.status.on/)
+  assert.equal(status(view.tree, 'running'), '1')
+  assert.equal(status(view.tree, 'blocked'), '0')
+  assert.match(status(view.tree, 'beat'), /01:00/)
+  assert.match(status(view.tree, 'maxrun'), /05:00/)
+  assert.match(status(view.tree, 'next-report'), new RegExp(clock(now + 60000)))
+
+  // A second profile renders its own numbers: the bar reads policy, not constants.
+  const second = mount(T.SecretaryOverview, {
+    t,
+    width: 1200,
+    now,
+    payload: withPolicy(
+      [run({ count: 1, startedAt: now - 100000, capped: false, stoppedReason: null })],
+      { beatSeconds: 300, maxRunSeconds: 3600 },
+    ),
+  })
+  assert.match(status(second.tree, 'beat'), /08:20/)
+  assert.match(status(second.tree, 'maxrun'), /58:20/)
+
+  // With no running beat, the newest report's cadence is the only next-report projection.
+  const reportsOnly = mount(T.SecretaryOverview, {
+    t,
+    width: 1200,
+    now,
+    payload: withPolicy(
+      [],
+      { beatSeconds: 120, maxRunSeconds: 600 },
+      [
+        {
+          sessionId: 's-2',
+          at: now - 100000,
+          kind: 'delta',
+          path: 'r/2.md',
+          changes: { completed: [], blocked: [], flipped: [] },
+          error: null,
+        },
+      ],
+    ),
+  })
+  assert.equal(status(reportsOnly.tree, 'beat'), '—')
+  assert.equal(status(reportsOnly.tree, 'next-report'), clock(now + 20000))
+
+  // A payload that can produce none of it says '—' instead of a plausible zero.
+  const bare = mount(T.SecretaryOverview, {
+    t,
+    width: 1200,
+    now,
+    payload: {
+      enabled: false,
+      orchestrators: [run({ count: 2, startedAt: now - 300000, capped: true, stoppedReason: 'max-run' })],
+      reports: [],
+      drafts: [],
+    },
+  })
+  assert.match(status(bare.tree, 'tracking'), /secretary\.status\.off/)
+  assert.equal(status(bare.tree, 'running'), '1')
+  assert.equal(status(bare.tree, 'beat'), '—')
+  assert.equal(status(bare.tree, 'maxrun'), '—')
+  assert.equal(status(bare.tree, 'next-report'), '—')
+})
+
+test('a blocker row says what the user must do and never leaves the line blank (why: the reason alone does not name the action)', () => {
+  const payload = secretaryPayload({
+    orchestrators: [
+      {
+        sessionId: 's-1',
+        title: '构建视图',
+        live: true,
+        state: 'Needs input',
+        workers: [],
+        beats: { count: 1, startedAt: 1, capped: false, stoppedReason: null },
+        needsAction: '先确认 12 条记录是否已导出',
+      },
+      {
+        sessionId: 's-2',
+        title: '收尾',
+        live: true,
+        state: 'Needs input',
+        workers: [],
+        beats: { count: 1, startedAt: 1, capped: false, stoppedReason: null },
+      },
+    ],
+  })
+  const view = mount(T.SecretaryOverview, { t, width: 1200, payload })
+  const withField = textOf(byTestId(view.tree, 'orchestrator-secretary-blocker-needs-action-s-1'))
+  assert.match(withField, /secretary.needsAction/)
+  assert.match(withField, /先确认 12 条记录是否已导出/)
+  const without = textOf(byTestId(view.tree, 'orchestrator-secretary-blocker-needs-action-s-2'))
+  assert.match(without, /secretary.needsActionHint/)
+  // The suggestion is real copy in both dictionaries, not an empty placeholder.
+  assert.match(T.zh['secretary.needsActionHint'], /决定是否允许继续/)
+  assert.ok(T.en['secretary.needsActionHint'].length > 0)
+})
+
+test('the current run shows its step highlighted with the elapsed time from the beat start (why: a blank step line hid progress)', () => {
+  const now = 1_700_000_000_000
+  const run = (extra) =>
+    Object.assign(
+      {
+        sessionId: 's-2',
+        title: '收尾',
+        workspace: '',
+        live: true,
+        state: 'Working',
+        workers: [],
+        beats: { count: 1, startedAt: now - 372000, capped: false, stoppedReason: null },
+        lastReport: null,
+      },
+      extra,
+    )
+  const at = (row) => secretaryPayload({ orchestrators: [row] })
+
+  const view = mount(T.SecretaryOverview, { t, width: 1200, now, payload: at(run()) })
+  const current = byTestId(view.tree, 'orchestrator-secretary-current')
+  assert.match(textOf(current), /secretary.currentStep/)
+  // The six-state projection has no step source: the highlighted value is 未提供, never blank.
+  assert.equal(textOf(byTestId(view.tree, 'orchestrator-secretary-current-step')).trim(), 'secretary.stepNone')
+  assert.match(textOf(current), /secretary.elapsed/)
+  assert.equal(textOf(byTestId(view.tree, 'orchestrator-secretary-current-elapsed')).trim(), '06:12')
+
+  // When the payload does carry a step, the same line shows it instead of the placeholder.
+  const stepped = mount(T.SecretaryOverview, { t, width: 1200, now, payload: at(run({ step: { index: 3, total: 5 } })) })
+  assert.equal(textOf(byTestId(stepped.tree, 'orchestrator-secretary-current-step')).trim(), '3 / 5')
+
+  // Without a beat start the elapsed cell says '—' rather than a made-up zero.
+  const noBeat = mount(T.SecretaryOverview, {
+    t,
+    width: 1200,
+    now,
+    payload: at(run({ beats: { count: 0, startedAt: null, capped: false, stoppedReason: null } })),
+  })
+  assert.equal(textOf(byTestId(noBeat.tree, 'orchestrator-secretary-current-elapsed')).trim(), '—')
 })
 
 test('the settings tab shows the policy numbers the payload carries, keyed by the real config key', () => {
