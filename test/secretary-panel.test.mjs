@@ -412,7 +412,7 @@ test('a broken projection or agent registry degrades to Idle and live false inst
   assert.equal(collectOrchestratorRows({}).length, 0)
 })
 
-test('the Remote exposes the read method plus the two draft transitions (why: ticket 08 adds confirm and discard)', () => {
+test('the Remote exposes the read method, the two draft transitions and the session picker (why: the picker adds a read and a creation)', () => {
   const service = new SecretaryRemote({ enabled: () => false, read: async () => ({}) })
   assert.equal(SECRETARY_SERVICE_KEY, 'orchestratorSecretary')
   assert.equal(SECRETARY_METHOD, 'secretaryState')
@@ -422,6 +422,9 @@ test('the Remote exposes the read method plus the two draft transitions (why: ti
   // exactly one plain parameter named draftId.
   assert.equal(service.confirmDraft.length, 1)
   assert.equal(service.discardDraft.length, 1)
+  // 会话选择器：读方法零参数；新建方法一个可选 id（缺省由服务端补），SRC 只能看到名字。
+  assert.equal(service.listCandidateSessions.length, 0)
+  assert.equal(service.createMasterSession.length, 1)
   assert.deepEqual(service.typertRemote, {
     service,
     serviceKey: SECRETARY_SERVICE_KEY,
@@ -432,10 +435,14 @@ test('the Remote exposes the read method plus the two draft transitions (why: ti
     '@deepseek-ai/dsh-typert-protocol/remote-methods',
   )?.value
   assert.equal(marker.version, 1)
+  // Why changed: the session picker adds two endpoints, so the marker carries five methods.
+  // The old three-method list asserted the picker out of existence.
   assert.deepEqual(marker.methods, [
     { method: 'secretaryState', invocation: { kind: 'direct' } },
     { method: 'confirmDraft', invocation: { kind: 'direct' } },
     { method: 'discardDraft', invocation: { kind: 'direct' } },
+    { method: 'listCandidateSessions', invocation: { kind: 'direct' } },
+    { method: 'createMasterSession', invocation: { kind: 'direct' } },
   ])
 })
 

@@ -148,6 +148,7 @@ function fakeCtx({
   secretaryEnabled = false,
   secretaryOrchestrators = [],
   storageDomain,
+  services: extraServices,
 } = {}) {
   const state = { enabled, allowed, memoryEnabled, panelEnabled, masterEnabled, secretaryEnabled, secretaryOrchestrators }
   const projections = []
@@ -234,6 +235,8 @@ function fakeCtx({
     },
     emit: (event, ...args) => emitted.push([event, ...args]),
   }
+  // Optional host services resolved through ctx.get (sessionTitle, sessionQuery, ...).
+  if (extraServices !== undefined) Object.assign(ctx, extraServices)
   const config = {
     enabled: { get: () => state.enabled },
     allowedTools: { get: () => state.allowed },
@@ -1639,13 +1642,17 @@ test('the secretary endpoint is provided only while its switch is on', async () 
   assert.deepEqual([...off.services.keys()], ['orchestratorMaster'])
   assert.equal(off.services.has('orchestratorSecretary'), false, 'a closed switch registers no secretary service')
 
-  const session = { id: 'orch-1', title: '修登录', header: { id: 'orch-1' } }
+  // Why changed: the fake session used to carry `title: '修登录'` and the endpoint read that field.
+  // A real Session has no `title` — the title is a log-backed fact owned by dsh-session-title — so
+  // the old fake asserted the bug. The host frame now offers the real service.
+  const session = { id: 'orch-1', header: { id: 'orch-1' } }
   const harness = start({
     secretaryEnabled: true,
     secretaryOrchestrators: [{ sessionId: 'orch-1', workspace: '', title: '', trackedAt: 1 }],
     sessions: { get: () => undefined, list: () => [session], flush: async () => true },
     agents: { get: (id) => (id === 'orch-1' ? { id } : undefined) },
     stateOf: () => ({ workers: [{ id: 'orch-1', role: 'main', state: 'Working', summary: '在写报告' }] }),
+    services: { sessionTitle: { get: (target) => (target?.id === 'orch-1' ? { title: '修登录' } : undefined) } },
   })
   const service = harness.services.get('orchestratorSecretary')
   assert.ok(service, 'the open switch provides the read-only endpoint')

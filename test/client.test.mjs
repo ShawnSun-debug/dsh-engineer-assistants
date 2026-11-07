@@ -392,6 +392,10 @@ test('apply leaves only the plan toggle in the composer, registers the settings 
   )
   assert.equal(pageProps.orch, pageProps.scopes.orch)
   assert.equal(typeof pageProps.loadCatalog, 'function')
+  // The session picker's two endpoint calls are wired by the same injection: without them the
+  // section would render but every button would be inert.
+  assert.equal(typeof pageProps.loadCandidates, 'function')
+  assert.equal(typeof pageProps.createMaster, 'function')
   assert.deepEqual(plain(mod.inject), [
     'slots',
     'locale',
@@ -1182,13 +1186,19 @@ test('the settings page shows a review route row and the last verdict', async ()
 // ---- The plugin settings page --------------------------------------------------------
 
 /** Mount the settings page over three writable scopes and a one-provider catalog. */
-function mountSettings({ groups = [{ id: 'nexus-deepseek', name: 'Nexus DeepSeek', models: [{ id: 'flash', name: 'Flash' }] }] } = {}) {
+function mountSettings({
+  groups = [{ id: 'nexus-deepseek', name: 'Nexus DeepSeek', models: [{ id: 'flash', name: 'Flash' }] }],
+  loadCandidates = async () => [],
+  createMaster = async () => ({ ok: false, error: 'not wired in this test' }),
+} = {}) {
   const scopes = { main: fakeScope(), worker: fakeScope(), orch: fakeScope() }
   const view = mount(T.OrchestratorSettingsSection, {
     t,
     scopes,
     orch: scopes.orch,
     loadCatalog: async () => ({ ok: true, value: { groups } }),
+    loadCandidates,
+    createMaster,
   })
   return { view, scopes, groups }
 }
@@ -1200,8 +1210,16 @@ test('the settings page has four zones and gives every control the scope it writ
   // A section element, addressed for the host and for a test, is the page root.
   assert.equal(tree.type, 'section')
   assert.equal(tree.props['data-testid'], 'orchestrator-settings')
+  // The session picker owns its own <section data-zone="sessions">, but it is a child component:
+  // the shim renders one component per mount, so the page tree holds its element, not its markup.
+  // What the page owns is the order — the picker is the first zone and precedes every other one.
   const zones = nodes(tree).filter((node) => node.props?.['data-zone'] !== undefined)
   assert.deepEqual(zones.map((zone) => zone.props['data-zone']), ['enable', 'routes', 'allowed', 'supervise'])
+  const kids = tree.kids
+  const pickerAt = kids.findIndex((kid) => kid !== null && kid !== undefined && kid.type === T.SessionPicker)
+  const enableAt = kids.findIndex((kid) => kid?.props?.['data-zone'] === 'enable')
+  assert.ok(pickerAt >= 0, 'the page renders the picker')
+  assert.ok(pickerAt < enableAt, 'the picker sits above every other zone')
   for (const key of ['section.title', 'section.enable', 'section.routes', 'section.allowed', 'section.supervise']) {
     assert.equal(textOf(tree).includes(key), true, key)
   }
@@ -1440,11 +1458,13 @@ test('the three tabs are the fixed vocabulary and both dictionaries label them',
 
 test('the secretary contribution declares the two draft transitions with one draftId each (why: ticket 08 adds a write seam)', () => {
   const descriptors = plain(T.SECRETARY_CONTRIBUTION.descriptors)
+  // Why changed: the session picker adds two endpoints. The old three-method list asserted the
+  // picker out of existence; the two new ones are zero-argument calls, checked separately below.
   assert.deepEqual(
     descriptors.map((descriptor) => descriptor.method),
-    ['secretaryState', 'confirmDraft', 'discardDraft'],
+    ['secretaryState', 'confirmDraft', 'discardDraft', 'listCandidateSessions', 'createMasterSession'],
   )
-  for (const descriptor of descriptors.slice(1)) {
+  for (const descriptor of descriptors.filter((entry) => entry.method.endsWith('Draft'))) {
     assert.equal(descriptor.id, 'dsh-orchestrator-secretary#orchestratorSecretary/' + descriptor.method)
     assert.equal(descriptor.service, 'orchestratorSecretary')
     assert.equal(descriptor.namespace, 'orchestratorSecretary')
@@ -1472,6 +1492,14 @@ test('the secretary contribution declares the two draft transitions with one dra
     assert.deepEqual(plain(parameter.codec.jsonSchema), { type: 'string' })
     // The results stay src-json (commit 814d662): raw JSON both ways, no generated decoder.
     assert.deepEqual(descriptor.result, { mode: 'src-json' })
+  }
+  // The picker's two calls carry no client-supplied field at all: the optional master id stays
+  // absent so the Host applies the plugin's default, and the list read takes nothing.
+  for (const method of ['listCandidateSessions', 'createMasterSession']) {
+    const descriptor = descriptors.find((entry) => entry.method === method)
+    assert.ok(descriptor, method)
+    assert.deepEqual(descriptor.parameters, [], method)
+    assert.deepEqual(descriptor.result, { mode: 'src-json' }, method)
   }
 })
 
@@ -2372,3 +2400,235 @@ test('every tab survives a payload with no segments', () => {
 })
 
 
+
+
+// ---- 会话选择器（票：会话选择器） -------------------------------------------------------
+
+/** One candidate row exactly as the endpoint sends it. */
+const CANDIDATE = (id, extra) => ({
+  sessionId: id,
+  title: '标题-' + id,
+  titleMissing: false,
+  cwd: 'D:\\ws',
+  live: true,
+  running: false,
+  updatedAt: 1_700_000_000_000,
+  parentSession: null,
+  delegationDepth: 0,
+  isMaster: false,
+  isOrchestrator: false,
+  ...(extra ?? {}),
+})
+
+function mountPicker({ initial = {}, loadCandidates, createMaster } = {}) {
+  const scope = fakeScope({ initial })
+  const view = mount(T.SessionPicker, { t, scope, loadCandidates, createMaster })
+  return { view, scope }
+}
+
+test('the session picker is the first zone of the settings page and owns the plugin scope', async () => {
+  let reads = 0
+  const { view, scopes } = mountSettings({
+    loadCandidates: async () => {
+      reads += 1
+      return []
+    },
+  })
+  await flush()
+  const picker = nodes(view.tree).find((node) => node.type === T.SessionPicker)
+  assert.ok(picker, 'the page renders the picker as its own component')
+  assert.equal(picker.props.scope, scopes.orch, 'it writes the plugin config entry the registry lives in')
+  assert.equal(typeof picker.props.loadCandidates, 'function')
+  assert.equal(typeof picker.props.createMaster, 'function')
+  assert.equal(reads, 0, 'the test shim never renders a child component, so no read happens here')
+  view.unmount()
+})
+
+test('the picker lists title, workspace, status and activity, marking the master and the registered rows', async () => {
+  const { view } = mountPicker({
+    initial: {
+      secretaryMasterSessionId: 'a',
+      secretaryOrchestrators: [{ sessionId: 'b', workspace: 'w', title: '旧', trackedAt: 1 }],
+    },
+    loadCandidates: async () => [
+      CANDIDATE('a', { running: true, isMaster: true }),
+      CANDIDATE('b', { title: '', titleMissing: true, cwd: '', live: false, isOrchestrator: true }),
+      CANDIDATE('c', { running: false, live: true }),
+      CANDIDATE('d', { running: false, live: false }),
+    ],
+  })
+  await flush()
+
+  const rowA = byTestId(view.tree, 'orchestrator-session-row-a')
+  assert.match(textOf(rowA), /标题-a/)
+  assert.match(textOf(rowA), /sessions\.status\.running/)
+  assert.match(textOf(rowA), /sessions\.master/)
+  assert.match(textOf(rowA), /D:\\ws/, 'the workspace path is shown')
+
+  const rowB = byTestId(view.tree, 'orchestrator-session-row-b')
+  assert.match(textOf(rowB), /sessions\.titleMissing/, 'a missing title is said out loud')
+  assert.match(textOf(rowB), /sessions\.noWorkspace/)
+  assert.match(textOf(rowB), /sessions\.status\.persisted/)
+  assert.match(textOf(rowB), /sessions\.registered/)
+
+  assert.match(textOf(byTestId(view.tree, 'orchestrator-session-row-c')), /sessions\.status\.live/)
+  assert.match(textOf(byTestId(view.tree, 'orchestrator-session-row-d')), /sessions\.status\.persisted/)
+  assert.equal(byTestId(view.tree, 'orchestrator-session-row-c').props['data-registered'], 'false')
+  assert.equal(byTestId(view.tree, 'orchestrator-session-row-a').props['data-master'], 'true')
+  assert.equal(byTestId(view.tree, 'orchestrator-session-picker-setmaster-a').props.disabled, true)
+  view.unmount()
+})
+
+test('every change is staged locally and only the save button writes the two config keys', async () => {
+  const { view, scope } = mountPicker({
+    initial: {
+      secretaryMasterSessionId: 'a',
+      secretaryOrchestrators: [{ sessionId: 'b', workspace: 'w', title: '旧', trackedAt: 1 }],
+    },
+    loadCandidates: async () => [
+      CANDIDATE('a'),
+      CANDIDATE('b', { isOrchestrator: true }),
+      CANDIDATE('c'),
+      CANDIDATE('d'),
+    ],
+  })
+  await flush()
+
+  const save = () => byTestId(view.tree, 'orchestrator-session-picker-save')
+  assert.equal(save().props.disabled, true, 'nothing staged yet, so there is nothing to save')
+
+  byTestId(view.tree, 'orchestrator-session-picker-setmaster-c').props.onClick()
+  assert.equal(scope.calls.length, 0, 'a master change is staged, not written')
+  assert.match(textOf(view.tree), /sessions\.dirty/)
+
+  // 登记 d、取消 b：Master 与登记表是互斥的，所以换 Master 之后 c 不能再登记进来。
+  byTestId(view.tree, 'orchestrator-session-picker-register-d').props.onClick()
+  byTestId(view.tree, 'orchestrator-session-picker-unregister-b').props.onClick()
+  assert.equal(scope.calls.length, 0, 'registering and unregistering are staged too')
+  assert.notEqual(save().props.disabled, true)
+
+  save().props.onClick()
+  await flush()
+  assert.equal(scope.calls.length, 1, 'one save, one write')
+  const ops = plain(scope.calls[0].ops)
+  assert.equal(ops[0].op, 'set')
+  assert.deepEqual(ops[0].path, ['secretaryMasterSessionId'])
+  assert.equal(ops[0].value, 'c')
+  assert.deepEqual(ops[1].path, ['secretaryOrchestrators'])
+  assert.deepEqual(ops[1].value.map((row) => row.sessionId), ['d'])
+  assert.equal(ops[1].value[0].workspace, 'D:\\ws', 'the row borrows the candidate workspace')
+  assert.equal(ops[1].value[0].title, '标题-d')
+  assert.equal(scope.calls[0].expected, 1, 'the write uses the snapshot revision')
+  view.unmount()
+})
+
+test('registering the session that is already the Master is refused, not written as a conflict', async () => {
+  const { view, scope } = mountPicker({
+    initial: { secretaryMasterSessionId: 'a', secretaryOrchestrators: [] },
+    loadCandidates: async () => [CANDIDATE('a'), CANDIDATE('b')],
+  })
+  await flush()
+
+  byTestId(view.tree, 'orchestrator-session-picker-register-a').props.onClick()
+  const alert = byTestId(view.tree, 'orchestrator-session-picker-error')
+  assert.ok(alert)
+  assert.match(textOf(alert), /sessions\.registerMaster/)
+  assert.equal(scope.calls.length, 0)
+  view.unmount()
+})
+
+test('an empty host is guidance, and a failed read is an error with a retry that really re-reads', async () => {
+  const empty = mountPicker({ loadCandidates: async () => [] })
+  await flush()
+  assert.match(textOf(empty.view.tree), /sessions\.empty/)
+  empty.view.unmount()
+
+  let calls = 0
+  const failing = mountPicker({
+    loadCandidates: async () => {
+      calls += 1
+      throw new Error('endpoint down')
+    },
+  })
+  await flush()
+  const alert = byTestId(failing.view.tree, 'orchestrator-session-picker-error')
+  assert.ok(alert, 'a broken read is visible, never a blank page')
+  assert.match(textOf(alert), /sessions\.failed/)
+  assert.match(textOf(alert), /endpoint down/)
+  byTestId(failing.view.tree, 'orchestrator-session-picker-retry').props.onClick()
+  await flush()
+  assert.equal(calls, 2, 'the retry re-reads the list')
+  failing.view.unmount()
+})
+
+test('the refresh button re-reads the candidate list', async () => {
+  let calls = 0
+  const { view } = mountPicker({
+    loadCandidates: async () => {
+      calls += 1
+      return [CANDIDATE('a')]
+    },
+  })
+  await flush()
+  assert.equal(calls, 1, 'the list is read once when the page appears')
+  byTestId(view.tree, 'orchestrator-session-picker-refresh').props.onClick()
+  await flush()
+  assert.equal(calls, 2)
+  assert.ok(byTestId(view.tree, 'orchestrator-session-row-a'))
+  view.unmount()
+})
+
+test('the create button asks the endpoint for a workspace-free Master and stages the new id', async () => {
+  let created = 0
+  const { view, scope } = mountPicker({
+    loadCandidates: async () => [CANDIDATE('a')],
+    createMaster: async () => {
+      created += 1
+      return { ok: true, sessionId: 'orchestrator-master' }
+    },
+  })
+  await flush()
+  assert.match(textOf(byTestId(view.tree, 'orchestrator-session-picker-create')), /sessions\.create/)
+  byTestId(view.tree, 'orchestrator-session-picker-create').props.onClick()
+  await flush()
+  assert.equal(created, 1)
+  assert.match(textOf(view.tree), /orchestrator-master/)
+  assert.match(textOf(view.tree), /sessions\.created/)
+  assert.equal(scope.calls.length, 0, 'the server already recorded the id; the page only stages it')
+  view.unmount()
+})
+
+test('a failed creation is reported verbatim and stages nothing', async () => {
+  const { view, scope } = mountPicker({
+    loadCandidates: async () => [],
+    createMaster: async () => ({ ok: false, error: 'session id already exists' }),
+  })
+  await flush()
+  byTestId(view.tree, 'orchestrator-session-picker-create').props.onClick()
+  await flush()
+  const alert = byTestId(view.tree, 'orchestrator-session-picker-error')
+  assert.ok(alert)
+  assert.match(textOf(alert), /session id already exists/, 'the host reason is not replaced by a generic one')
+  assert.equal(scope.calls.length, 0)
+  view.unmount()
+})
+
+test('the picker offers no config write at all on a read-only scope', async () => {
+  const scope = fakeScope({ writable: false, initial: { secretaryMasterSessionId: 'a', secretaryOrchestrators: [] } })
+  const view = mount(T.SessionPicker, {
+    t,
+    scope,
+    loadCandidates: async () => [CANDIDATE('a'), CANDIDATE('b')],
+    createMaster: async () => ({ ok: false, error: 'read-only' }),
+  })
+  await flush()
+  assert.equal(byTestId(view.tree, 'orchestrator-session-picker-save').props.disabled, true)
+  assert.equal(byTestId(view.tree, 'orchestrator-session-picker-setmaster-b').props.disabled, true)
+  assert.equal(
+    byTestId(view.tree, 'orchestrator-session-picker-create').props.disabled,
+    false,
+    'creating is a host call, not a config write',
+  )
+  assert.match(textOf(view.tree), /secretary\.readonly/)
+  view.unmount()
+})
