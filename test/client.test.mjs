@@ -3308,3 +3308,26 @@ test('the picker offers no config write at all on a read-only scope', async () =
   assert.match(textOf(view.tree), /secretary\.readonly/)
   view.unmount()
 })
+
+// ---- 秘书设置页的「查看设计稿」入口 ---------------------------------------------------------
+// 设计稿由服务端在同一 3080 上托管（见 test/index.test.mjs 的设计稿用例），这里只守入口：
+// 一个 <a>、新窗口、noreferrer。不用 iframe：设计稿是独立文档，同源 iframe 只会把脚本
+// 和布局耦合进来。
+
+test('the settings tab links to the hosted design in a new tab', async () => {
+  // 两种语言都要有这份文案；键集一致性在别处守着，这里守内容。
+  assert.equal(T.zh['secretary.design'], '查看设计稿')
+  assert.equal(T.en['secretary.design'], 'Open the design')
+
+  const { view } = mountSecretarySettings()
+  await flush()
+  const link = byTestId(view.tree, 'orchestrator-secretary-design-link')
+  assert.ok(link, 'the settings tab carries the design entry')
+  assert.equal(link.type, 'a', 'a link, not an iframe')
+  assert.equal(link.props.href, '/orchestrator/secretary-view')
+  assert.equal(link.props.target, '_blank')
+  assert.equal(link.props.rel, 'noreferrer')
+  // mountSecretarySettings uses the identity translator, so the shown text is the key it uses.
+  assert.equal(textOf(link).trim(), 'secretary.design')
+  view.unmount()
+})

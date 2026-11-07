@@ -149,6 +149,7 @@ function fakeCtx({
   secretaryOrchestrators = [],
   storageDomain,
   services: extraServices,
+  webServer = fakeWebServer(),
 } = {}) {
   const state = { enabled, allowed, memoryEnabled, panelEnabled, masterEnabled, secretaryEnabled, secretaryOrchestrators }
   const projections = []
@@ -216,6 +217,9 @@ function fakeCtx({
       },
     },
     storageDomain,
+    // The real host always mounts the webserver service; the stand-in records the one route the
+    // plugin registers so a case can inspect it, and a case can pass null to drop the service.
+    webServer,
     agents: agents ?? { get: () => undefined },
     sessions: sessions ?? { get: () => undefined, list: () => [], flush: async () => true },
     effect(fn, label) {
@@ -267,6 +271,7 @@ function fakeCtx({
     sections,
     storageDomain,
     services,
+    webServer,
     getCalls,
     logs,
     emitted,
@@ -2091,5 +2096,115 @@ test('a missing, throwing or non-object agentDefaultModel degrades the main rout
   const junkPayload = await throwing.services.get('orchestratorSecretary').secretaryState()
   assert.deepEqual(junkPayload.policy.routes.main, { provider: '', model: '', effort: '' })
   assert.deepEqual(junkPayload.policy.routes.worker, { provider: '', model: '', effort: '' })
+})
+
+// ---- 设计稿托管：一条写死的 exact 路由，读盘一次，响应必须自带 sandbox CSP -------------------
+// 设计稿是秘书面板的视觉参照，插件自己托管它，于是设置页的入口不必指向仓库外的临时目录。
+// 安全账：页面与宿主 Web GUI 同源（127.0.0.1:3080），不加 sandbox 它就能调用宿主的能力，
+// 所以下面每一个用例都盯着 sandbox 这条指令，而不是只看 200。
+
+const DESIGN_PATH = '/orchestrator/secretary-view'
+const designFileUrl = new URL('../lib/secretary-view.html', import.meta.url)
+
+/** A webServer stand-in: records the route and the disposer the plugin keeps for it. */
+function fakeWebServer() {
+  const routes = []
+  const disposed = []
+  return {
+    routes,
+    disposed,
+    register(route) {
+      routes.push(route)
+      return () => disposed.push(route.path)
+    },
+  }
+}
+
+test('the plugin declares the webserver service it registers the design route on', () => {
+  assert.ok(mod.inject.includes('webServer'), 'webServer must be in the inject list, or apply runs before the listener exists')
+})
+
+test('apply registers exactly one exact route for the design at a fixed path', () => {
+  const harness = fakeCtx()
+  mod.apply(harness.ctx, harness.config)
+  const webServer = harness.webServer
+
+  assert.equal(webServer.routes.length, 1, 'one route registered at load, not one per request')
+  const route = webServer.routes[0]
+  assert.equal(route.kind, 'exact', 'an exact path, so nothing else lands on it')
+  assert.equal(route.path, DESIGN_PATH)
+  assert.equal(typeof route.resource, 'function', 'a resource answers GET and HEAD through the host')
+
+  // The registration is owned by an effect, so unloading the plugin removes its route.
+  const owned = harness.effects.find((entry) => typeof entry.dispose === 'function' && /design view/i.test(entry.label))
+  assert.ok(owned, 'the route must be owned by an effect')
+  owned.dispose()
+  assert.deepEqual(webServer.disposed, [DESIGN_PATH])
+})
+
+test('the design route answers the file byte for byte with the sandboxing headers', async () => {
+  const expected = await readFile(designFileUrl)
+  const route = mod.createSecretaryViewRoute()
+  const response = await route.resource(new Request('http://127.0.0.1:3080' + DESIGN_PATH))
+
+  assert.equal(response.status, 200)
+  assert.equal(response.headers.get('content-type'), 'text/html; charset=utf-8')
+  assert.equal(response.headers.get('x-content-type-options'), 'nosniff')
+
+  const csp = response.headers.get('content-security-policy')
+  assert.ok(typeof csp === 'string' && csp !== '', 'the page is same-origin with the host, so a CSP is not optional')
+  assert.match(csp, /(?:^|;\s*)sandbox(?:\s|;|$)/, 'sandbox puts the document in an opaque origin')
+  assert.match(csp, /default-src 'none'/)
+  assert.match(csp, /script-src 'unsafe-inline'/, 'the design carries one inline script')
+  assert.match(csp, /style-src 'unsafe-inline'/, 'and one inline stylesheet')
+
+  const body = Buffer.from(await response.arrayBuffer())
+  assert.equal(body.length, expected.length, 'a served copy must not gain or lose a byte')
+  assert.equal(body.length, 58333, 'the copied design is the 58333-byte source file')
+  assert.deepEqual(body, expected)
+})
+
+test('the design is read from disk once and then served from memory', async () => {
+  let reads = 0
+  const bytes = Buffer.from('<!doctype html><p>design</p>', 'utf8')
+  const route = mod.createSecretaryViewRoute({
+    readFile: async () => {
+      reads += 1
+      return bytes
+    },
+  })
+
+  const first = await route.resource(new Request('http://127.0.0.1:3080' + DESIGN_PATH))
+  const second = await route.resource(new Request('http://127.0.0.1:3080' + DESIGN_PATH))
+  assert.equal(reads, 1, 'the second request must not touch the disk again')
+  assert.deepEqual(Buffer.from(await first.arrayBuffer()), bytes)
+  assert.deepEqual(Buffer.from(await second.arrayBuffer()), bytes)
+})
+
+test('a missing design file answers 404 with a plain explanation instead of throwing', async () => {
+  const calls = []
+  const route = mod.createSecretaryViewRoute({
+    readFile: async (...args) => {
+      calls.push(args)
+      throw new Error('ENOENT: no such file or directory')
+    },
+  })
+  // The query string cannot steer which file is read: the reader receives no request-derived
+  // argument at all, so there is no path to traverse.
+  const response = await route.resource(new Request('http://127.0.0.1:3080' + DESIGN_PATH + '?file=../../etc/passwd'))
+
+  assert.equal(response.status, 404, 'a missing file is a 404, never a crash or a fake 200')
+  assert.equal(response.headers.get('content-type'), 'text/plain; charset=utf-8')
+  assert.match(await response.text(), /secretary-view\.html/, 'the message names the file that is missing')
+  assert.deepEqual(calls, [[]], 'the reader takes no argument, so no request can steer the path')
+})
+
+test('a host without the webserver service still loads, and says the design route is skipped', () => {
+  const harness = fakeCtx({ services: { webServer: null } })
+  assert.doesNotThrow(() => mod.apply(harness.ctx, harness.config))
+  assert.ok(
+    harness.logs.warn.some((line) => line.includes('webServer')),
+    'the missing service is reported, not silently ignored',
+  )
 })
 
