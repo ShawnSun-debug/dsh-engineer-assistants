@@ -138,5 +138,5 @@ _Avoid_: 把它叫「自动提醒」——草稿不是消息，生成草稿一�
 
 ## 仓库基线（本蓝图新增）
 
-文档里凡出现提交号与用例数，以这一行为准，改动后请同步这一行：当前 HEAD `27e9e94`（`git rev-parse --short HEAD`），全量测试 `node --test --test-isolation=none` 为 573 个用例全绿（2026-11-06 实跑；这条命令比 `test/*.test.mjs` 多发现 `blueprint/test/pipeline.test.js` 的 9 个用例，只跑后者时为 564）。
+文档里凡出现提交号与用例数，以这一行为准，改动后请同步这一行：提交号一律用 `git rev-parse --short HEAD` 现读（本行写下时是 `025d778`），用例数分两条口径记：`npm test`（= `node --test "test/*.test.mjs"`，37 个文件）为 646 个用例全绿，裸全量 `node --test --test-isolation=none` 为 655 个用例全绿（2026-11-07 实跑，Node v24.21.0；裸全量多出的 9 个用例来自 `blueprint/test/pipeline.test.js`）。
 

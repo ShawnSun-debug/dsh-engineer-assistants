@@ -17,7 +17,7 @@
 
 ## Done
 
-1. **需求与规格链** / requirements.md 45 行（首行写明来自 2026-11-06 的六轮 /grill）、design-brief.md 34 行、spec.md 61 行含 28 条 user story；十张票 `issues/01`–`10` 全部 implemented / 证据：`Select-String -Path .scratch/master-secretary/issues/*.md -Pattern '^\*\*Status:'` 分组 = 10 × implemented。票在仓库外（`.scratch/master-secretary`，`git rev-parse --show-toplevel` = `D:/DSH orchestrator/repo`），克隆拿不到。
+1. **需求与规格链** / requirements.md 45 行（首行写明来自 2026-11-06 的六轮 /grill）、design-brief.md 34 行、spec.md 61 行含 28 条 user story；十张票 `issues/01`–`10` 全部 implemented / 证据：`Select-String -Path ..\.scratch\master-secretary\issues\*.md -Pattern '^\*\*Status:'` 分组 = 10 × implemented（2026-11-07 复跑确认，文件仍在）。票在仓库外：真实路径 `D:\DSH orchestrator\.scratch\master-secretary`，从仓库根看是 `..\.scratch\master-secretary`；**仓库根那个 `.scratch` 是空目录（0 项）**，拿它找证据会扑空。`git rev-parse --show-toplevel` = `D:/DSH orchestrator/repo`，上一级 `D:\DSH orchestrator` 本身不是 git 仓库，所以这些证据不进版本控制、克隆拿不到。
 2. **十张票实现与节拍接线** / 十二个 `lib/secretary-*.js`（registry / beat / watch / report / archive / diff / deliver / nudge / panel / constants / tools / authority）+ `index.js` 接线；`attachSecretary`（index.js:1114）在开关关时 :1115 直接返回，节拍挂载点 index.js:2465，一拍 180 s、封顶 7200 s（secretary-beat.js:17、:20）/ 证据：提交链 `1e97d92`（01–05）→`a22ce03`（06）→`2a85d1e`（07）→`cb3e31f`（08）→`e6f1729`（09）→`e17cd3a`（10）。
 3. **两轮硬化** / 纯读端点、规划首报可重试、删假字段、配置键对齐、登记表按 id 编辑 / 证据：`ee9f398`（9 文件 +480/−73）、`ae2ec15`（6 文件 +526/−151）。
 4. **常量收敛** / 新增 `lib/secretary-constants.js`（38 行）作类别名的单一来源 / 证据：`27e9e94`（12 文件 +164/−68）。
@@ -27,13 +27,14 @@
 8. **codec 修复（入参 wire 与 strict codec）** / `confirmDraft` / `discardDraft` 的参数必须带 `wire`、`source: 'json'`、`mode: 'strict'` 的 codec，否则 Gateway 报 `field undefined has no strict codec` 拒收 / 证据：`604e8f5`（3 文件 +189/−6），代码位 `client.js:2294–2361`。
 9. **设置页迁移** / 删掉 `RoutePicker` 与 `conversation.input.right` 注册，输入区只剩 `conversation.input.left` / `orchestrator-plan-toggle` / order 20（client.js:4742）；能力搬成整页 `OrchestratorSettingsSection`（client.js:2017），`settings.section` 注册在 client.js:4761–4778（id `orchestrator`、order 30、inject `{ scopes, orch, loadCatalog }`）/ 证据：`d567989`（2 文件 +341/−205）。
 10. **会话选择器与 Master 创建** / 设置页里列可登记会话、创建无工作区 Master 并写回 `secretaryMasterSessionId` / 证据：`61b5ce6`（7 文件 +1677/−13），测试 `test/secretary-sessions.test.mjs`。
-11. **设计稿重建与六块补齐** / EAC 项目 `14e7a682`、成品 `636039a9`（`secretary-view.html` r1、58333 字节、SHA256 `1B1119D349CFA41C756B1FFF0C640E4449DC6F5DAB0D4ABCE6F630F2FA4799E6`）按文字规格重建；依它补顶部状态条 `0a9d6da`（+459/−5）、可登记 + 时间线展开 `a9f49cf`（+631/−48）、设置页权限/模型 `664f8d8`（+219/−7）/ 证据：`eac_design_state` 实读 + `.scratch/master-secretary/v4-{overview,diff,settings}.png`（三张都是 1130×995，无头浏览器截的）。
+11. **设计稿重建与六块补齐** / EAC 项目 `14e7a682`、成品 `636039a9`（`secretary-view.html` r1、58333 字节、SHA256 `1B1119D349CFA41C756B1FFF0C640E4449DC6F5DAB0D4ABCE6F630F2FA4799E6`）按文字规格重建；依它补顶部状态条 `0a9d6da`（+459/−5）、可登记 + 时间线展开 `a9f49cf`（+631/−48）、设置页权限/模型 `664f8d8`（+219/−7）/ 证据：`eac_design_state` 实读 + `..\.scratch\master-secretary\v4-{overview,diff,settings}.png`（三张都是 1130×995，无头浏览器截的；2026-11-07 复读 PNG 头确认）。
 12. **npm test 修复** / 换成 `node --test "test/*.test.mjs"`，Node v24.21.0 下能跑 / 证据：`def1933`（1 行），`npm test` = 646 pass / 0 fail。
 13. **四次 PR 与合并提交** / 全部 `MERGED` 进 `fork/main`：#1 `0b67e35`（2026-11-06T17:50:48Z）、#2 `8200f22`（18:04:06Z）、#3 `e2893e6`（2026-11-07T05:01:53Z）、#4 `f38c98b`（05:37:05Z）/ 证据：`gh pr list --repo ShawnSun-debug/dsh-orchestrator --state all --json number,state,mergeCommit,mergedAt`。
+14. **CONTEXT.md 基线行纠正** / `CONTEXT.md:141` 整行替换成两条测试口径分开记（`npm test` = 646、裸全量 `node --test --test-isolation=none` = 655、差 9 个来自 `blueprint/test/pipeline.test.js`），HEAD 改成「用 `git rev-parse --short HEAD` 现读（写此行时 `025d778`）」而不是写死「当前 HEAD」——写死一次下次提交通行就过期 / 证据：`Select-String -Path CONTEXT.md -Pattern '573|564|27e9e94'` 命中 0（`MATCHES=0`）；`git diff --numstat CONTEXT.md` = `1\t1\tCONTEXT.md`；实跑 `npm test` 646 pass / 0 fail、`node --test --test-isolation=none` 655 pass / 0 fail、`blueprint/test/pipeline.test.js` 单独跑 9 pass（Node v24.21.0，2026-11-07）。两条改动（`CONTEXT.md` 1 行 + 本文件）随本次 `docs: fix the stale baseline and correct the scratch evidence paths` 一起入库，提交后工作树干净——所以别再把「未提交」当成当前状态。
 
 ## Next
 
-**1. 修 CONTEXT.md 的过期基线行（先做这条：它是文档里提交号与用例数的基准）。**
+**1. 修 CONTEXT.md 的过期基线行（先做这条：它是文档里提交号与用例数的基准）。** ✅ 已完成 2026-11-07，见 Done 14；下面留原始改法与验收供核对。
 
 - 文件：`CONTEXT.md:141`。定位命令 `Select-String -Path CONTEXT.md -Pattern '基线|HEAD'`，只命中一行。
 - 现状（本轮实读）：写的是「HEAD `27e9e94`」「573 个用例」「只跑后者时为 564」。
@@ -67,7 +68,7 @@
 
 1. **真机验收（用户必须自己点）**：宿主 GUI 里打开设置对话框与秘书视图，一次都没做过。证据：`check.mjs --load` 只证明宿主半侧加载，输出「已加载宿主半侧：0 项可用；注册了工具：dispatch」并提示 `secretary has no view file and no panel("secretary") registration`（面板是运行时按开关注册的，静态检查看不到）。判定口径：切进去不白屏、切走再切回状态还在、刷新页面后配置还在、`confirmDraft` 真的投递成功；任一项不成立按回归处理，回滚到 `604e8f5`。
 2. **是否把分支推 upstream**：现在 41 个代码提交全在 `fork`（外加这份文档的提交；本文件提交前 `fork/main` 与 `feat/master-session` 内容一致），`upstream/main` 停在 `95360de`（v0.7.1，比已合的 v0.7.0 新）。push 只推 fork，永不碰 upstream；推 upstream 必须由用户决定。
-3. **设计稿预览 URL 在本实例 404，要不要修 EAC 侧**：本轮实测 `http://127.0.0.1:3080/api/design/artifacts/636039a9-5080-4420-ade1-7090fcec4397/preview` = 404（body 9 字节）；同一条记录里的 `content`/`download` 路径是 EAC 自己的路由。视觉证据暂以 `.scratch` 三张 `v4-*.png` 与 r1.html 的 SHA256 为准，别把预览链接写成能打开的页面。
+3. **设计稿预览 URL 在本实例 404，要不要修 EAC 侧**：本轮实测 `http://127.0.0.1:3080/api/design/artifacts/636039a9-5080-4420-ade1-7090fcec4397/preview` = 404（body 9 字节）；同一条记录里的 `content`/`download` 路径是 EAC 自己的路由。视觉证据暂以 `..\.scratch\master-secretary` 三张 `v4-*.png` 与 r1.html 的 SHA256 为准，别把预览链接写成能打开的页面。
 4. **默认开关是否打开**：`secretaryEnabled` 默认 false（index.js:245），`secretaryWakeOnBlocked` 默认 false（index.js:284）。默认全关 = 卡住了没人知道，与「秘书」定位有张力；这是产品决策，不该由实现顺手改。
 
 ## Key facts
