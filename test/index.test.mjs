@@ -126,10 +126,11 @@ const HOST_TOOLS = [
   ...mod.DEFAULT_ALLOWED_TOOLS,
 ]
 
-/** What a whitelist hides out of `HOST_TOOLS`: everything it does not name, transport aside. */
-function hiddenOf(allowed) {
-  return HOST_TOOLS.filter((name) => name !== 'run_code' && !allowed.includes(name))
-}
+/**
+ * The model-facing table one request would carry: the host's `definitions()` after the
+ * plugin's wrapper. This is the half a model actually sees, next to the guard it runs into.
+ */
+const tableOf = (ctx, agent) => ctx.tools.definitions(agent).map((definition) => definition.name)
 
 /** A minimal ctx: only the members `apply` touches, each recording what it got.
  *  `enabled` and the live `allowedTools` are mutable so a test can flip the switch or the
@@ -154,6 +155,8 @@ function fakeCtx({
   const state = { enabled, allowed, memoryEnabled, panelEnabled, masterEnabled, secretaryEnabled, secretaryOrchestrators }
   const projections = []
   const tools = []
+  // Every call the plugin's tool-surface wrapper makes to the host's `definitions()`.
+  const definitionsCalls = []
   const handlers = new Map()
   // The options each subscription was made with: a lifecycle edge of a child is dispatched
   // with the child's parent as carrier, so the retry listener has to be registered global.
@@ -201,6 +204,12 @@ function fakeCtx({
       register(tool) {
         tools.push(tool)
         return () => {}
+      },
+      // The host's own tool surface. The plugin wraps exactly this method, so a test can
+      // read the table one request would carry.
+      definitions(scope, toolSet) {
+        definitionsCalls.push([scope, toolSet])
+        return catalogNames.map((name) => ({ name }))
       },
       // The context-global view the catalog reads: names plus an empty visible map.
       view: () => ({ knownNames: new Set(catalogNames), visible: new Map() }),
@@ -250,6 +259,7 @@ function fakeCtx({
     superviseEnabled: { get: () => true },
     superviseIntervalSeconds: { get: () => 600 },
     superviseMaxNoticesPerChild: { get: () => 3 },
+    superviseUnlimited: { get: () => state.unlimited === true },
     superviseNotifyOnNoProgress: { get: () => false },
     masterMemoryEnabled: { get: () => state.memoryEnabled },
     masterPanelEnabled: { get: () => state.panelEnabled },
@@ -265,6 +275,7 @@ function fakeCtx({
     state,
     projections,
     tools,
+    definitionsCalls,
     handlers,
     handlerOptions,
     effects,
@@ -306,6 +317,10 @@ function fakeAgent({ id = 'agent-1', depth, header = {}, hidden = [] } = {}) {
         },
         guard(fn) {
           guards.push(fn)
+          return () => {
+            const at = guards.indexOf(fn)
+            if (at !== -1) guards.splice(at, 1)
+          }
         },
         register(tool) {
           registered.push(tool)
@@ -386,33 +401,40 @@ test('a main agent gets the full rule and no scoped shadows', () => {
   assert.match(dispatch.description, /Main-agent rule: the main agent plans only/)
 })
 
-test('a panel refresh still re-masks main agents and leaves a child shadow in place', () => {
-  const main = maskAgent()
-  const child = maskAgent({ id: 'child-1', depth: 1 })
+test('a panel write reaches the main agent table and leaves a child shadow in place', () => {
+  const main = fakeAgent()
+  const child = fakeAgent({ id: 'child-1', depth: 1 })
   const childShadows = []
   child.agent.ctx.tools.register = (tool) => {
     childShadows.push(tool.name)
     return () => {}
   }
   const roots = () => [main.agent, child.agent]
-  const { handlers, created, state } = start({ agents: { get: () => undefined, roots } })
+  const { handlers, created, state, ctx } = start({ agents: { get: () => undefined, roots } })
   created({ agent: main.agent, source: 'create' })
   created({ agent: child.agent, source: 'startup' })
   assert.deepEqual(childShadows, ['dispatch'])
+  assert.equal(tableOf(ctx, main.agent).includes('read'), false)
   state.allowed = [...mod.DEFAULT_ALLOWED_TOOLS, 'read']
   handlers.get('loader/volatile-update')()
-  assert.equal(main.mask.has('read'), false, 'the main mask follows the panel write')
+  assert.equal(tableOf(ctx, main.agent).includes('read'), true, 'the main table follows the panel write')
   assert.deepEqual(childShadows, ['dispatch'], 'a refresh must not register anything else')
 })
 
-test('a main agent is masked and guarded, and only the shipped whitelist passes', () => {
-  const { created } = start()
+test('a main agent is offered the shipped whitelist and guarded, with no restriction at all', () => {
+  const { created, ctx } = start()
   const { agent, restricted, guards } = fakeAgent()
   created({ agent, source: 'create' })
-  // Whitelist-driven: every catalog name the shipped list does not cover is hidden, and
-  // `run_code` is never among them because `tools.restrict` refuses to hide the transport.
-  assert.deepEqual(restricted, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS))
-  assert.equal(restricted.includes('run_code'), false)
+  // Whitelist-driven, in two halves. The model-facing half is the tool surface: every host
+  // name the shipped list does not cover is gone from the request's table, and `run_code`
+  // survives because it is the PTC transport. The execution half is the guard.
+  const names = tableOf(ctx, agent)
+  for (const name of mod.DEFAULT_ALLOWED_TOOLS) assert.equal(names.includes(name), true, name)
+  for (const name of ['edit', 'read', 'subagent', 'mcp__demo__ping', 'bash', 'workflow']) {
+    assert.equal(names.includes(name), false, name)
+  }
+  assert.equal(names.includes('run_code'), true, 'the transport survives the filter')
+  assert.deepEqual(restricted, [], 'nothing is restricted: no tools/change, no mask storm')
   assert.equal(guards.length, 1)
   for (const name of mod.DEFAULT_ALLOWED_TOOLS) assert.equal(guards[0]({ name }), undefined, name)
   assert.match(guards[0]({ name: 'edit' }), /"edit" is not available to the main agent/)
@@ -465,10 +487,11 @@ test('the shipped whitelist is eleven planning tools, and every other name is re
     assert.match(allowGuard(shipped)({ name }), /is not available to the main agent/, name)
   }
 
-  const { created } = start()
+  const { created, ctx } = start()
   const { agent, restricted, guards } = fakeAgent()
   created({ agent, source: 'create' })
-  assert.equal(restricted.includes('compress'), false, 'compress is whitelisted, so not hidden')
+  assert.equal(tableOf(ctx, agent).includes('compress'), true, 'compress is whitelisted, so it stays on the table')
+  assert.deepEqual(restricted, [], 'the surface filters the table, so no restriction is needed')
   assert.equal(guards[0]({ name: 'compress' }), undefined, 'compress must pass the guard')
   for (const name of ['ops_bash', 'read', 'decompress']) {
     assert.match(guards[0]({ name }), /is not available to the main agent/, name)
@@ -477,10 +500,13 @@ test('the shipped whitelist is eleven planning tools, and every other name is re
 })
 
 test('a resumed agent with a parentSession but no depth is gated and warns', () => {
-  const { created, logs } = start()
+  const { created, logs, ctx } = start()
   const { agent, restricted, guards } = fakeAgent({ id: 'cold-child', header: { parentSession: 'root-session' } })
   created({ agent, source: 'resume' })
-  assert.deepEqual(restricted, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS))
+  assert.deepEqual(restricted, [], 'the gate masks nothing; the surface filters the table')
+  for (const name of ['edit', 'read', 'subagent']) {
+    assert.equal(tableOf(ctx, agent).includes(name), false, name)
+  }
   assert.equal(guards.length, 1)
   assert.equal(logs.warn.length, 1)
   assert.match(logs.warn[0], /cold-child/)
@@ -779,6 +805,42 @@ test('deliver refuses an unknown parent and degrades safely when the llm import 
   assert.equal(host.logs.filter((message) => /cannot load @deepseek-ai\/dsh-llm/.test(message)).length, 1)
 })
 
+test('the unlimited switch is declared off and read back by the live config after a write', async () => {
+  // The declaration: opt-in, volatile, so a settings write reaches the running plugin.
+  const { shape } = mod.Config
+  assert.ok(shape.superviseUnlimited, 'Config must declare the unlimited switch')
+  assert.equal(shape.superviseUnlimited.defaultValue, false, 'unlimited must stay off until it is turned on')
+  assert.equal(shape.superviseUnlimited.volatileFlag, true, 'a settings write must reach the running plugin')
+
+  // The live config: read on every scan, so the written value applies without a restart.
+  // A zero budget switched supervision off before the write; unlimited overrides it.
+  const calls = []
+  const parent = { id: 'p', session: {}, followup: (message) => calls.push(message) }
+  const child = { id: 'c', log: [] }
+  const host = fakeSupervisionHost({
+    parents: new Map([
+      ['p', parent],
+      ['c', child],
+    ]),
+    sessions: new Map([['c', child]]),
+    stateOf: () => ({}),
+  })
+  const config = { superviseUnlimited: false, superviseMaxNoticesPerChild: 0 }
+  const { supervisor } = mod.createSupervision({
+    ctx: host.ctx,
+    config,
+    loadLlm: async () => ({ createUserMessage: (input) => input }),
+  })
+  const started = 1_000_000
+  supervisor.track({ childId: 'c', parentId: 'p', startedAt: started })
+  await supervisor.tick(started + 600_000)
+  assert.equal(calls.length, 0, 'a zero budget with the switch off sends nothing')
+
+  config.superviseUnlimited = true
+  await supervisor.tick(started + 1_200_000)
+  assert.equal(calls.length, 1, 'the written switch is read on the next scan')
+})
+
 test('deliver queues exactly one notice with followup, never steer', async () => {
   const calls = { followup: [], steer: 0, flush: [] }
   const parent = {
@@ -815,116 +877,95 @@ test('deliver queues exactly one notice with followup, never steer', async () =>
 })
 
 /**
- * An agent whose deny mask is a real set with real disposers. `lifts` counts released
- * handles, so a refresh that leaks (or double-disposes) one is visible here.
+ * The model-facing table and the guard are the two halves of one whitelist. These four
+ * cases pin what a panel write, a switch flip and a disposal do to each: the table moves on
+ * the next request, the guard is installed once and unregistered with the agent, and no
+ * `tools.restrict` call happens along the way — that is what caused the `tools/change`
+ * storm dsh-ops reacted to.
  */
-function maskAgent({ id = 'agent-1', globals = HOST_TOOLS, depth, header = {} } = {}) {
-  const mask = new Set()
-  const counts = { restrict: 0, lift: 0 }
-  let guard
-  return {
-    mask,
-    counts,
-    getGuard: () => guard,
-    agent: {
-      id,
-      options: { provider: 'p', model: 'm', ...(depth === undefined ? {} : { subagentDepth: depth }) },
-      session: { header },
-      ctx: {
-        tools: {
-          restrict({ deny }) {
-            const [tool] = deny
-            if (!globals.includes(tool)) throw new Error('tools.restrict() names unknown global tool "' + tool + '"')
-            counts.restrict += 1
-            mask.add(tool)
-            let live = true
-            return () => {
-              if (!live) throw new Error('a restriction was disposed twice')
-              live = false
-              counts.lift += 1
-              mask.delete(tool)
-            }
-          },
-          guard(fn) {
-            guard = fn
-          },
-        },
-      },
-    },
-  }
-}
-
-test('a panel write re-applies the mask on every live main agent, in the open session', () => {
-  const main = maskAgent()
-  const child = maskAgent({ id: 'child-1', depth: 1 })
-  const { handlers, created, state } = start({ agents: { get: () => undefined, roots: () => [main.agent, child.agent] } })
+test('a panel write reaches an open session on the very next request, with no reinstall', () => {
+  const main = fakeAgent()
+  const { handlers, created, state, ctx } = start({ agents: { get: () => undefined, roots: () => [main.agent] } })
   created({ agent: main.agent, source: 'create' })
-  assert.equal(main.mask.has('read'), true)
-  assert.equal(child.mask.size, 0, 'a child is never gated')
+  assert.equal(tableOf(ctx, main.agent).includes('read'), false)
+  assert.equal(tableOf(ctx, main.agent).includes('ops_bash'), false)
 
   // The panel checks `read`: allowedTools gains it, then the loader announces the write.
   state.allowed = [...mod.DEFAULT_ALLOWED_TOOLS, 'read']
   const volatile = handlers.get('loader/volatile-update')
   assert.equal(typeof volatile, 'function', 'apply must subscribe to loader/volatile-update')
   volatile()
-  assert.equal(main.mask.has('read'), false, 'the next request sees the table without read')
-  assert.equal(main.mask.has('ops_bash'), true, 'every other name stays hidden')
-  assert.equal(child.mask.size, 0, 'a refresh must not touch a child')
+  assert.equal(tableOf(ctx, main.agent).includes('read'), true, 'the next request sees the table with read')
+  assert.equal(tableOf(ctx, main.agent).includes('ops_bash'), false, 'every other name stays filtered')
 
-  // Unchecking it again hides it again.
+  // Unchecking it again removes it again.
   state.allowed = mod.DEFAULT_ALLOWED_TOOLS
   volatile()
-  assert.equal(main.mask.has('read'), true)
+  assert.equal(tableOf(ctx, main.agent).includes('read'), false)
+  assert.deepEqual(main.restricted, [], 'no tools.restrict call, therefore no tools/change storm')
+  assert.equal(main.guards.length, 1, 'the guard was installed once and never rebuilt')
 })
 
-test('the enable switch flips every restriction in the open session through the same event', () => {
-  const main = maskAgent()
-  const { handlers, created, state } = start({ agents: { get: () => undefined, roots: () => [main.agent] } })
+test('the enable switch flips the whole table without re-installing anything', () => {
+  const main = fakeAgent()
+  const { created, state, ctx } = start({ agents: { get: () => undefined, roots: () => [main.agent] } })
   created({ agent: main.agent, source: 'create' })
-  const volatile = handlers.get('loader/volatile-update')
-  assert.equal(main.mask.size, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS).length)
+  assert.equal(tableOf(ctx, main.agent).includes('edit'), false)
 
   state.enabled = false
-  volatile()
-  assert.equal(main.mask.size, 0, 'off lifts every restriction')
-  assert.equal(main.getGuard()({ name: 'edit' }), undefined, 'and lets every call through')
+  assert.deepEqual(tableOf(ctx, main.agent), HOST_TOOLS, 'off hands the host table back untouched')
+  assert.equal(main.guards[0]({ name: 'edit' }), undefined, 'and lets every call through')
 
   state.enabled = true
-  volatile()
-  assert.equal(main.mask.size, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS).length, 'on restores the table')
-  assert.match(main.getGuard()({ name: 'edit' }), /not available to the main agent/)
+  assert.equal(tableOf(ctx, main.agent).includes('edit'), false, 'on filters the table again at once')
+  assert.match(main.guards[0]({ name: 'edit' }), /not available to the main agent/)
+  assert.deepEqual(main.restricted, [], 'the switch needs no restriction either')
 })
 
-test('a disposed agent releases its mask and is not refreshed afterwards', () => {
-  const main = maskAgent()
+test('a disposed agent releases its guard and is not gated again', () => {
+  const main = fakeAgent()
   const roots = [main.agent]
-  const { handlers, created, state } = start({ agents: { get: () => undefined, roots: () => roots } })
+  const { handlers, created } = start({ agents: { get: () => undefined, roots: () => roots } })
   created({ agent: main.agent, source: 'create' })
-  const volatile = handlers.get('loader/volatile-update')
   const disposed = handlers.get('agent/disposed')
   assert.equal(typeof disposed, 'function', 'apply must subscribe to agent/disposed')
+  assert.equal(main.guards.length, 1)
 
   disposed({ agent: main.agent })
-  assert.equal(main.mask.size, 0, 'the mask is lifted when the agent goes away')
-  assert.equal(main.counts.lift, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS).length)
+  assert.equal(main.guards.length, 0, 'the guard is unregistered with the agent')
 
   // A later write with the agent gone has nothing to reinstall.
   roots.length = 0
-  state.allowed = [...mod.DEFAULT_ALLOWED_TOOLS, 'read']
-  volatile()
-  assert.equal(main.mask.size, 0)
+  handlers.get('loader/volatile-update')()
+  assert.equal(main.guards.length, 0)
 })
 
-test('an agent created before the plugin mounted is gated on the first panel write', () => {
-  // The registry is the source of truth, so a missed creation hook self-heals.
-  const main = maskAgent({ id: 'pre-existing' })
-  const { handlers, state } = start({ agents: { get: () => undefined, roots: () => [main.agent] } })
-  const volatile = handlers.get('loader/volatile-update')
-  assert.equal(main.mask.size, 0)
+test('unloading the plugin hands the host its original tool table back', async () => {
+  const harness = start()
+  const { agent } = fakeAgent()
+  harness.created({ agent, source: 'create' })
+  assert.equal(tableOf(harness.ctx, agent).includes('edit'), false)
+
+  await unload(harness)
+  const names = tableOf(harness.ctx, agent)
+  assert.equal(names.includes('edit'), true, 'the wrapper is gone after unload')
+  assert.deepEqual(names, HOST_TOOLS)
+})
+
+test('an agent created before the plugin mounted is filtered at once and guarded on the next write', () => {
+  // The surface is one global wrapper, so the table is filtered without a creation hook.
+  // The guard is the execution-time half, and a settings write installs it for the roots
+  // the registry already knows.
+  const main = fakeAgent({ id: 'pre-existing' })
+  const { handlers, state, ctx } = start({ agents: { get: () => undefined, roots: () => [main.agent] } })
+  assert.equal(main.guards.length, 0, 'no guard yet: the hook never fired')
+  assert.equal(tableOf(ctx, main.agent).includes('edit'), false, 'the table is filtered anyway')
+
   state.allowed = [...mod.DEFAULT_ALLOWED_TOOLS, 'read']
-  volatile()
-  assert.equal(main.mask.has('edit'), true)
-  assert.equal(main.mask.has('read'), false)
+  handlers.get('loader/volatile-update')()
+  assert.equal(main.guards.length, 1, 'the missed creation hook self-heals')
+  assert.match(main.guards[0]({ name: 'edit' }), /not available to the main agent/)
+  assert.equal(tableOf(ctx, main.agent).includes('read'), true)
 })
 
 test('a refresh without agents.roots, or a broken registry, is not fatal', () => {
@@ -1925,13 +1966,13 @@ test('with the secretary switch off the master session gets the default gate, ex
   const { created, logs, handlers } = start()
   const { agent, restricted, guards } = masterAgent()
   created({ agent, source: 'create' })
-  assert.deepEqual(restricted, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS))
+  assert.deepEqual(restricted, [], 'the default gate no longer restricts: the surface filters the table')
   assert.equal(guards.length, 1)
   assert.match(guards[0]({ name: 'read' }), /is not available to the main agent/)
   assert.equal(logs.info.some((line) => line.includes('dispatch-command')), false)
   // A settings write while the switch is off must not claim anything either.
   handlers.get('loader/volatile-update')()
-  assert.deepEqual(restricted, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS))
+  assert.deepEqual(restricted, [], 'the default gate no longer restricts: the surface filters the table')
 })
 
 test('an unset master id designates nobody, even with the secretary switch on', () => {
@@ -1939,7 +1980,7 @@ test('an unset master id designates nobody, even with the secretary switch on', 
   harness.config.secretaryMasterSessionId = { get: () => '' }
   const { agent, restricted, guards } = masterAgent()
   harness.created({ agent, source: 'create' })
-  assert.deepEqual(restricted, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS))
+  assert.deepEqual(restricted, [], 'the default gate no longer restricts: the surface filters the table')
   assert.equal(guards.length, 1)
   assert.equal(harness.logs.info.some((line) => line.includes('dispatch-command')), false)
 })
@@ -1948,7 +1989,7 @@ test('a session that is not the master keeps the default gate while the switch i
   const harness = start({ secretaryEnabled: true })
   const { agent, restricted, guards } = fakeAgent({ id: 'someone-else' })
   harness.created({ agent, source: 'create' })
-  assert.deepEqual(restricted, hiddenOf(mod.DEFAULT_ALLOWED_TOOLS))
+  assert.deepEqual(restricted, [], 'the default gate no longer restricts: the surface filters the table')
   assert.equal(guards.length, 1)
   assert.equal(harness.logs.info.some((line) => line.includes('dispatch-command')), false)
 })
@@ -1967,7 +2008,7 @@ test('the designated master is handed to the authority: no default gate, reads s
   assert.match(guards[0]({ name: 'edit', arguments: {} }), /not available to the dispatch-command agent/)
 })
 
-test('cancelling the switch or re-designating the master reinstates the default gate', () => {
+test('cancelling the switch or re-designating the master swaps the claim for the default gate', () => {
   const agent = masterAgent()
   const harness = start({
     secretaryEnabled: true,
@@ -1975,19 +2016,50 @@ test('cancelling the switch or re-designating the master reinstates the default 
   })
   harness.created({ agent: agent.agent, source: 'create' })
   assert.equal(agent.masked().includes('read'), false, 'the authority mask leaves reads open')
+  assert.match(agent.guards[0]({ name: 'edit', arguments: {} }), /dispatch-command agent/)
 
-  // 开关关闭 = 取消调度指挥；交还时必须把默认闸门装回去，不能让它裸奔。
+  // 开关关闭 = 取消调度指挥；交还时必须把默认闸门装回去，不能让它裸奔。默认闸门只剩 guard
+  // （表由工具面裁），所以它拒绝 read，而它自己不再遮任何名字。
   harness.state.secretaryEnabled = false
   harness.handlers.get('loader/volatile-update')()
-  assert.ok(agent.masked().includes('read'), 'the default gate is back once the switch is off')
+  assert.deepEqual(agent.masked(), [], 'the default gate masks nothing: the surface filters the table')
+  assert.equal(agent.guards.length, 1, 'one guard at a time: the claim guard was unregistered')
+  assert.match(agent.guards[0]({ name: 'read', arguments: {} }), /not available to the main agent/)
 
   // 再打开是新的认领；换个指定则把旧 master 交还，同一条交还路径。
   harness.state.secretaryEnabled = true
   harness.handlers.get('loader/volatile-update')()
-  assert.equal(agent.masked().includes('read'), false, 'the authority claims it again')
+  assert.equal(agent.guards.length, 1)
+  assert.equal(agent.guards[0]({ name: 'read', arguments: {} }), undefined, 'the authority claims it again')
   harness.config.secretaryMasterSessionId = { get: () => 'someone-else' }
   harness.handlers.get('loader/volatile-update')()
-  assert.ok(agent.masked().includes('read'), 're-designating the master returns the default gate')
+  assert.equal(agent.guards.length, 1)
+  assert.match(agent.guards[0]({ name: 'read', arguments: {} }), /not available to the main agent/)
+  assert.deepEqual(agent.masked(), [])
+})
+
+test('the claimed master keeps the authority allow list on the table, not the default whitelist', () => {
+  // The authority's allow list is wider on purpose: reads stay open and every writer is
+  // refused by its mask and guard. Layering the default whitelist on top would drop the
+  // reads — a table the master's own guard would happily allow but the model never sees.
+  const harness = start({ secretaryEnabled: true, agents: { get: () => undefined, roots: () => [master.agent] } })
+  const master = masterAgent()
+  harness.created({ agent: master.agent, source: 'create' })
+  for (const name of ['read', 'grep', 'glob', 'dispatch', 'send_message', 'interrupt_agent']) {
+    assert.equal(tableOf(harness.ctx, master.agent).includes(name), true, name)
+  }
+
+  // A normal main agent still gets the shipped whitelist only.
+  const other = fakeAgent({ id: 'someone-else' })
+  harness.created({ agent: other.agent, source: 'create' })
+  assert.equal(tableOf(harness.ctx, other.agent).includes('read'), false)
+  assert.equal(tableOf(harness.ctx, other.agent).includes('dispatch'), true)
+
+  // Releasing the claim hands the same session back to the default whitelist, at once.
+  harness.state.secretaryEnabled = false
+  harness.handlers.get('loader/volatile-update')()
+  assert.equal(tableOf(harness.ctx, master.agent).includes('read'), false, 'released: the default whitelist is back')
+  assert.equal(tableOf(harness.ctx, master.agent).includes('dispatch'), true)
 })
 
 test('a disposed master is released without a fresh default gate on a dead agent', () => {

@@ -1293,6 +1293,34 @@ test('settings-page controls write the same config keys the composer panel wrote
   view.unmount()
 })
 
+test('the supervise zone offers the unlimited switch and flipping it writes superviseUnlimited', async () => {
+  const { view, scopes } = mountSettings()
+  await flush()
+
+  // The switch sits beside the interval field and carries its own addressable row.
+  const row = byTestId(view.tree, 'orchestrator-supervise-unlimited')
+  assert.ok(row, 'the supervise zone must render the unlimited switch')
+  const sw = nodes(row).find((node) => node.type === T.EnableSwitch)
+  assert.ok(sw, 'the row must hold a real switch, not a bare label')
+  // Off until the config literally says true, so an older profile keeps the old behaviour.
+  assert.equal(sw.props.checked, false)
+  assert.equal(sw.props.label, 'supervise.unlimitedLabel')
+
+  await sw.props.onChange(true)
+  assert.deepEqual(plain(scopes.orch.calls[0].ops), [{ op: 'set', path: ['superviseUnlimited'], value: true }])
+  assert.equal(scopes.orch.calls[0].expected, 1)
+  // The scope subscription carries the write back into the row.
+  const after = nodes(byTestId(view.tree, 'orchestrator-supervise-unlimited')).find(
+    (node) => node.type === T.EnableSwitch,
+  )
+  assert.equal(after.props.checked, true)
+
+  // Both dictionaries label it, so a language switch never shows a raw key.
+  assert.equal(T.zh['supervise.unlimitedLabel'], '无限巡检')
+  assert.equal(T.en['supervise.unlimitedLabel'], 'Unlimited checks')
+  view.unmount()
+})
+
 test('the settings page reports a failed catalog read instead of hiding the routes silently', async () => {
   const scopes = { main: fakeScope(), worker: fakeScope(), orch: fakeScope() }
   const view = mount(T.OrchestratorSettingsSection, {

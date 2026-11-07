@@ -206,6 +206,7 @@ function harness({ config: configOverrides = {} } = {}) {
     enabled: true,
     intervalSeconds: 600,
     maxNoticesPerChild: 3,
+    unlimited: false,
     notifyOnNoProgress: false,
     repeatThreshold: 3,
     noticeMaxChars: 2000,
@@ -333,7 +334,7 @@ test('several due children of one parent merge into one deliver call', async () 
   assert.match(h.deliveries[0].text, /第 1\/3 次/)
 })
 
-test('the per-child notice budget stops at three and then forgets the child', async () => {
+test('the per-child notice budget stops at three but keeps the child registered', async () => {
   const h = harness({ config: { notifyOnNoProgress: true } })
   h.add('c1')
   h.events.set('c1', [])
@@ -348,7 +349,15 @@ test('the per-child notice budget stops at three and then forgets the child', as
   h.advance(10 * 60_000)
   await h.sup.tick()
   assert.equal(h.deliveries.length, 3)
-  assert.equal(h.sup.size(), 0)
+  // The spent budget must not forget the child: raising it mid-run has to resume
+  // supervision of the worker that is still running.
+  assert.equal(h.sup.size(), 1)
+
+  h.config.maxNoticesPerChild = 5
+  h.advance(10 * 60_000)
+  await h.sup.tick()
+  assert.equal(h.deliveries.length, 4)
+  assert.match(h.deliveries[3].text, /第 4\/5 次/)
 })
 
 test('no new activity does not notify but still advances the deadline', async () => {
@@ -567,7 +576,7 @@ test('a higher repeatThreshold suppresses the loop warning', async () => {
   assert.equal(h.deliveries[0].text.includes('可能原地打转'), false)
 })
 
-test('maxNoticesPerChild=0 means unlimited notices', async () => {
+test('maxNoticesPerChild=0 turns supervision off but keeps the registry', async () => {
   const h = harness({ config: { notifyOnNoProgress: true, maxNoticesPerChild: 0 } })
   h.add('c1')
   h.events.set('c1', [])
@@ -576,10 +585,79 @@ test('maxNoticesPerChild=0 means unlimited notices', async () => {
     h.advance(10 * 60_000)
     await h.sup.tick()
   }
-  assert.equal(h.deliveries.length, 4)
+  assert.equal(h.deliveries.length, 0, 'a zero budget sends nothing')
+  assert.equal(h.sup.size(), 1, 'the running child stays registered')
+
+  // Raising the budget mid-run resumes supervision of that same child at once: the
+  // deadline was left in the past, so no extra interval has to elapse.
+  h.config.maxNoticesPerChild = 2
+  await h.sup.tick()
+  assert.equal(h.deliveries.length, 1)
+  assert.match(h.deliveries[0].text, /第 1\/2 次/)
+
+  // And turning the unlimited switch on resumes it too, without a denominator.
+  h.config.maxNoticesPerChild = 0
+  h.config.unlimited = true
+  h.advance(10 * 60_000)
+  await h.sup.tick()
+  assert.equal(h.deliveries.length, 2)
+  assert.match(h.deliveries[1].text, /第 2 次/)
+})
+
+test('unlimited ignores the notice cap and keeps reporting until the child ends', async () => {
+  const h = harness({ config: { unlimited: true, maxNoticesPerChild: 3 } })
+  h.add('c1')
+  h.events.set('c1', [])
+
+  // notifyOnNoProgress stays false: unlimited alone must keep the notices coming.
+  for (let i = 0; i < 6; i += 1) {
+    h.advance(10 * 60_000)
+    await h.sup.tick()
+  }
+  assert.equal(h.deliveries.length, 6)
   assert.equal(h.sup.size(), 1)
   assert.match(h.deliveries[0].text, /第 1 次/)
-  assert.match(h.deliveries[3].text, /第 4 次/)
+  assert.match(h.deliveries[5].text, /第 6 次/)
+  assert.equal(h.deliveries[5].text.includes('/3'), false, 'no denominator when unlimited')
+  assert.match(h.deliveries[5].text, /自上次巡检无新活动/)
+
+  // A child that stops is forgotten, which is what ends an unlimited run.
+  h.aliveChildren.delete('c1')
+  h.advance(10 * 60_000)
+  await h.sup.tick()
+  assert.equal(h.deliveries.length, 6)
+  assert.equal(h.sup.size(), 0)
+})
+
+test('unlimited overrides a zero budget', async () => {
+  const h = harness({ config: { unlimited: true, maxNoticesPerChild: 0 } })
+  h.add('c1')
+  h.events.set('c1', [])
+
+  for (let i = 0; i < 3; i += 1) {
+    h.advance(10 * 60_000)
+    await h.sup.tick()
+  }
+  assert.equal(h.deliveries.length, 3)
+  assert.match(h.deliveries[2].text, /第 3 次/)
+})
+
+test('turning unlimited off restores the per-child budget', async () => {
+  const h = harness({ config: { unlimited: true, maxNoticesPerChild: 2 } })
+  h.add('c1')
+  h.events.set('c1', [])
+
+  for (let i = 0; i < 3; i += 1) {
+    h.advance(10 * 60_000)
+    await h.sup.tick()
+  }
+  assert.equal(h.deliveries.length, 3)
+
+  h.config.unlimited = false
+  h.advance(10 * 60_000)
+  await h.sup.tick()
+  assert.equal(h.deliveries.length, 3, 'the spent budget now applies again')
+  assert.equal(h.sup.size(), 1, 'and the child is still registered')
 })
 
 test('two overlapping ticks produce only one notice', async () => {

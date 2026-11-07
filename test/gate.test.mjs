@@ -45,6 +45,7 @@ const refusal = (tool) =>
  */
 function fakeAgent({ globals = ['edit', 'write', 'str_replace_editor'], scope = [], guardError } = {}) {
   const restricted = []
+  const guardDisposers = []
   let recorded
   const agent = {
     id: 'main',
@@ -62,6 +63,13 @@ function fakeAgent({ globals = ['edit', 'write', 'str_replace_editor'], scope = 
         guard(fn) {
           if (guardError !== undefined) throw new Error(guardError)
           recorded = fn
+          const dispose = () => {
+            if (recorded === fn) recorded = undefined
+            const at = guardDisposers.indexOf(dispose)
+            if (at !== -1) guardDisposers.splice(at, 1)
+          }
+          guardDisposers.push(dispose)
+          return dispose
         },
         view() {
           return { knownNames: new Set(scope), visible: new Map() }
@@ -69,7 +77,7 @@ function fakeAgent({ globals = ['edit', 'write', 'str_replace_editor'], scope = 
       },
     },
   }
-  return { agent, restricted, getGuard: () => recorded }
+  return { agent, restricted, guardDisposers, getGuard: () => recorded }
 }
 
 // ---- effectiveAllowed ------------------------------------------------------------------
@@ -218,30 +226,33 @@ test('restrictEach keeps going after one name is refused and reports it in skipp
 
 // ---- installGate -----------------------------------------------------------------------
 
-test('installGate hides the catalog names outside the whitelist, run_code excepted', () => {
+/**
+ * The gate is the guard alone now: the model-facing table is cut per request by
+ * `installToolSurface` in `lib/tool-surface.js` (covered by `test/tool-surface.test.mjs`).
+ * A restriction here would announce `tools/change`, and dsh-ops reacts by hiding and
+ * re-installing the official `read`/`glob`/`grep`, so these tests pin that installGate
+ * never calls `restrict` and that the guard alone refuses what the whitelist leaves out.
+ */
+test('installGate installs the guard and never restricts a single tool', () => {
   const { agent, restricted, getGuard } = fakeAgent({ globals: HIDDEN })
-  const gate = installGate({ agent, allowed: () => ALLOWED, catalog: () => CATALOG, enabled: () => true })
-  assert.deepEqual(gate.applied, HIDDEN)
-  assert.deepEqual(restricted, HIDDEN)
-  assert.deepEqual(gate.skipped, [])
+  const gate = installGate({ agent, allowed: () => ALLOWED, enabled: () => true })
+  assert.deepEqual(restricted, [], 'the gate must not call tools.restrict')
   assert.equal(gate.guardError, undefined)
-  assert.equal(gate.applied.includes('run_code'), false, 'the transport is never restricted')
   assert.deepEqual(gate.allowed, ALLOWED)
 
   const guard = getGuard()
   for (const name of ALLOWED) assert.equal(guard({ name }), undefined, name)
   assert.equal(guard({ name: 'read' }), refusal('read'))
+  assert.equal(guard({ name: 'run_code', arguments: { code: 'return 1' } }), undefined, 'the transport stays callable')
 })
 
-test('installGate hides a scope-local tool through the guard when restrict refuses it', () => {
+test('the guard refuses a scope-local tool a restriction could never hide', () => {
   // `subagent` is registered in the agent's own scope, where `tools.restrict` throws; the
-  // tool therefore stays visible and only the guard can refuse it.
+  // tool therefore stays visible to the model and only the guard can refuse it.
   const { agent, restricted, getGuard } = fakeAgent({ globals: ['edit'], scope: ['subagent'] })
-  const gate = installGate({ agent, allowed: ALLOWED, catalog: ['edit'], enabled: () => true })
-  assert.deepEqual(gate.applied, ['edit'])
-  assert.deepEqual(restricted, ['edit'])
-  assert.equal(gate.skipped.length, 1)
-  assert.match(gate.skipped[0], /^subagent \(.*unknown global tool "subagent"/)
+  const gate = installGate({ agent, allowed: ALLOWED, enabled: () => true })
+  assert.deepEqual(restricted, [])
+  assert.deepEqual(gate.allowed, ALLOWED)
   assert.equal(getGuard()({ name: 'subagent' }), refusal('subagent'))
   assert.equal(getGuard()({ name: 'edit' }), refusal('edit'))
   for (const name of ALLOWED) assert.equal(getGuard()({ name }), undefined, name)
@@ -249,90 +260,48 @@ test('installGate hides a scope-local tool through the guard when restrict refus
 
 test('installGate reports a guard failure instead of throwing', () => {
   const { agent } = fakeAgent({ guardError: 'guard is not available here' })
-  const gate = installGate({ agent, allowed: [], catalog: ['edit'], enabled: () => true })
+  const gate = installGate({ agent, allowed: [], enabled: () => true })
   assert.equal(gate.guardError, 'guard is not available here')
-  assert.deepEqual(gate.applied, ['edit'])
+  assert.deepEqual(gate.allowed, [])
 })
 
-test('refresh rebuilds the mask when the whitelist moves, and is idempotent otherwise', () => {
+test('the whitelist and the switch are read per call, so neither needs a reinstall', () => {
   const { agent, restricted, getGuard } = fakeAgent({ globals: [...HIDDEN, 'read'] })
   let allowed = [...ALLOWED, 'read']
-  const gate = installGate({ agent, allowed: () => allowed, catalog: () => CATALOG, enabled: () => true })
-  assert.equal(gate.applied.includes('read'), false, 'a checked box is not hidden')
+  let on = true
+  const gate = installGate({ agent, allowed: () => allowed, enabled: () => on })
   assert.equal(getGuard()({ name: 'read' }), undefined)
 
-  // Un-checking `read` only rewrites the config; `refresh` is what the panel write triggers.
+  // A panel write only rewrites the config; the very next call already sees it.
   allowed = [...ALLOWED]
-  assert.equal(gate.refresh(), true)
-  assert.deepEqual(restricted.sort(), [...HIDDEN].sort())
   assert.equal(getGuard()({ name: 'read' }), refusal('read'))
 
-  // Unchanged list: one list comparison, nothing touched.
-  for (let index = 0; index < 5; index += 1) assert.equal(gate.refresh(), false)
-
-  // Re-checking it hides nothing again, and the guard lets it through at once.
-  allowed = [...ALLOWED, 'read']
-  assert.equal(gate.refresh(), true)
-  assert.equal(restricted.includes('read'), false)
-  assert.equal(getGuard()({ name: 'read' }), undefined)
-  assert.equal(getGuard()({ name: 'edit' }), refusal('edit'))
-})
-
-test('refresh picks up a tool that registered after the agent was created', () => {
-  // The registry stores the names a restriction was installed with, so a later MCP or
-  // plugin tool only gets hidden once the mask is replaced.
-  const { agent, restricted } = fakeAgent({ globals: [] })
-  let catalog = [...ALLOWED]
-  const gate = installGate({ agent, allowed: ALLOWED, catalog: () => catalog, enabled: () => true })
-  assert.deepEqual(gate.applied, [])
-  assert.deepEqual(restricted, [])
-
-  agent.ctx.tools.restrict = ({ deny }) => {
-    restricted.push(deny[0])
-    return () => {
-      const at = restricted.indexOf(deny[0])
-      if (at !== -1) restricted.splice(at, 1)
-    }
-  }
-  catalog = [...ALLOWED, 'mcp_custom_tool']
-  assert.equal(gate.refresh(), true)
-  assert.deepEqual(restricted, ['mcp_custom_tool'])
-})
-
-test('the switch being off lifts the mask and lets everything through', () => {
-  const { agent, restricted, getGuard } = fakeAgent({ globals: ['edit'] })
-  let on = false
-  const gate = installGate({ agent, allowed: ALLOWED, catalog: ['edit'], enabled: () => on })
-  assert.deepEqual(gate.applied, [])
-  assert.deepEqual(restricted, [])
-  assert.equal(getGuard()({ name: 'edit' }), undefined)
-
-  on = true
-  assert.equal(gate.refresh(), true)
-  assert.deepEqual(restricted, ['edit'])
-  assert.equal(getGuard()({ name: 'edit' }), refusal('edit'))
-
+  // The switch is read per call too: off lets every call through, on refuses again.
   on = false
-  assert.equal(gate.refresh(), true)
-  assert.deepEqual(restricted, [])
-  assert.equal(getGuard()({ name: 'edit' }), undefined, 'off lets every call through')
+  assert.equal(getGuard()({ name: 'read' }), undefined, 'off lets every call through')
+  assert.equal(getGuard()({ name: 'edit' }), undefined)
+  on = true
+  assert.equal(getGuard()({ name: 'edit' }), refusal('edit'))
+
+  // The returned snapshot is the list at install time, not a live view.
+  assert.deepEqual(gate.allowed, [...ALLOWED, 'read'])
+  assert.deepEqual(restricted, [], 'no restriction was ever installed along the way')
 })
 
-test('dispose lifts the mask and unregisters the guard', () => {
-  const { agent, restricted } = fakeAgent({ globals: ['edit', 'read'] })
-  const gate = installGate({ agent, allowed: ALLOWED, catalog: ['edit', 'read'], enabled: () => true })
-  assert.deepEqual(restricted, ['edit', 'read'])
+test('dispose unregisters the guard, and a second dispose is harmless', () => {
+  const { agent, guardDisposers } = fakeAgent({ globals: ['edit'] })
+  const gate = installGate({ agent, allowed: ALLOWED, enabled: () => true })
+  assert.equal(guardDisposers.length, 1)
   gate.dispose()
-  assert.deepEqual(restricted, [])
+  assert.equal(guardDisposers.length, 0, 'the guard handler is gone')
   gate.dispose()
-  assert.deepEqual(restricted, [], 'a second dispose must not re-run a lifted handle')
+  assert.equal(guardDisposers.length, 0, 'a second dispose must not touch a lifted guard')
 })
 
-test('an empty whitelist hides everything but refuses nothing extra by accident', () => {
+test('an empty whitelist refuses everything but the run_code transport', () => {
   const { agent, restricted, getGuard } = fakeAgent({ globals: ['edit'] })
-  const gate = installGate({ agent, allowed: [], catalog: ['edit', 'run_code'], enabled: () => true })
-  assert.deepEqual(gate.applied, ['edit'])
-  assert.deepEqual(restricted, ['edit'])
+  installGate({ agent, allowed: [], enabled: () => true })
+  assert.deepEqual(restricted, [])
   // `run_code` is transport, not a granted capability: a legal program still runs.
   assert.equal(getGuard()({ name: 'run_code', arguments: { code: 'return 1' } }), undefined)
   assert.equal(getGuard()({ name: DELEGATE_TOOL }), refusal(DELEGATE_TOOL))
@@ -347,7 +316,7 @@ test('an empty whitelist hides everything but refuses nothing extra by accident'
  */
 test('a run_code sub-dispatch is refused by name, exactly like a direct call', () => {
   const { agent, getGuard } = fakeAgent()
-  installGate({ agent, allowed: ALLOWED, catalog: CATALOG, enabled: () => true })
+  installGate({ agent, allowed: ALLOWED, enabled: () => true })
   const guard = getGuard()
   const nested = (name) => ({
     name,
@@ -366,7 +335,7 @@ test('a run_code sub-dispatch is refused by name, exactly like a direct call', (
 
 test('a refusal is decided before the body runs, so the nested call has no effect', () => {
   const { agent, getGuard } = fakeAgent()
-  installGate({ agent, allowed: ALLOWED, catalog: CATALOG, enabled: () => true })
+  installGate({ agent, allowed: ALLOWED, enabled: () => true })
   const guard = getGuard()
   const ran = []
   const dispatch = (exec) => {
@@ -460,22 +429,20 @@ test('a forked root keeps the gate: parentSession without a depth is not a child
 
 /**
  * A whitelist gate fails without an error: hand `installGate` the wrong argument name and
- * `allowed()` reads empty, which hides every tool but the transport and logs nothing. These
- * two assertions pin the exact end state, so that regression shows up as a red test instead
- * of a main agent that mysteriously has no tools.
+ * `allowed()` reads empty, so the guard refuses every tool but the transport and the tool
+ * surface offers an empty table — without a single log line. These two assertions pin the
+ * exact end state, so that regression shows up as a red test instead of a main agent that
+ * mysteriously has no tools.
  */
-test('an empty whitelist hides and refuses every host tool but the run_code transport', () => {
-  const host = ['dispatch', 'edit', 'write', 'read', 'subagent', 'run_code']
+test('an empty whitelist refuses every host tool but the run_code transport', () => {
   const { agent, restricted, getGuard } = fakeAgent({ globals: ['dispatch', 'edit', 'write', 'read'], scope: ['subagent'] })
-  const gate = installGate({ agent, allowed: [], catalog: host, enabled: () => true })
+  const gate = installGate({ agent, allowed: [], enabled: () => true })
 
-  // Every global name is hidden; `subagent` is scope-local, so only the guard reaches it.
-  assert.deepEqual(gate.applied.sort(), ['dispatch', 'edit', 'read', 'write'])
-  assert.deepEqual(restricted.sort(), ['dispatch', 'edit', 'read', 'write'])
-  assert.equal(gate.applied.includes('run_code'), false, 'the transport is never restricted')
   assert.equal(gate.allowed.length, 0)
+  assert.deepEqual(restricted, [], 'nothing is masked any more: the surface does the hiding')
 
   const guard = getGuard()
+  // `subagent` is scope-local, so it is only ever refused at call time — one rule for both.
   for (const name of ['dispatch', 'edit', 'write', 'read', 'subagent']) {
     assert.equal(guard({ name }), refusal(name), name)
   }
@@ -488,13 +455,11 @@ test('an empty whitelist hides and refuses every host tool but the run_code tran
 })
 
 test('a whitelist holding dispatch lets dispatch through and refuses edit and write', () => {
-  const host = ['dispatch', 'edit', 'write', 'read', 'run_code']
   const { agent, restricted, getGuard } = fakeAgent({ globals: ['dispatch', 'edit', 'write', 'read'] })
-  const gate = installGate({ agent, allowed: ['dispatch'], catalog: host, enabled: () => true })
+  const gate = installGate({ agent, allowed: ['dispatch'], enabled: () => true })
 
   assert.deepEqual(gate.allowed, ['dispatch'])
-  assert.deepEqual(gate.applied.sort(), ['edit', 'read', 'write'])
-  assert.deepEqual(restricted.sort(), ['edit', 'read', 'write'])
+  assert.deepEqual(restricted, [])
 
   const guard = getGuard()
   assert.equal(guard({ name: 'dispatch' }), undefined, 'the one whitelisted entry stays callable')
