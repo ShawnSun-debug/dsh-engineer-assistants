@@ -5,6 +5,7 @@ import vm from 'node:vm'
 import { z } from 'zod'
 import { WORKER_STATE } from '../lib/master-state.js'
 import { NOTIFY_SWITCHES } from '../lib/secretary-constants.js'
+import { DISPATCH_COMMAND } from '../lib/secretary-authority.js'
 
 const src = fs.readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
 
@@ -1203,7 +1204,7 @@ function mountSettings({
   return { view, scopes, groups }
 }
 
-test('the settings page has four zones and gives every control the scope it writes', async () => {
+test('the settings page has five zones and gives every control the scope it writes', async () => {
   const { view, scopes } = mountSettings()
   await flush()
   const tree = view.tree
@@ -1214,13 +1215,20 @@ test('the settings page has four zones and gives every control the scope it writ
   // the shim renders one component per mount, so the page tree holds its element, not its markup.
   // What the page owns is the order — the picker is the first zone and precedes every other one.
   const zones = nodes(tree).filter((node) => node.props?.['data-zone'] !== undefined)
-  assert.deepEqual(zones.map((zone) => zone.props['data-zone']), ['enable', 'routes', 'allowed', 'supervise'])
+  assert.deepEqual(zones.map((zone) => zone.props['data-zone']), ['enable', 'routes', 'allowed', 'supervise', 'permissions'])
   const kids = tree.kids
   const pickerAt = kids.findIndex((kid) => kid !== null && kid !== undefined && kid.type === T.SessionPicker)
   const enableAt = kids.findIndex((kid) => kid?.props?.['data-zone'] === 'enable')
   assert.ok(pickerAt >= 0, 'the page renders the picker')
   assert.ok(pickerAt < enableAt, 'the picker sits above every other zone')
-  for (const key of ['section.title', 'section.enable', 'section.routes', 'section.allowed', 'section.supervise']) {
+  for (const key of [
+    'section.title',
+    'section.enable',
+    'section.routes',
+    'section.allowed',
+    'section.supervise',
+    'section.permissions',
+  ]) {
     assert.equal(textOf(tree).includes(key), true, key)
   }
 
@@ -1299,6 +1307,84 @@ test('the settings page reports a failed catalog read instead of hiding the rout
   // No route rows without a catalog, but the switch, whitelist and interval stay usable.
   assert.equal(nodes(view.tree).some((node) => node.type === T.RouteRow), false)
   assert.ok(nodes(view.tree).some((node) => node.type === T.AllowedToolsPanel))
+  view.unmount()
+})
+
+test('the permissions zone names the dispatch-command level and its four read-only scopes', async () => {
+  // The level id is mirrored in the client bundle (it cannot import a server module); the
+  // server constant is the source of truth and the two must agree.
+  assert.equal(T.SECRETARY_AUTHORITY_LEVEL, DISPATCH_COMMAND)
+  assert.deepEqual(plain(T.SECRETARY_AUTHORITY_SCOPE_KEYS), [
+    'secretary.permissions.scopeNoWrite',
+    'secretary.permissions.scopeNoConfig',
+    'secretary.permissions.scopeNoSessionEdit',
+    'secretary.permissions.scopeRegisteredOnly',
+  ])
+
+  const scopes = { main: fakeScope(), worker: fakeScope(), orch: fakeScope() }
+  // Translate through the real Chinese dictionary: this is the case that proves the user sees
+  // 「调度指挥」 and the four scope sentences, not raw keys.
+  const view = mount(T.OrchestratorSettingsSection, {
+    t: (key) => T.zh[key] ?? key,
+    scopes,
+    orch: scopes.orch,
+    loadCatalog: async () => ({ ok: true, value: { groups: [] } }),
+    loadCandidates: async () => [],
+    createMaster: async () => ({ ok: false, error: 'not wired in this test' }),
+  })
+  await flush()
+
+  const zone = nodes(view.tree).find((node) => node.props?.['data-zone'] === 'permissions')
+  assert.ok(zone, 'the permissions zone must be rendered')
+  assert.match(textOf(zone), /权限与模型/, 'the zone heading is the section.permissions copy')
+  // The shim renders one component per mount, so the zone holds the child element; its own
+  // markup is asserted on a direct mount below.
+  const panel = nodes(zone).find((node) => node.type === T.AuthorityPanel)
+  assert.ok(panel, 'the permissions zone renders AuthorityPanel')
+  assert.equal(typeof panel.props.t, 'function')
+
+  const inner = mount(T.AuthorityPanel, { t: (key) => T.zh[key] ?? key })
+  const text = textOf(inner.tree)
+  // The level's name, the fixed id it stands for, and the one sentence explaining the level.
+  assert.match(text, /调度指挥/)
+  assert.match(text, /dispatch-command/)
+  assert.match(text, /Master 会话只读/)
+  assert.match(text, /不能写文件、不能改插件配置/)
+
+  // The four scope lines are constants, in the declared order, not editable rows.
+  const list = nodes(inner.tree).find((node) => node.props?.['data-list'] === 'secretary-authority-scope')
+  assert.ok(list, 'the scope list must be rendered')
+  const scopeLines = nodes(list)
+    .filter((node) => node.type === 'li')
+    .map((node) => node.kids[0])
+  assert.deepEqual(scopeLines, [
+    T.zh['secretary.permissions.scopeNoWrite'],
+    T.zh['secretary.permissions.scopeNoConfig'],
+    T.zh['secretary.permissions.scopeNoSessionEdit'],
+    T.zh['secretary.permissions.scopeRegisteredOnly'],
+  ])
+  assert.deepEqual(scopeLines, ['不能写文件', '不能改插件配置', '不能直接改 orchestrator 会话内容', '不能越出登记名单'])
+
+  // The model row is the pending line: no payload or config field names a model, so there are
+  // no choices to fake.
+  assert.match(text, /模型选择待接（当前跟随宿主默认）/)
+  assert.match(text, /跟随宿主默认模型/)
+  assert.equal(nodes(inner.tree).some((node) => node.type === 'select'), false)
+  assert.equal(nodes(inner.tree).some((node) => node.type === 'input'), false)
+  assert.equal(nodes(inner.tree).some((node) => node.type === 'button'), false)
+
+  // Display only: mounting and rendering the zone writes nothing.
+  for (const scope of [scopes.main, scopes.worker, scopes.orch]) {
+    assert.equal(scope.calls.length, 0)
+  }
+  // Both dictionaries carry the new keys, so a language switch never shows a raw key.
+  for (const key of ['section.permissions', ...plain(T.SECRETARY_AUTHORITY_SCOPE_KEYS), 'secretary.permissions.dispatch']) {
+    for (const dict of [T.zh, T.en]) {
+      assert.equal(typeof dict[key], 'string', key)
+      assert.ok(dict[key].length > 0, key)
+    }
+  }
+  inner.unmount()
   view.unmount()
 })
 
