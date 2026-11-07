@@ -1410,7 +1410,7 @@ function secretaryPayload(overrides = {}) {
 }
 
 /** Mount the panel over the hook shim; the scope is enabled unless a case says otherwise. */
-function mountSecretary({ payload = secretaryPayload(), loadState, scope, openSession, mutate, nudge } = {}) {
+function mountSecretary({ payload = secretaryPayload(), loadState, scope, openSession, mutate, nudge, loadCandidates } = {}) {
   return mount(mod.__test.SecretaryPanel, {
     t,
     orch: scope ?? fakeScope({ initial: { secretaryEnabled: true } }),
@@ -1418,6 +1418,7 @@ function mountSecretary({ payload = secretaryPayload(), loadState, scope, openSe
     openSession,
     mutate,
     nudge,
+    loadCandidates,
   })
 }
 
@@ -1867,6 +1868,150 @@ test('the panel hands the overview the nudge seam and its refresh re-reads the e
   view.unmount()
 })
 
+// ---- 可登记折叠区（票：可登记会话） -------------------------------------------------------
+/** One candidate row exactly as orchestratorSecretary/listCandidateSessions answers it. */
+const REGISTRABLE_CANDIDATE = (id, extra) => ({
+  sessionId: id,
+  title: '标题-' + id,
+  titleMissing: false,
+  cwd: 'D:\\ws',
+  live: true,
+  running: false,
+  updatedAt: 1_700_000_000_000,
+  parentSession: null,
+  delegationDepth: 0,
+  isMaster: false,
+  isOrchestrator: false,
+  ...(extra ?? {}),
+})
+
+test('the registrable fold lists only unregistered sessions and leaves out the master (why: a registered row would be a dead click)', async () => {
+  let reads = 0
+  const view = mount(T.SecretaryOverview, {
+    t,
+    width: 1200,
+    payload: secretaryPayload(),
+    loadCandidates: async () => {
+      reads += 1
+      return [
+        REGISTRABLE_CANDIDATE('s-1', { isOrchestrator: true }),
+        REGISTRABLE_CANDIDATE('m-1', { isMaster: true }),
+        REGISTRABLE_CANDIDATE('c-1', { running: true }),
+        REGISTRABLE_CANDIDATE('c-2', { title: '', titleMissing: true, cwd: null, live: false, running: false }),
+      ]
+    },
+  })
+  await flush()
+  assert.equal(reads, 1, 'the fold reads the candidate endpoint once when the view appears')
+
+  const fold = byTestId(view.tree, 'orchestrator-secretary-registrable')
+  assert.ok(fold, 'the fold sits at the top of the tracking tree')
+  assert.match(textOf(fold), /secretary\.registrable/)
+  assert.equal(byTestId(view.tree, 'orchestrator-secretary-registrable-s-1'), undefined, 'a registered row is not offered again')
+  assert.equal(byTestId(view.tree, 'orchestrator-secretary-registrable-m-1'), undefined, 'the Master is not registrable')
+
+  const c1 = byTestId(view.tree, 'orchestrator-secretary-registrable-c-1')
+  assert.match(textOf(c1), /标题-c-1/)
+  assert.match(textOf(c1), /D:\\ws/)
+  assert.match(textOf(c1), /sessions\.status\.running/)
+  const c2 = byTestId(view.tree, 'orchestrator-secretary-registrable-c-2')
+  assert.match(textOf(c2), /secretary\.untitled/, 'a missing title is named instead of left blank')
+  assert.match(textOf(c2), /sessions\.noWorkspace/)
+  assert.match(textOf(c2), /sessions\.status\.persisted/)
+
+  // The header collapses the region; aria-expanded is the state it reports.
+  const toggle = byTestId(view.tree, 'orchestrator-secretary-registrable-toggle')
+  assert.equal(toggle.props['aria-expanded'], true)
+  toggle.props.onClick()
+  assert.equal(byTestId(view.tree, 'orchestrator-secretary-registrable-toggle').props['aria-expanded'], false)
+  assert.equal(byTestId(view.tree, 'orchestrator-secretary-registrable-c-1'), undefined, 'a collapsed fold hides its rows')
+  byTestId(view.tree, 'orchestrator-secretary-registrable-toggle').props.onClick()
+  assert.ok(byTestId(view.tree, 'orchestrator-secretary-registrable-c-1'))
+  view.unmount()
+})
+
+test('an empty or unreadable candidate read still says what happened inside the fold', async () => {
+  const empty = mount(T.SecretaryOverview, {
+    t,
+    width: 1200,
+    payload: secretaryPayload(),
+    loadCandidates: async () => [REGISTRABLE_CANDIDATE('s-1', { isOrchestrator: true })],
+  })
+  await flush()
+  assert.match(
+    textOf(byTestId(empty.tree, 'orchestrator-secretary-registrable-empty')),
+    /secretary\.registrableEmpty/,
+    'nothing left to register is said out loud',
+  )
+  empty.unmount()
+
+  let calls = 0
+  const failing = mount(T.SecretaryOverview, {
+    t,
+    width: 1200,
+    payload: secretaryPayload(),
+    loadCandidates: async () => {
+      calls += 1
+      throw new Error('session endpoint down')
+    },
+  })
+  await flush()
+  const alert = byTestId(failing.tree, 'orchestrator-secretary-registrable-failed')
+  assert.ok(alert, 'a broken read is visible, never a blank fold')
+  assert.equal(alert.props.role, 'alert')
+  assert.match(textOf(alert), /sessions\.failed/)
+  byTestId(failing.tree, 'orchestrator-secretary-registrable-retry').props.onClick()
+  await flush()
+  assert.equal(calls, 2, 'the retry really re-reads the candidates')
+  failing.unmount()
+})
+
+test('registering a candidate stages a page-local draft and writes nothing', async () => {
+  const view = mount(T.SecretaryOverview, {
+    t,
+    width: 1200,
+    payload: secretaryPayload(),
+    loadCandidates: async () => [REGISTRABLE_CANDIDATE('c-1'), REGISTRABLE_CANDIDATE('c-2', { title: '' })],
+  })
+  await flush()
+  assert.equal(byTestId(view.tree, 'orchestrator-secretary-registrable-draft'), undefined, 'nothing staged yet')
+
+  const register = () => byTestId(view.tree, 'orchestrator-secretary-registrable-register-c-1')
+  assert.equal(register().props.disabled, false)
+  register().props.onClick()
+
+  const draft = byTestId(view.tree, 'orchestrator-secretary-registrable-draft')
+  assert.ok(draft, 'the click stages a draft instead of writing the config')
+  assert.match(textOf(draft), /标题-c-1/)
+  assert.match(textOf(draft), /secretary\.registrableDraftHint/, 'the draft says where it is really saved')
+  assert.ok(byTestId(view.tree, 'orchestrator-secretary-registrable-draft-c-1'), 'the staged row is listed by id')
+  assert.equal(register().props.disabled, true, 'a staged row cannot be staged twice')
+  assert.match(textOf(byTestId(view.tree, 'orchestrator-secretary-registrable-c-1')), /secretary\.staged/)
+
+  // A second click on the same row never duplicates the draft entry.
+  register().props.onClick()
+  const chips = nodes(view.tree).filter((node) =>
+    String(node.props?.['data-testid'] ?? '').startsWith('orchestrator-secretary-registrable-draft-'),
+  )
+  assert.equal(chips.length, 1)
+  // A row with no title still lands in the draft with the placeholder name.
+  byTestId(view.tree, 'orchestrator-secretary-registrable-register-c-2').props.onClick()
+  assert.match(
+    textOf(byTestId(view.tree, 'orchestrator-secretary-registrable-draft-c-2')),
+    /secretary\.untitled/,
+  )
+  view.unmount()
+})
+
+test('the panel hands the overview the candidate reader (why: the fold cannot exist on the settings endpoint alone)', async () => {
+  const view = mountSecretary({ loadCandidates: async () => [REGISTRABLE_CANDIDATE('c-1')] })
+  await flush()
+  const body = bodyOf(view.tree)
+  assert.equal(body.type, T.SecretaryOverview)
+  assert.equal(typeof body.props.loadCandidates, 'function')
+  view.unmount()
+})
+
 test('the blockers and the tracker rows come from the payload, not from the view', () => {
   const payload = secretaryPayload()
   const blockers = plain(T.secretaryBlockersOf(payload))
@@ -1939,6 +2084,101 @@ test('the history tab groups the newest report and lists the timeline (why: it r
   assert.match(textOf(timeline), /secretary\.reportKind\.delta/)
   assert.match(textOf(timeline), /r\/1\.md/)
   view.unmount()
+})
+
+test('a timeline row opens the report body and closes again by click, Enter and Space', () => {
+  const history = mount(T.SecretaryHistory, {
+    t,
+    payload: secretaryPayload({
+      reports: [
+        {
+          sessionId: 's-1',
+          at: 1_700_000_000_000,
+          kind: 'delta',
+          path: 'r/1.md',
+          content: '# 增量报告\n- 进度：第 3 步 / 共 5 步',
+          changes: { completed: [], blocked: [], flipped: [] },
+          error: null,
+        },
+        {
+          sessionId: 's-1',
+          at: 1_699_999_999_000,
+          kind: 'plan',
+          path: 'r/0.md',
+          changes: { completed: [], blocked: [], flipped: [] },
+          error: null,
+        },
+      ],
+    }),
+  })
+  const row = (index) => byTestId(history.tree, 'orchestrator-secretary-timeline-row-' + String(index))
+  const body = (index) => byTestId(history.tree, 'orchestrator-secretary-timeline-body-' + String(index))
+
+  // The row is a keyboard-reachable disclosure, closed to begin with.
+  assert.equal(row(0).props.role, 'button')
+  assert.equal(row(0).props.tabIndex, 0)
+  assert.equal(row(0).props['aria-expanded'], false)
+  assert.equal(body(0), undefined, 'a closed row renders no panel at all')
+
+  row(0).props.onClick()
+  assert.equal(row(0).props['aria-expanded'], true)
+  assert.match(textOf(body(0)), /进度：第 3 步 \/ 共 5 步/, 'the report content is shown inline')
+  assert.equal(body(0).props.id !== '', true)
+
+  // A second click closes it again; the state lives on the row, not in the DOM.
+  row(0).props.onClick()
+  assert.equal(row(0).props['aria-expanded'], false)
+  assert.equal(body(0), undefined)
+
+  // Enter and Space both toggle; any other key leaves the row alone.
+  row(0).props.onKeyDown({ key: 'Enter', preventDefault() {} })
+  assert.equal(row(0).props['aria-expanded'], true)
+  row(0).props.onKeyDown({ key: ' ', preventDefault() {} })
+  assert.equal(row(0).props['aria-expanded'], false)
+  row(0).props.onKeyDown({ key: 'Tab', preventDefault() {} })
+  assert.equal(row(0).props['aria-expanded'], false)
+
+  // Rows toggle independently: the second one stays closed while the first is open.
+  row(0).props.onClick()
+  assert.equal(row(1).props['aria-expanded'], false)
+  assert.equal(body(1), undefined)
+  history.unmount()
+})
+
+test('a report without a body shows its archive path and says where the full text lives', () => {
+  const bare = {
+    sessionId: 's-1',
+    at: 1,
+    kind: 'delta',
+    path: 'r/9.md',
+    changes: { completed: [], blocked: [], flipped: [] },
+    error: null,
+  }
+  const payload = secretaryPayload({
+    reports: [
+      bare,
+      { ...bare, at: 2, path: '', body: '正文来自 body 字段', kind: 'summary' },
+      { ...bare, at: 3, path: '' },
+    ],
+  })
+  const lines = plain(T.reportLinesOf(payload))
+  assert.equal(lines[0].content, '', 'a report without content keeps an empty body')
+  assert.equal(lines[1].content, '正文来自 body 字段', 'the body field is read as the content')
+
+  const history = mount(T.SecretaryHistory, { t, payload })
+  const row = (index) => byTestId(history.tree, 'orchestrator-secretary-timeline-row-' + String(index))
+  const body = (index) => byTestId(history.tree, 'orchestrator-secretary-timeline-body-' + String(index))
+
+  row(0).props.onClick()
+  assert.match(textOf(body(0)), /r\/9\.md/, 'the archive path is shown in the panel')
+  assert.match(textOf(body(0)), /secretary\.timelineNeedsArchive/, 'and the panel says the rest is on disk')
+
+  // A row that cannot even name a path still explains itself instead of opening a blank panel.
+  row(2).props.onClick()
+  assert.match(textOf(body(2)), /secretary\.reportPathNone/)
+  assert.match(textOf(body(2)), /secretary\.timelineNeedsArchive/)
+  assert.ok(textOf(body(2)).trim().length > 0, 'an expanded row is never empty')
+  history.unmount()
 })
 
 test('diffGroupsOf separates the writer shapes and keeps the unknown ones', () => {
