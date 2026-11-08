@@ -124,23 +124,35 @@ dsh plugin --profile desktop add SShiRkiT/dsh-orchestrator#main
 
 ---
 
+## 从旧版本手工迁移
+
+本版本删掉了旧的「调度模式」设置页与旧的汇报归档，**不做自动迁移**：升级后插件不会改写你的 profile，也不会搬动或删除磁盘上的旧文件。要手工做这几件事：
+
+1. **设置页缩小了，换了名字。** 插件仍在宿主设置对话框里占一个座位，但标题从「调度模式」改成「助手设置」，内容只剩三块：主代理工具白名单、子代理巡检、权限级别。旧「调度模式」的总开关、三行模型路由、Master / 登记选择器已删除。三行模型路由与秘书相关开关仍在秘书视图的「设置」页签里。
+2. **只留在 profile 里的开关。** `enabled`（调度模式总开关）没有界面了——它仍被工具闸门读取，要改就编辑 profile 里的插件 config；字段是 volatile，下一次读取即生效。白名单（`allowedTools`）与巡检的五个键（`superviseEnabled`、`superviseIntervalSeconds`、`superviseMaxNoticesPerChild`、`superviseUnlimited`、`superviseNotifyOnNoProgress`）在「助手设置」页里可改。
+3. **旧汇报归档不再读也不再写。** `<工作区>/.scratch/master-secretary/reports` 下的历史文件不会再被列出，也不会再产生新文件；插件不删除它们，是否清理由你自己决定。汇报改由右栏面板每三分钟产出一份；秘书视图的「差异与历史」页签只显示一行说明。
+4. **面板每行的类别来自角色预设。** 派发时施加了预设就写预设的 `category`，不再固定为 `code`；没有施加预设的 worker 行会写出「未施加预设」。
+5. **这些保持不变：** 秘书登记表（`secretaryMasterSessionId` / `secretaryOrchestrators`）、右栏面板端点、死页签清扫、新的三分钟汇报节拍。旧登记行不需要迁移。
+
+---
+
 ## 配置说明
 
-配置项均为 volatile（动态热配置），在面板中修改后立即生效，无需重启 DSH；例外是 master 层的两个安装型开关（`masterMemoryEnabled` / `masterSessionEnabled`），它们在插件挂载时读取，改动要重载插件：
+配置项均为 volatile（动态热配置），在「助手设置」页、秘书视图的设置页签或 profile 里修改后立即生效，无需重启 DSH；例外是 master 层的两个安装型开关（`masterMemoryEnabled` / `masterSessionEnabled`），它们在插件挂载时读取，改动要重载插件：
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
-| `enabled` | `true` | 调度模式总开关。关闭时立即对当前会话恢复主代理全部工具。 |
+| `enabled` | `true` | 调度模式总开关。关闭时立即对当前会话恢复主代理全部工具。**本版起没有界面，只能在 profile 里改。** |
 | `workerProvider` / `workerModel` | `""` | 子代理默认模型路由（必填，未配置时派发直接报错，绝不静默继承主代理模型）。 |
 | `workerReasoningEffort` | `""` | 子代理思考强度，留空则由所选模型自行决定默认值。 |
 | `reviewProvider` / `reviewModel` | `""` | 评审者路由。两项都填才覆盖，否则整体跟随子代理路由——不做半套拼路由。 |
 | `reviewReasoningEffort` | `""` | 评审者思考强度，留空由所选模型决定。 |
-| `lastReview` | `""` | 最近一次评审的 `{ verdict, target, at }` 摘要，由插件写入、面板只读。 |
-| `allowedTools` | 11 项内置白名单 | 白名单式驱动：主代理仅可使用列表内的工具，其余宿主/MCP/插件工具自动隐藏并禁用；面板右侧 Allowed Tools 可直接勾选放行或取消勾选禁用，下一条消息即刻生效。 |
+| `lastReview` | `""` | 最近一次评审的 `{ verdict, target, at }` 摘要，由插件写入，只读。 |
+| `allowedTools` | 11 项内置白名单 | 白名单式驱动：主代理仅可使用列表内的工具，其余宿主/MCP/插件工具自动隐藏并禁用；在「助手设置」页的 Allowed Tools 里勾选即改这个键，下一条消息生效。 |
 | `superviseEnabled` | `true` | 子代理后台巡检总开关。 |
 | `superviseIntervalSeconds` | `600` | 巡检间隔（秒），范围 10–86400，运行中修改立即生效。 |
 | `superviseMaxNoticesPerChild` | `3` | 每个子代理最多发送几次巡检通知（0–20；`0` 关闭巡检，除非同时打开 `superviseUnlimited`）。 |
-| `superviseUnlimited` | `false` | 打开后忽略上面的次数上限，一直巡检到子代理停止、交付或结束；设置页的「无限巡检」开关写的就是这个键。 |
+| `superviseUnlimited` | `false` | 打开后忽略上面的次数上限，一直巡检到子代理停止、交付或结束；「助手设置」页的「无限巡检」开关写的就是这个键。 |
 | `superviseNotifyOnNoProgress` | `false` | 子代理日志无新活动时是否仍然发送通知。 |
 | `masterMemoryEnabled` | `false` | AI 记忆层：打开存储域并注入紧凑索引。**挂载时读取**，改动需重载插件。 |
 | `masterPanelEnabled` | `false` | Master 状态面板。关闭时按钮不渲染，服务端端点只返回空投影。 |
@@ -148,7 +160,7 @@ dsh plugin --profile desktop add SShiRkiT/dsh-orchestrator#main
 | `masterMessagingEnabled` | `false` | 跨会话消息开关。逐次读取；关闭时投递以 `disabled` 拒绝，不碰接收方。 |
 | `masterInboundPolicy` | `accept` | 入站策略：`accept` / `hold` / `refuse`；未知值判 `unknown-policy` 拒绝，不悄悄当成 `accept`。 |
 
-> 注：主代理的默认模型保存在宿主的 `agent-default-model` 中，由同一个「调度模式」面板直接读写，对新创建的会话生效；子代理模型改动从下一次委派起立即生效。
+> 注：主代理的默认模型保存在宿主的 `agent-default-model` 中，在秘书视图的「设置」页签里直接读写，对新创建的会话生效；子代理模型改动从下一次委派起立即生效。
 
 ## License
 

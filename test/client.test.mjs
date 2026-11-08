@@ -143,15 +143,6 @@ function nodes(tree, out = []) {
   return out
 }
 
-function mountField(scope) {
-  const view = mount(mod.__test.SuperviseIntervalField, { scope, t })
-  return {
-    view,
-    input: () => nodes(view.tree).find((node) => node.type === 'input'),
-    alert: () => nodes(view.tree).find((node) => node.props?.role === 'alert'),
-  }
-}
-
 let mod
 const timers = []
 // 清扫的定时器走 setInterval；测试手动打一拍，别让真实时间参与。
@@ -203,6 +194,30 @@ vm.runInNewContext(src, {
 })
 const T = mod.__test
 const t = (k) => k
+function mountField(scope) {
+  const view = mount(mod.__test.SuperviseIntervalField, { scope, t })
+  return {
+    view,
+    input: () => nodes(view.tree).find((node) => node.type === 'input'),
+    alert: () => nodes(view.tree).find((node) => node.props?.role === 'alert'),
+  }
+}
+
+/** 巡检「每次上限」字段：与间隔共用同一个组件，只是 setting / keys / testid 不同。 */
+function mountMaxNoticesField(scope) {
+  const view = mount(mod.__test.SuperviseIntervalField, {
+    scope,
+    t,
+    setting: mod.__test.MAX_NOTICES,
+    keys: { label: 'supervise.maxLabel', hint: 'supervise.maxHint', invalid: 'supervise.maxInvalid' },
+    testid: 'orchestrator-supervise-max',
+  })
+  return {
+    view,
+    input: () => nodes(view.tree).find((node) => node.type === 'input'),
+    alert: () => nodes(view.tree).find((node) => node.props?.role === 'alert'),
+  }
+}
 // Values built inside the vm context have another Object.prototype; compare them as plain JSON.
 const plain = (v) => JSON.parse(JSON.stringify(v))
 
@@ -351,109 +366,6 @@ test('saveRoute surfaces a rejected write and a write that did not land', async 
   assert.equal(await T.saveRoute(dropped, T.MAIN.fields, { provider: 'p', model: 'm', effort: '' }, t), 'route.saveFailed')
 })
 
-test('apply leaves only the plan toggle in the composer, registers the settings page, and keeps the secretary seats', () => {
-  const regs = []
-  const ctx = {
-    effect: (fn) => fn(),
-    locale: { register: () => {}, bind: () => (key) => key },
-    configForms: { get: (ns) => ({ ns }) },
-    remote: {
-      commands: { execute: async () => ({ ok: true, value: 'x' }) },
-      session: { modelCatalog: async () => ({ ok: true, value: { groups: [] } }) },
-    },
-    get: () => undefined,
-    slots: { inject: (_n, cb) => cb(), register: (opts, comp) => regs.push({ opts, comp }) },
-  }
-  mod.apply(ctx)
-  assert.deepEqual(regs.map((r) => [r.opts.name, r.opts.id, r.opts.order]), [
-    // The composer keeps one plugin control: the plan toggle. The dispatch entry point and
-    // its whitelist panel moved into the settings page, so nothing targets input.right.
-    ['conversation.input.left', 'orchestrator-plan-toggle', 20],
-    ['settings.section', 'orchestrator', 30],
-    // The secretary view: one keyless-identity registration into the main seat, then the sidebar
-    // row that selects it by the same id.
-    ['main', undefined, undefined],
-    ['sidebar.panellist', 'secretary', 40],
-  ])
-  // Ticket 10 retired the legacy master panel: no slot carries its id any more.
-  assert.equal(regs.some((r) => r.opts.id === 'orchestrator-master-panel'), false)
-  assert.deepEqual(
-    regs.filter((r) => r.opts.id === 'secretary' || r.opts.key === 'secretary').map((r) => r.opts.name),
-    ['main', 'sidebar.panellist'],
-  )
-  // The composer's plugin controls are down to the plan toggle: the route picker and the
-  // allowed-tools column no longer register anywhere in the input area.
-  const composer = regs.filter((r) => String(r.opts.name).startsWith('conversation.input.'))
-  assert.deepEqual(
-    composer.map((r) => [r.opts.name, r.opts.id]),
-    [['conversation.input.left', 'orchestrator-plan-toggle']],
-  )
-  assert.equal(regs.some((r) => r.opts.name === 'conversation.input.right'), false)
-  assert.equal(regs.some((r) => r.opts.id === 'orchestrator-route-picker'), false)
-
-  // The settings section registration follows the host contract: list-slot identity in
-  // `id` (the key the nav selects), a locale-following `label` thunk, and its own inject face.
-  const settings = regs.find((r) => r.opts.name === 'settings.section')
-  assert.equal(settings.opts.id, 'orchestrator')
-  assert.equal(settings.opts.order, 30)
-  assert.equal(settings.opts.locale, 'orchestrator')
-  assert.equal(settings.opts.label(), 'section.title')
-  assert.equal(settings.comp, T.OrchestratorSettingsSection)
-  const pageProps = settings.opts.inject()
-  assert.deepEqual(
-    [pageProps.scopes.main.ns, pageProps.scopes.worker.ns, pageProps.scopes.orch.ns],
-    ['agent-default-model', 'orchestrator', 'orchestrator'],
-  )
-  assert.equal(pageProps.orch, pageProps.scopes.orch)
-  assert.equal(typeof pageProps.loadCatalog, 'function')
-  // The session picker's two endpoint calls are wired by the same injection: without them the
-  // section would render but every button would be inert.
-  assert.equal(typeof pageProps.loadCandidates, 'function')
-  assert.equal(typeof pageProps.createMaster, 'function')
-  assert.deepEqual(plain(mod.inject), [
-    'slots',
-    'locale',
-    'remote',
-    'remote.commands',
-    'remote.session',
-    'configForms',
-    'layout',
-    'uiWorkspace',
-  ])
-})
-
-test('filterGroups matches provider names wholesale and model ids or names otherwise', () => {
-  const groups = [
-    {
-      id: 'nexus-deepseek',
-      name: 'Nexus DeepSeek',
-      models: [
-        { id: 'deepseek-v4.1-flash', name: 'Flash' },
-        { id: 'deepseek-v4.1-pro', name: 'Pro' },
-      ],
-    },
-    { id: 'nexus-claude', name: 'Nexus Claude', models: [{ id: 'claude/opus:5.5', name: 'Opus 5.5' }] },
-  ]
-  assert.equal(plain(T.filterGroups(groups, '   ')).length, 2)
-  // A provider hit keeps every model that provider offers.
-  const byProvider = plain(T.filterGroups(groups, 'claude'))
-  assert.deepEqual(byProvider.map((g) => g.id), ['nexus-claude'])
-  assert.equal(byProvider[0].models.length, 1)
-  // A model hit keeps only the matching models and drops providers left empty.
-  const byModel = plain(T.filterGroups(groups, 'PRO'))
-  assert.deepEqual(byModel.map((g) => g.id), ['nexus-deepseek'])
-  assert.deepEqual(byModel[0].models.map((m) => m.id), ['deepseek-v4.1-pro'])
-  // Display names count too, and nothing matching is an empty catalog, not the full one.
-  assert.deepEqual(plain(T.filterGroups(groups, 'opus')).map((g) => g.id), ['nexus-claude'])
-  assert.deepEqual(plain(T.filterGroups(groups, 'zzz')), [])
-})
-
-
-test('countModels sums the models each provider offers', () => {
-  assert.equal(T.countModels([]), 0)
-  assert.equal(T.countModels([{ models: [{ id: 'a' }, { id: 'b' }] }, { models: [{ id: 'c' }] }]), 3)
-})
-
 test('the supervision interval field shows the stored value, or 600 when it is absent or malformed', () => {
   const cases = [
     [{}, '600'],
@@ -569,6 +481,68 @@ test('the interval field follows a value changed elsewhere', () => {
   const field = mountField(scope)
   scope.externalSet({ superviseIntervalSeconds: 1200 })
   assert.equal(field.input().props.value, '1200')
+})
+
+test('apply leaves only the plan toggle in the composer, registers the smaller settings page, and keeps the secretary seats', () => {
+  const regs = []
+  const ctx = {
+    effect: (fn) => fn(),
+    locale: { register: () => {}, bind: () => (key) => key },
+    configForms: { get: (ns) => ({ ns }) },
+    remote: {
+      commands: { execute: async () => ({ ok: true, value: 'x' }) },
+      session: { modelCatalog: async () => ({ ok: true, value: { groups: [] } }) },
+    },
+    get: () => undefined,
+    slots: { inject: (_n, cb) => cb(), register: (opts, comp) => regs.push({ opts, comp }) },
+  }
+  mod.apply(ctx)
+  assert.deepEqual(regs.map((r) => [r.opts.name, r.opts.id, r.opts.order]), [
+    // The composer keeps one plugin control: the plan toggle.
+    ['conversation.input.left', 'orchestrator-plan-toggle', 20],
+    // 票 15：设置页座位保留（内容只剩白名单 / 巡检 / 权限），标题走新键。
+    ['settings.section', 'orchestrator', 30],
+    // The secretary view: one keyless-identity registration into the main seat, then the sidebar
+    // row that selects it by the same id.
+    ['main', undefined, undefined],
+    ['sidebar.panellist', 'secretary', 40],
+  ])
+  // Ticket 10 retired the legacy master panel: no slot carries its id any more.
+  assert.equal(regs.some((r) => r.opts.id === 'orchestrator-master-panel'), false)
+  assert.deepEqual(
+    regs.filter((r) => r.opts.id === 'secretary' || r.opts.key === 'secretary').map((r) => r.opts.name),
+    ['main', 'sidebar.panellist'],
+  )
+  // The settings seat is back, but its page is the smaller one: new title key, one config scope.
+  const settings = regs.find((r) => r.opts.name === 'settings.section')
+  assert.equal(settings.opts.id, 'orchestrator')
+  assert.equal(settings.opts.order, 30)
+  assert.equal(settings.opts.locale, 'orchestrator')
+  assert.equal(settings.opts.label(), 'assistant.settings.title')
+  assert.equal(settings.comp, T.AssistantSettingsSection)
+  assert.deepEqual(Object.keys(settings.opts.inject()), ['orch'])
+  // The old dispatch-mode page is still gone: no enable switch, no routes, no Master picker in it.
+  for (const symbol of ['section.title', 'route.enable', 'SessionPicker', 'OrchestratorSettingsSection']) {
+    assert.equal(src.includes(symbol), false, symbol + ' must stay deleted')
+  }
+  // The composer's plugin controls are down to the plan toggle.
+  const composer = regs.filter((r) => String(r.opts.name).startsWith('conversation.input.'))
+  assert.deepEqual(
+    composer.map((r) => [r.opts.name, r.opts.id]),
+    [['conversation.input.left', 'orchestrator-plan-toggle']],
+  )
+  assert.equal(regs.some((r) => r.opts.name === 'conversation.input.right'), false)
+  assert.equal(regs.some((r) => r.opts.id === 'orchestrator-route-picker'), false)
+  assert.deepEqual(plain(mod.inject), [
+    'slots',
+    'locale',
+    'remote',
+    'remote.commands',
+    'remote.session',
+    'configForms',
+    'layout',
+    'uiWorkspace',
+  ])
 })
 
 // ---- Allowed tools ------------------------------------------------------------------
@@ -1015,6 +989,138 @@ test('a catalog that reads empty mid-write does not collapse the panel to the sh
   assert.equal(names().includes('mcp__demo__ping'), false)
 })
 
+// ---- 最小设置页（票 15 恢复） ------------------------------------------------------------
+
+test('the smaller settings page keeps three zones: whitelist, supervision, read-only authority', async () => {
+  const scope = fakeScope({
+    initial: { superviseEnabled: false, superviseUnlimited: true, superviseNotifyOnNoProgress: false },
+  })
+  const view = mount(T.AssistantSettingsSection, { t, orch: scope })
+  const tree = view.tree
+  assert.match(textOf(tree), /assistant\.settings\.title/)
+  const zones = nodes(tree)
+    .map((node) => node.props?.['data-zone'])
+    .filter((zone) => typeof zone === 'string')
+  assert.deepEqual(zones, ['allowed', 'supervise', 'permissions'])
+  assert.ok(nodes(tree).some((node) => node.type === T.AllowedToolsPanel), 'the whitelist panel is rendered')
+  assert.ok(nodes(tree).some((node) => node.type === T.AuthorityPanel), 'the read-only authority panel is rendered')
+
+  // 间隔与「每次上限」是同一个组件、两个 setting：键不同，写入目标就不同。
+  const fields = nodes(tree).filter((node) => node.type === T.SuperviseIntervalField)
+  assert.equal(fields.length, 2)
+  assert.deepEqual(
+    fields.map((node) => (node.props.setting ?? T.INTERVAL).key),
+    ['superviseIntervalSeconds', 'superviseMaxNoticesPerChild'],
+    'same component, two config keys',
+  )
+
+  // 三个巡检开关：每个只写自己那个配置键，且显示的是存储值。
+  const switches = [
+    ['orchestrator-supervise-enabled', 'superviseEnabled', false],
+    ['orchestrator-supervise-unlimited', 'superviseUnlimited', true],
+    ['orchestrator-supervise-no-progress', 'superviseNotifyOnNoProgress', false],
+  ]
+  for (const [testid, key, checked] of switches) {
+    const row = byTestId(tree, testid)
+    assert.ok(row, testid + ' is rendered')
+    const sw = nodes(row).find((node) => node.type === T.EnableSwitch)
+    assert.ok(sw, testid + ' renders the switch')
+    assert.equal(sw.props.checked, checked, testid + ' shows the stored value')
+    sw.props.onChange(!checked)
+  }
+  await flush()
+  assert.deepEqual(
+    plain(scope.calls.map((call) => call.ops[0].path[0])),
+    switches.map((entry) => entry[1]),
+  )
+  assert.deepEqual(
+    plain(scope.calls.map((call) => call.ops[0].value)),
+    switches.map((entry) => !entry[2]),
+  )
+  view.unmount()
+})
+
+test('the max-notices field writes superviseMaxNoticesPerChild and rejects out-of-range input', async () => {
+  const scope = fakeScope({ initial: { superviseMaxNoticesPerChild: 5 } })
+  const field = mountMaxNoticesField(scope)
+  assert.equal(field.input().props.value, '5')
+  assert.equal(field.input().props['data-testid'], 'orchestrator-supervise-max')
+
+  field.input().props.onChange({ target: { value: '21' } })
+  await field.input().props.onBlur()
+  assert.equal(scope.calls.length, 0, 'out of range writes nothing')
+  assert.match(field.alert().kids[0], /supervise\.maxInvalid/)
+
+  field.input().props.onChange({ target: { value: '7' } })
+  await field.input().props.onBlur()
+  assert.deepEqual(plain(scope.calls[0].ops), [{ op: 'set', path: ['superviseMaxNoticesPerChild'], value: 7 }])
+  assert.equal(scope.calls[0].expected, 1)
+  field.view.unmount()
+})
+
+test('the permissions zone names the dispatch-command level and its four read-only scopes', () => {
+  // 级别的 id 镜像在客户端 bundle 里（不能 import 服务端模块）；服务端常量是真源，两边必须一致。
+  assert.equal(T.SECRETARY_AUTHORITY_LEVEL, DISPATCH_COMMAND)
+  assert.deepEqual(plain(T.SECRETARY_AUTHORITY_SCOPE_KEYS), [
+    'secretary.permissions.scopeNoWrite',
+    'secretary.permissions.scopeNoConfig',
+    'secretary.permissions.scopeNoSessionEdit',
+    'secretary.permissions.scopeRegisteredOnly',
+  ])
+
+  const inner = mount(T.AuthorityPanel, { t: (key) => T.zh[key] ?? key })
+  const text = textOf(inner.tree)
+  assert.match(text, /调度指挥/)
+  assert.match(text, /dispatch-command/)
+  assert.match(text, /Master 会话只读/)
+  const list = nodes(inner.tree).find((node) => node.props?.['data-list'] === 'secretary-authority-scope')
+  assert.ok(list, 'the scope list must be rendered')
+  const scopeLines = nodes(list)
+    .filter((node) => node.type === 'li')
+    .map((node) => node.kids[0])
+  assert.deepEqual(scopeLines, [
+    T.zh['secretary.permissions.scopeNoWrite'],
+    T.zh['secretary.permissions.scopeNoConfig'],
+    T.zh['secretary.permissions.scopeNoSessionEdit'],
+    T.zh['secretary.permissions.scopeRegisteredOnly'],
+  ])
+  // 只读：没有输入、没有选择、没有按钮。
+  assert.equal(nodes(inner.tree).some((node) => ['input', 'select', 'button'].includes(node.type)), false)
+  inner.unmount()
+})
+
+test('filterGroups matches provider names wholesale and model ids or names otherwise', () => {
+  const groups = [
+    {
+      id: 'nexus-deepseek',
+      name: 'Nexus DeepSeek',
+      models: [
+        { id: 'deepseek-v4.1-flash', name: 'Flash' },
+        { id: 'deepseek-v4.1-pro', name: 'Pro' },
+      ],
+    },
+    { id: 'nexus-claude', name: 'Nexus Claude', models: [{ id: 'claude/opus:5.5', name: 'Opus 5.5' }] },
+  ]
+  assert.equal(plain(T.filterGroups(groups, '   ')).length, 2)
+  // A provider hit keeps every model that provider offers.
+  const byProvider = plain(T.filterGroups(groups, 'claude'))
+  assert.deepEqual(byProvider.map((g) => g.id), ['nexus-claude'])
+  assert.equal(byProvider[0].models.length, 1)
+  // A model hit keeps only the matching models and drops providers left empty.
+  const byModel = plain(T.filterGroups(groups, 'PRO'))
+  assert.deepEqual(byModel.map((g) => g.id), ['nexus-deepseek'])
+  assert.deepEqual(byModel[0].models.map((m) => m.id), ['deepseek-v4.1-pro'])
+  // Display names count too, and nothing matching is an empty catalog, not the full one.
+  assert.deepEqual(plain(T.filterGroups(groups, 'opus')).map((g) => g.id), ['nexus-claude'])
+  assert.deepEqual(plain(T.filterGroups(groups, 'zzz')), [])
+})
+
+
+test('countModels sums the models each provider offers', () => {
+  assert.equal(T.countModels([]), 0)
+  assert.equal(T.countModels([{ models: [{ id: 'a' }, { id: 'b' }] }, { models: [{ id: 'c' }] }]), 3)
+})
+
 test('the model list opens on the side with room and caps its height to that room', () => {
   const rect = { top: 100, bottom: 134, left: 20, width: 300 }
   // Plenty of room below: open downward at the preferred height, aligned to the button.
@@ -1159,7 +1265,7 @@ test('review route: own fields, same plugin namespace, and copy for both languag
   assert.notEqual(REVIEW.fields.provider, WORKER.fields.provider)
 
   for (const dict of [zh, en]) {
-    for (const key of ['route.review', 'route.reviewNote', 'route.lastReview', 'route.lastReviewNone']) {
+    for (const key of ['route.review', 'route.reviewNote']) {
       assert.equal(typeof dict[key], 'string', key)
       assert.ok(dict[key].length > 0, key)
     }
@@ -1174,260 +1280,6 @@ function textOf(node) {
   const props = node.props ?? {}
   return textOf(node.kids) + ' ' + textOf(props.title ?? '') + ' ' + textOf(props.children ?? '')
 }
-
-test('the settings page shows a review route row and the last verdict', async () => {
-  const mainScope = fakeScope({ initial: { provider: 'p', model: 'm', reasoningEffort: '' } })
-  const workerScope = fakeScope({ initial: { workerProvider: 'wp', workerModel: 'wm', workerReasoningEffort: '' } })
-  const orchScope = fakeScope({ initial: { enabled: true, lastReview: JSON.stringify({ verdict: 'BLOCK', target: 'verify', at: 1 }) } })
-
-  const view = mount(T.OrchestratorSettingsSection, {
-    t: (key) => key,
-    scopes: { main: mainScope, worker: workerScope, orch: orchScope },
-    orch: orchScope,
-    loadCatalog: async () => ({ ok: true, value: { groups: [{ id: 'wp', name: 'WP', models: [{ id: 'wm', name: 'WM' }] }] } }),
-  })
-  // The page fetches the catalog on mount; the promise lands after a few microtasks.
-  for (let i = 0; i < 5; i += 1) await Promise.resolve()
-
-  const text = textOf(view.tree)
-  assert.match(text, /route\.review/, 'the reviewer row must be rendered')
-  assert.match(text, /route\.lastReview/, 'the last verdict line must be rendered')
-  assert.match(text, /BLOCK/, 'the verdict itself must be visible')
-  assert.match(text, /verify/, 'the reviewed field must be visible')
-  view.unmount()
-})
-
-// ---- The plugin settings page --------------------------------------------------------
-
-/** Mount the settings page over three writable scopes and a one-provider catalog. */
-function mountSettings({
-  groups = [{ id: 'nexus-deepseek', name: 'Nexus DeepSeek', models: [{ id: 'flash', name: 'Flash' }] }],
-  loadCandidates = async () => [],
-  createMaster = async () => ({ ok: false, error: 'not wired in this test' }),
-} = {}) {
-  const scopes = { main: fakeScope(), worker: fakeScope(), orch: fakeScope() }
-  const view = mount(T.OrchestratorSettingsSection, {
-    t,
-    scopes,
-    orch: scopes.orch,
-    loadCatalog: async () => ({ ok: true, value: { groups } }),
-    loadCandidates,
-    createMaster,
-  })
-  return { view, scopes, groups }
-}
-
-test('the settings page has five zones and gives every control the scope it writes', async () => {
-  const { view, scopes } = mountSettings()
-  await flush()
-  const tree = view.tree
-  // A section element, addressed for the host and for a test, is the page root.
-  assert.equal(tree.type, 'section')
-  assert.equal(tree.props['data-testid'], 'orchestrator-settings')
-  // The session picker owns its own <section data-zone="sessions">, but it is a child component:
-  // the shim renders one component per mount, so the page tree holds its element, not its markup.
-  // What the page owns is the order — the picker is the first zone and precedes every other one.
-  const zones = nodes(tree).filter((node) => node.props?.['data-zone'] !== undefined)
-  assert.deepEqual(zones.map((zone) => zone.props['data-zone']), ['enable', 'routes', 'allowed', 'supervise', 'permissions'])
-  const kids = tree.kids
-  const pickerAt = kids.findIndex((kid) => kid !== null && kid !== undefined && kid.type === T.SessionPicker)
-  const enableAt = kids.findIndex((kid) => kid?.props?.['data-zone'] === 'enable')
-  assert.ok(pickerAt >= 0, 'the page renders the picker')
-  assert.ok(pickerAt < enableAt, 'the picker sits above every other zone')
-  for (const key of [
-    'section.title',
-    'section.enable',
-    'section.routes',
-    'section.allowed',
-    'section.supervise',
-    'section.permissions',
-  ]) {
-    assert.equal(textOf(tree).includes(key), true, key)
-  }
-
-  // The dispatch switch shows the stored value and is wired to the plugin entry.
-  const sw = nodes(tree).find((node) => node.type === T.EnableSwitch)
-  assert.ok(sw)
-  assert.equal(sw.props.checked, false)
-  assert.equal(sw.props.label, 'route.enable')
-
-  // The three route rows are in the routes zone, in the same order as the old panel.
-  const rows = nodes(tree).filter((node) => node.type === T.RouteRow)
-  assert.deepEqual(rows.map((row) => row.props.label), ['route.main', 'route.worker', 'route.review'])
-
-  // The whitelist and the interval field both read and write this plugin's own config entry.
-  const allowed = nodes(tree).find((node) => node.type === T.AllowedToolsPanel)
-  const interval = nodes(tree).find((node) => node.type === T.SuperviseIntervalField)
-  assert.equal(allowed.props.scope, scopes.orch)
-  assert.equal(interval.props.scope, scopes.orch)
-
-  // The page title is the copy that used to label the composer button, not an orphan key.
-  assert.equal(T.zh['section.title'], '调度模式')
-  assert.equal('route.button' in T.zh, false)
-  assert.equal('route.button' in T.en, false)
-  view.unmount()
-})
-
-test('settings-page controls write the same config keys the composer panel wrote', async () => {
-  const { view, scopes } = mountSettings()
-  await flush()
-
-  // 1. The switch stores enabled in the plugin entry.
-  const sw = () => nodes(view.tree).find((node) => node.type === T.EnableSwitch)
-  await sw().props.onChange(true)
-  assert.deepEqual(plain(scopes.orch.calls[0].ops), [{ op: 'set', path: ['enabled'], value: true }])
-  assert.equal(scopes.orch.calls[0].expected, 1)
-
-  // 2. The main row writes the host's agent-default-model entry, effort included.
-  const rows = () => nodes(view.tree).filter((node) => node.type === T.RouteRow)
-  await rows()[0].props.onChange({ provider: 'nexus-deepseek', model: 'flash', effort: 'high' })
-  assert.deepEqual(plain(scopes.main.calls[0].ops), [
-    { op: 'set', path: ['provider'], value: 'nexus-deepseek' },
-    { op: 'set', path: ['model'], value: 'flash' },
-    { op: 'set', path: ['reasoningEffort'], value: 'high' },
-  ])
-
-  // 3. The worker row writes the plugin's worker fields; no effort stores the empty string
-  //    so the bundled default cannot come back through an unset.
-  await rows()[1].props.onChange({ provider: 'p', model: 'm', effort: '' })
-  assert.deepEqual(plain(scopes.worker.calls[0].ops), [
-    { op: 'set', path: ['workerProvider'], value: 'p' },
-    { op: 'set', path: ['workerModel'], value: 'm' },
-    { op: 'set', path: ['workerReasoningEffort'], value: '' },
-  ])
-
-  // 4. The reviewer row writes the review fields in the same plugin entry.
-  await rows()[2].props.onChange({ provider: 'p2', model: 'm2', effort: 'low' })
-  assert.deepEqual(plain(scopes.orch.calls[1].ops), [
-    { op: 'set', path: ['reviewProvider'], value: 'p2' },
-    { op: 'set', path: ['reviewModel'], value: 'm2' },
-    { op: 'set', path: ['reviewReasoningEffort'], value: 'low' },
-  ])
-  view.unmount()
-})
-
-test('the supervise zone offers the unlimited switch and flipping it writes superviseUnlimited', async () => {
-  const { view, scopes } = mountSettings()
-  await flush()
-
-  // The switch sits beside the interval field and carries its own addressable row.
-  const row = byTestId(view.tree, 'orchestrator-supervise-unlimited')
-  assert.ok(row, 'the supervise zone must render the unlimited switch')
-  const sw = nodes(row).find((node) => node.type === T.EnableSwitch)
-  assert.ok(sw, 'the row must hold a real switch, not a bare label')
-  // Off until the config literally says true, so an older profile keeps the old behaviour.
-  assert.equal(sw.props.checked, false)
-  assert.equal(sw.props.label, 'supervise.unlimitedLabel')
-
-  await sw.props.onChange(true)
-  assert.deepEqual(plain(scopes.orch.calls[0].ops), [{ op: 'set', path: ['superviseUnlimited'], value: true }])
-  assert.equal(scopes.orch.calls[0].expected, 1)
-  // The scope subscription carries the write back into the row.
-  const after = nodes(byTestId(view.tree, 'orchestrator-supervise-unlimited')).find(
-    (node) => node.type === T.EnableSwitch,
-  )
-  assert.equal(after.props.checked, true)
-
-  // Both dictionaries label it, so a language switch never shows a raw key.
-  assert.equal(T.zh['supervise.unlimitedLabel'], '无限巡检')
-  assert.equal(T.en['supervise.unlimitedLabel'], 'Unlimited checks')
-  view.unmount()
-})
-
-test('the settings page reports a failed catalog read instead of hiding the routes silently', async () => {
-  const scopes = { main: fakeScope(), worker: fakeScope(), orch: fakeScope() }
-  const view = mount(T.OrchestratorSettingsSection, {
-    t,
-    scopes,
-    orch: scopes.orch,
-    loadCatalog: async () => ({ ok: false, error: { message: 'no catalog' } }),
-  })
-  await flush()
-  const alert = nodes(view.tree).find((node) => node.props?.role === 'alert')
-  assert.equal(alert.kids[0], 'route.catalogFailed')
-  // No route rows without a catalog, but the switch, whitelist and interval stay usable.
-  assert.equal(nodes(view.tree).some((node) => node.type === T.RouteRow), false)
-  assert.ok(nodes(view.tree).some((node) => node.type === T.AllowedToolsPanel))
-  view.unmount()
-})
-
-test('the permissions zone names the dispatch-command level and its four read-only scopes', async () => {
-  // The level id is mirrored in the client bundle (it cannot import a server module); the
-  // server constant is the source of truth and the two must agree.
-  assert.equal(T.SECRETARY_AUTHORITY_LEVEL, DISPATCH_COMMAND)
-  assert.deepEqual(plain(T.SECRETARY_AUTHORITY_SCOPE_KEYS), [
-    'secretary.permissions.scopeNoWrite',
-    'secretary.permissions.scopeNoConfig',
-    'secretary.permissions.scopeNoSessionEdit',
-    'secretary.permissions.scopeRegisteredOnly',
-  ])
-
-  const scopes = { main: fakeScope(), worker: fakeScope(), orch: fakeScope() }
-  // Translate through the real Chinese dictionary: this is the case that proves the user sees
-  // 「调度指挥」 and the four scope sentences, not raw keys.
-  const view = mount(T.OrchestratorSettingsSection, {
-    t: (key) => T.zh[key] ?? key,
-    scopes,
-    orch: scopes.orch,
-    loadCatalog: async () => ({ ok: true, value: { groups: [] } }),
-    loadCandidates: async () => [],
-    createMaster: async () => ({ ok: false, error: 'not wired in this test' }),
-  })
-  await flush()
-
-  const zone = nodes(view.tree).find((node) => node.props?.['data-zone'] === 'permissions')
-  assert.ok(zone, 'the permissions zone must be rendered')
-  assert.match(textOf(zone), /权限与模型/, 'the zone heading is the section.permissions copy')
-  // The shim renders one component per mount, so the zone holds the child element; its own
-  // markup is asserted on a direct mount below.
-  const panel = nodes(zone).find((node) => node.type === T.AuthorityPanel)
-  assert.ok(panel, 'the permissions zone renders AuthorityPanel')
-  assert.equal(typeof panel.props.t, 'function')
-
-  const inner = mount(T.AuthorityPanel, { t: (key) => T.zh[key] ?? key })
-  const text = textOf(inner.tree)
-  // The level's name, the fixed id it stands for, and the one sentence explaining the level.
-  assert.match(text, /调度指挥/)
-  assert.match(text, /dispatch-command/)
-  assert.match(text, /Master 会话只读/)
-  assert.match(text, /不能写文件、不能改插件配置/)
-
-  // The four scope lines are constants, in the declared order, not editable rows.
-  const list = nodes(inner.tree).find((node) => node.props?.['data-list'] === 'secretary-authority-scope')
-  assert.ok(list, 'the scope list must be rendered')
-  const scopeLines = nodes(list)
-    .filter((node) => node.type === 'li')
-    .map((node) => node.kids[0])
-  assert.deepEqual(scopeLines, [
-    T.zh['secretary.permissions.scopeNoWrite'],
-    T.zh['secretary.permissions.scopeNoConfig'],
-    T.zh['secretary.permissions.scopeNoSessionEdit'],
-    T.zh['secretary.permissions.scopeRegisteredOnly'],
-  ])
-  assert.deepEqual(scopeLines, ['不能写文件', '不能改插件配置', '不能直接改 orchestrator 会话内容', '不能越出登记名单'])
-
-  // The model row points at the Routes zone above: the three routes are edited there, and a
-  // picker in this read-only zone would be a second writer for one value.
-  assert.match(text, /模型在上方的「路由」区设置/)
-  assert.match(text, /主代理、子代理与评审者三行模型都在上方的「路由」区/)
-  assert.equal(nodes(inner.tree).some((node) => node.type === 'select'), false)
-  assert.equal(nodes(inner.tree).some((node) => node.type === 'input'), false)
-  assert.equal(nodes(inner.tree).some((node) => node.type === 'button'), false)
-
-  // Display only: mounting and rendering the zone writes nothing.
-  for (const scope of [scopes.main, scopes.worker, scopes.orch]) {
-    assert.equal(scope.calls.length, 0)
-  }
-  // Both dictionaries carry the new keys, so a language switch never shows a raw key.
-  for (const key of ['section.permissions', ...plain(T.SECRETARY_AUTHORITY_SCOPE_KEYS), 'secretary.permissions.dispatch']) {
-    for (const dict of [T.zh, T.en]) {
-      assert.equal(typeof dict[key], 'string', key)
-      assert.ok(dict[key].length > 0, key)
-    }
-  }
-  inner.unmount()
-  view.unmount()
-})
 
 test('ticket 10 leaves no trace of the legacy master panel in the client bundle', () => {
   // The input.right button, its component, its poll and its endpoint descriptor are gone.
@@ -2191,172 +2043,21 @@ test('the blockers and the tracker rows come from the payload, not from the view
   // A missing segment is no rows, never a throw.
   assert.deepEqual(plain(T.secretaryRowsOf(undefined)), [])
   assert.deepEqual(plain(T.secretaryBlockersOf(undefined)), [])
-  assert.deepEqual(plain(T.reportLinesOf(undefined)), [])
   assert.deepEqual(plain(T.draftRowsOf(undefined)), [])
 })
 
-test('the history tab groups the newest report and lists the timeline (why: it reads the structured changes field)', () => {
+test('the history tab says reports moved to the dock, and keeps no timeline (why: the archive is gone)', () => {
+  // 票 15：归档停产、旧报告模块删除。这一页只留一行说明，差异与时间线都不再画。
   const view = mount(T.SecretaryHistory, { t, payload: secretaryPayload() })
-  const diff = byTestId(view.tree, 'orchestrator-secretary-diff')
-  const text = textOf(diff)
-  assert.match(text, /secretary\.diff\.completed/)
-  assert.match(text, /secretary\.diff\.blocked/)
-  assert.match(text, /secretary\.diff\.flipped/)
-  assert.match(text, /进度：第 3 步 \/ 共 5 步/)
-  assert.match(text, /会话进入 Needs input/)
-  assert.match(text, /会话：Idle → Working/)
-  // The structured payload has no unclassified group, so "other" is not rendered.
-  assert.equal(text.includes('secretary.diff.other'), false, 'the structured diff needs no fallback bucket')
-  const timeline = byTestId(view.tree, 'orchestrator-secretary-timeline')
-  assert.match(textOf(timeline), /secretary\.reportKind\.delta/)
-  assert.match(textOf(timeline), /r\/1\.md/)
+  const note = byTestId(view.tree, 'orchestrator-secretary-history-moved')
+  assert.equal(textOf(note).trim(), 'secretary.historyMoved')
+  assert.equal(byTestId(view.tree, 'orchestrator-secretary-timeline'), undefined)
+  assert.equal(byTestId(view.tree, 'orchestrator-secretary-diff'), undefined)
+  assert.ok(T.zh['secretary.historyMoved'].length > 0)
+  assert.ok(T.en['secretary.historyMoved'].length > 0)
   view.unmount()
 })
 
-test('a timeline row opens the report body and closes again by click, Enter and Space', () => {
-  const history = mount(T.SecretaryHistory, {
-    t,
-    payload: secretaryPayload({
-      reports: [
-        {
-          sessionId: 's-1',
-          at: 1_700_000_000_000,
-          kind: 'delta',
-          path: 'r/1.md',
-          content: '# 增量报告\n- 进度：第 3 步 / 共 5 步',
-          changes: { completed: [], blocked: [], flipped: [] },
-          error: null,
-        },
-        {
-          sessionId: 's-1',
-          at: 1_699_999_999_000,
-          kind: 'plan',
-          path: 'r/0.md',
-          changes: { completed: [], blocked: [], flipped: [] },
-          error: null,
-        },
-      ],
-    }),
-  })
-  const row = (index) => byTestId(history.tree, 'orchestrator-secretary-timeline-row-' + String(index))
-  const body = (index) => byTestId(history.tree, 'orchestrator-secretary-timeline-body-' + String(index))
-
-  // The row is a keyboard-reachable disclosure, closed to begin with.
-  assert.equal(row(0).props.role, 'button')
-  assert.equal(row(0).props.tabIndex, 0)
-  assert.equal(row(0).props['aria-expanded'], false)
-  assert.equal(body(0), undefined, 'a closed row renders no panel at all')
-
-  row(0).props.onClick()
-  assert.equal(row(0).props['aria-expanded'], true)
-  assert.match(textOf(body(0)), /进度：第 3 步 \/ 共 5 步/, 'the report content is shown inline')
-  assert.equal(body(0).props.id !== '', true)
-
-  // A second click closes it again; the state lives on the row, not in the DOM.
-  row(0).props.onClick()
-  assert.equal(row(0).props['aria-expanded'], false)
-  assert.equal(body(0), undefined)
-
-  // Enter and Space both toggle; any other key leaves the row alone.
-  row(0).props.onKeyDown({ key: 'Enter', preventDefault() {} })
-  assert.equal(row(0).props['aria-expanded'], true)
-  row(0).props.onKeyDown({ key: ' ', preventDefault() {} })
-  assert.equal(row(0).props['aria-expanded'], false)
-  row(0).props.onKeyDown({ key: 'Tab', preventDefault() {} })
-  assert.equal(row(0).props['aria-expanded'], false)
-
-  // Rows toggle independently: the second one stays closed while the first is open.
-  row(0).props.onClick()
-  assert.equal(row(1).props['aria-expanded'], false)
-  assert.equal(body(1), undefined)
-  history.unmount()
-})
-
-test('a report without a body shows its archive path and says where the full text lives', () => {
-  const bare = {
-    sessionId: 's-1',
-    at: 1,
-    kind: 'delta',
-    path: 'r/9.md',
-    changes: { completed: [], blocked: [], flipped: [] },
-    error: null,
-  }
-  const payload = secretaryPayload({
-    reports: [
-      bare,
-      { ...bare, at: 2, path: '', body: '正文来自 body 字段', kind: 'summary' },
-      { ...bare, at: 3, path: '' },
-    ],
-  })
-  const lines = plain(T.reportLinesOf(payload))
-  assert.equal(lines[0].content, '', 'a report without content keeps an empty body')
-  assert.equal(lines[1].content, '正文来自 body 字段', 'the body field is read as the content')
-
-  const history = mount(T.SecretaryHistory, { t, payload })
-  const row = (index) => byTestId(history.tree, 'orchestrator-secretary-timeline-row-' + String(index))
-  const body = (index) => byTestId(history.tree, 'orchestrator-secretary-timeline-body-' + String(index))
-
-  row(0).props.onClick()
-  assert.match(textOf(body(0)), /r\/9\.md/, 'the archive path is shown in the panel')
-  assert.match(textOf(body(0)), /secretary\.timelineNeedsArchive/, 'and the panel says the rest is on disk')
-
-  // A row that cannot even name a path still explains itself instead of opening a blank panel.
-  row(2).props.onClick()
-  assert.match(textOf(body(2)), /secretary\.reportPathNone/)
-  assert.match(textOf(body(2)), /secretary\.timelineNeedsArchive/)
-  assert.ok(textOf(body(2)).trim().length > 0, 'an expanded row is never empty')
-  history.unmount()
-})
-
-test('diffGroupsOf separates the writer shapes and keeps the unknown ones', () => {
-  const groups = plain(
-    T.diffGroupsOf(['进度：第 2 步 / 共 5 步', '产出：a.md', 'worker：完成', 'worker：等确认', '会话进入 Needs input', 'worker：Idle → Working', '别的话']),
-  )
-  assert.deepEqual(groups.completed, ['进度：第 2 步 / 共 5 步', '产出：a.md', 'worker：完成'])
-  assert.deepEqual(groups.blocked, ['worker：等确认', '会话进入 Needs input'])
-  assert.deepEqual(groups.flipped, ['worker：Idle → Working'])
-  assert.deepEqual(groups.other, ['别的话'])
-})
-
-test('a legacy flat diff is grouped by the fallback, marked degraded, and the settings tab says so (why: an older host still sends strings)', () => {
-  // A host that predates the structured field answers the old flat list. The page must keep
-  // rendering it — and flag it, so a missing group is never mistaken for "no change".
-  const legacy = secretaryPayload({
-    reports: [
-      {
-        sessionId: 's-1',
-        at: 1,
-        kind: 'delta',
-        path: 'r/1.md',
-        bytes: 1,
-        changes: ['写测试：完成', 'worker：等确认', 'worker：Idle → Working'],
-        error: null,
-      },
-    ],
-  })
-  const lines = plain(T.reportLinesOf(legacy))
-  assert.deepEqual(lines[0].changes, {
-    completed: ['写测试：完成'],
-    blocked: ['worker：等确认'],
-    flipped: ['worker：Idle → Working'],
-    other: [],
-  })
-  assert.equal(lines[0].degraded, true, 'the fallback is visible, not silent')
-  assert.equal(plain(T.reportLinesOf(secretaryPayload()))[0].degraded, false, 'the structured field is not degraded')
-
-  // The history tab still shows the recovered groups...
-  const history = mount(T.SecretaryHistory, { t, payload: legacy })
-  const diff = textOf(byTestId(history.tree, 'orchestrator-secretary-diff'))
-  assert.match(diff, /worker：等确认/)
-  assert.match(diff, /worker：Idle → Working/)
-  // ...and the settings tab carries the one-line notice.
-  const scope = fakeScope()
-  const settings = mount(T.SecretarySettings, { t, orch: scope, payload: legacy, mutate: scope.mutate })
-  assert.match(textOf(byTestId(settings.tree, 'orchestrator-secretary-degraded')), /secretary\.degraded/)
-  const cleanScope = fakeScope()
-  const clean = mount(T.SecretarySettings, { t, orch: cleanScope, payload: secretaryPayload(), mutate: cleanScope.mutate })
-  assert.equal(byTestId(clean.tree, 'orchestrator-secretary-degraded'), undefined)
-})
 
 test('the layout is two columns at 1100 and scrolls only inside the list regions', () => {
   const wide = T.secretaryStyleOf(1100)
@@ -2853,39 +2554,6 @@ test('the wake-on-blocked switch reads the scope and writes both directions (why
   assert.deepEqual(plain(on.scopes.orch.calls[0].ops), [{ op: 'set', path: ['secretaryWakeOnBlocked'], value: false }])
 })
 
-test('a truncated report body says so instead of showing a silently shortened text', () => {
-  const report = {
-    sessionId: 's-1',
-    at: 2,
-    kind: 'delta',
-    path: 'r/2.md',
-    content: '正文的前半段',
-    contentTruncated: true,
-    changes: { completed: [], blocked: [], flipped: [] },
-    error: null,
-  }
-  const payload = secretaryPayload({
-    reports: [report, { ...report, at: 1, path: 'r/1.md', contentTruncated: false }],
-  })
-  assert.deepEqual(
-    plain(T.reportLinesOf(payload)).map((line) => line.truncated),
-    [true, false],
-  )
-
-  const history = mount(T.SecretaryHistory, { t, payload })
-  const row = (index) => byTestId(history.tree, 'orchestrator-secretary-timeline-row-' + String(index))
-  row(0).props.onClick()
-  const hint = byTestId(history.tree, 'orchestrator-secretary-timeline-truncated-0')
-  assert.ok(hint, 'a truncated body must say so')
-  assert.match(textOf(hint), /secretary\.reportTruncated/)
-  row(1).props.onClick()
-  assert.equal(
-    byTestId(history.tree, 'orchestrator-secretary-timeline-truncated-1'),
-    undefined,
-    'a complete body carries no warning',
-  )
-  history.unmount()
-})
 
 test('a tab handed no route scopes renders no editable row instead of writing to the wrong entry', async () => {
   // 缺 main/worker/review 的 controller 时，退回 orch 会把 MAIN 的字段名写进 orchestrator
@@ -3118,237 +2786,6 @@ test('every tab survives a payload with no segments', () => {
 
 
 
-
-// ---- 会话选择器（票：会话选择器） -------------------------------------------------------
-
-/** One candidate row exactly as the endpoint sends it. */
-const CANDIDATE = (id, extra) => ({
-  sessionId: id,
-  title: '标题-' + id,
-  titleMissing: false,
-  cwd: 'D:\\ws',
-  live: true,
-  running: false,
-  updatedAt: 1_700_000_000_000,
-  parentSession: null,
-  delegationDepth: 0,
-  isMaster: false,
-  isOrchestrator: false,
-  ...(extra ?? {}),
-})
-
-function mountPicker({ initial = {}, loadCandidates, createMaster } = {}) {
-  const scope = fakeScope({ initial })
-  const view = mount(T.SessionPicker, { t, scope, loadCandidates, createMaster })
-  return { view, scope }
-}
-
-test('the session picker is the first zone of the settings page and owns the plugin scope', async () => {
-  let reads = 0
-  const { view, scopes } = mountSettings({
-    loadCandidates: async () => {
-      reads += 1
-      return []
-    },
-  })
-  await flush()
-  const picker = nodes(view.tree).find((node) => node.type === T.SessionPicker)
-  assert.ok(picker, 'the page renders the picker as its own component')
-  assert.equal(picker.props.scope, scopes.orch, 'it writes the plugin config entry the registry lives in')
-  assert.equal(typeof picker.props.loadCandidates, 'function')
-  assert.equal(typeof picker.props.createMaster, 'function')
-  assert.equal(reads, 0, 'the test shim never renders a child component, so no read happens here')
-  view.unmount()
-})
-
-test('the picker lists title, workspace, status and activity, marking the master and the registered rows', async () => {
-  const { view } = mountPicker({
-    initial: {
-      secretaryMasterSessionId: 'a',
-      secretaryOrchestrators: [{ sessionId: 'b', workspace: 'w', title: '旧', trackedAt: 1 }],
-    },
-    loadCandidates: async () => [
-      CANDIDATE('a', { running: true, isMaster: true }),
-      CANDIDATE('b', { title: '', titleMissing: true, cwd: '', live: false, isOrchestrator: true }),
-      CANDIDATE('c', { running: false, live: true }),
-      CANDIDATE('d', { running: false, live: false }),
-    ],
-  })
-  await flush()
-
-  const rowA = byTestId(view.tree, 'orchestrator-session-row-a')
-  assert.match(textOf(rowA), /标题-a/)
-  assert.match(textOf(rowA), /sessions\.status\.running/)
-  assert.match(textOf(rowA), /sessions\.master/)
-  assert.match(textOf(rowA), /D:\\ws/, 'the workspace path is shown')
-
-  const rowB = byTestId(view.tree, 'orchestrator-session-row-b')
-  assert.match(textOf(rowB), /sessions\.titleMissing/, 'a missing title is said out loud')
-  assert.match(textOf(rowB), /sessions\.noWorkspace/)
-  assert.match(textOf(rowB), /sessions\.status\.persisted/)
-  assert.match(textOf(rowB), /sessions\.registered/)
-
-  assert.match(textOf(byTestId(view.tree, 'orchestrator-session-row-c')), /sessions\.status\.live/)
-  assert.match(textOf(byTestId(view.tree, 'orchestrator-session-row-d')), /sessions\.status\.persisted/)
-  assert.equal(byTestId(view.tree, 'orchestrator-session-row-c').props['data-registered'], 'false')
-  assert.equal(byTestId(view.tree, 'orchestrator-session-row-a').props['data-master'], 'true')
-  assert.equal(byTestId(view.tree, 'orchestrator-session-picker-setmaster-a').props.disabled, true)
-  view.unmount()
-})
-
-test('every change is staged locally and only the save button writes the two config keys', async () => {
-  const { view, scope } = mountPicker({
-    initial: {
-      secretaryMasterSessionId: 'a',
-      secretaryOrchestrators: [{ sessionId: 'b', workspace: 'w', title: '旧', trackedAt: 1 }],
-    },
-    loadCandidates: async () => [
-      CANDIDATE('a'),
-      CANDIDATE('b', { isOrchestrator: true }),
-      CANDIDATE('c'),
-      CANDIDATE('d'),
-    ],
-  })
-  await flush()
-
-  const save = () => byTestId(view.tree, 'orchestrator-session-picker-save')
-  assert.equal(save().props.disabled, true, 'nothing staged yet, so there is nothing to save')
-
-  byTestId(view.tree, 'orchestrator-session-picker-setmaster-c').props.onClick()
-  assert.equal(scope.calls.length, 0, 'a master change is staged, not written')
-  assert.match(textOf(view.tree), /sessions\.dirty/)
-
-  // 登记 d、取消 b：Master 与登记表是互斥的，所以换 Master 之后 c 不能再登记进来。
-  byTestId(view.tree, 'orchestrator-session-picker-register-d').props.onClick()
-  byTestId(view.tree, 'orchestrator-session-picker-unregister-b').props.onClick()
-  assert.equal(scope.calls.length, 0, 'registering and unregistering are staged too')
-  assert.notEqual(save().props.disabled, true)
-
-  save().props.onClick()
-  await flush()
-  assert.equal(scope.calls.length, 1, 'one save, one write')
-  const ops = plain(scope.calls[0].ops)
-  assert.equal(ops[0].op, 'set')
-  assert.deepEqual(ops[0].path, ['secretaryMasterSessionId'])
-  assert.equal(ops[0].value, 'c')
-  assert.deepEqual(ops[1].path, ['secretaryOrchestrators'])
-  assert.deepEqual(ops[1].value.map((row) => row.sessionId), ['d'])
-  assert.equal(ops[1].value[0].workspace, 'D:\\ws', 'the row borrows the candidate workspace')
-  assert.equal(ops[1].value[0].title, '标题-d')
-  assert.equal(scope.calls[0].expected, 1, 'the write uses the snapshot revision')
-  view.unmount()
-})
-
-test('registering the session that is already the Master is refused, not written as a conflict', async () => {
-  const { view, scope } = mountPicker({
-    initial: { secretaryMasterSessionId: 'a', secretaryOrchestrators: [] },
-    loadCandidates: async () => [CANDIDATE('a'), CANDIDATE('b')],
-  })
-  await flush()
-
-  byTestId(view.tree, 'orchestrator-session-picker-register-a').props.onClick()
-  const alert = byTestId(view.tree, 'orchestrator-session-picker-error')
-  assert.ok(alert)
-  assert.match(textOf(alert), /sessions\.registerMaster/)
-  assert.equal(scope.calls.length, 0)
-  view.unmount()
-})
-
-test('an empty host is guidance, and a failed read is an error with a retry that really re-reads', async () => {
-  const empty = mountPicker({ loadCandidates: async () => [] })
-  await flush()
-  assert.match(textOf(empty.view.tree), /sessions\.empty/)
-  empty.view.unmount()
-
-  let calls = 0
-  const failing = mountPicker({
-    loadCandidates: async () => {
-      calls += 1
-      throw new Error('endpoint down')
-    },
-  })
-  await flush()
-  const alert = byTestId(failing.view.tree, 'orchestrator-session-picker-error')
-  assert.ok(alert, 'a broken read is visible, never a blank page')
-  assert.match(textOf(alert), /sessions\.failed/)
-  assert.match(textOf(alert), /endpoint down/)
-  byTestId(failing.view.tree, 'orchestrator-session-picker-retry').props.onClick()
-  await flush()
-  assert.equal(calls, 2, 'the retry re-reads the list')
-  failing.view.unmount()
-})
-
-test('the refresh button re-reads the candidate list', async () => {
-  let calls = 0
-  const { view } = mountPicker({
-    loadCandidates: async () => {
-      calls += 1
-      return [CANDIDATE('a')]
-    },
-  })
-  await flush()
-  assert.equal(calls, 1, 'the list is read once when the page appears')
-  byTestId(view.tree, 'orchestrator-session-picker-refresh').props.onClick()
-  await flush()
-  assert.equal(calls, 2)
-  assert.ok(byTestId(view.tree, 'orchestrator-session-row-a'))
-  view.unmount()
-})
-
-test('the create button asks the endpoint for a workspace-free Master and stages the new id', async () => {
-  let created = 0
-  const { view, scope } = mountPicker({
-    loadCandidates: async () => [CANDIDATE('a')],
-    createMaster: async () => {
-      created += 1
-      return { ok: true, sessionId: 'orchestrator-master' }
-    },
-  })
-  await flush()
-  assert.match(textOf(byTestId(view.tree, 'orchestrator-session-picker-create')), /sessions\.create/)
-  byTestId(view.tree, 'orchestrator-session-picker-create').props.onClick()
-  await flush()
-  assert.equal(created, 1)
-  assert.match(textOf(view.tree), /orchestrator-master/)
-  assert.match(textOf(view.tree), /sessions\.created/)
-  assert.equal(scope.calls.length, 0, 'the server already recorded the id; the page only stages it')
-  view.unmount()
-})
-
-test('a failed creation is reported verbatim and stages nothing', async () => {
-  const { view, scope } = mountPicker({
-    loadCandidates: async () => [],
-    createMaster: async () => ({ ok: false, error: 'session id already exists' }),
-  })
-  await flush()
-  byTestId(view.tree, 'orchestrator-session-picker-create').props.onClick()
-  await flush()
-  const alert = byTestId(view.tree, 'orchestrator-session-picker-error')
-  assert.ok(alert)
-  assert.match(textOf(alert), /session id already exists/, 'the host reason is not replaced by a generic one')
-  assert.equal(scope.calls.length, 0)
-  view.unmount()
-})
-
-test('the picker offers no config write at all on a read-only scope', async () => {
-  const scope = fakeScope({ writable: false, initial: { secretaryMasterSessionId: 'a', secretaryOrchestrators: [] } })
-  const view = mount(T.SessionPicker, {
-    t,
-    scope,
-    loadCandidates: async () => [CANDIDATE('a'), CANDIDATE('b')],
-    createMaster: async () => ({ ok: false, error: 'read-only' }),
-  })
-  await flush()
-  assert.equal(byTestId(view.tree, 'orchestrator-session-picker-save').props.disabled, true)
-  assert.equal(byTestId(view.tree, 'orchestrator-session-picker-setmaster-b').props.disabled, true)
-  assert.equal(
-    byTestId(view.tree, 'orchestrator-session-picker-create').props.disabled,
-    false,
-    'creating is a host call, not a config write',
-  )
-  assert.match(textOf(view.tree), /secretary\.readonly/)
-  view.unmount()
-})
 
 // ---- 秘书设置页的「查看设计稿」入口 ---------------------------------------------------------
 // 设计稿由服务端在同一 3080 上托管（见 test/index.test.mjs 的设计稿用例），这里只守入口：
@@ -3597,6 +3034,22 @@ test('the panel body lists the three fixed entries, then the workers in model or
   assert.match(second, /reserved/)
   assert.match(textOf(byTestId(view.tree, 'orchestrator-panel-retries-w-2')), /2/)
   assert.equal(byTestId(view.tree, 'orchestrator-panel-empty'), undefined)
+  view.unmount()
+})
+
+test('the row shows the preset category, and says so when no preset was applied', async () => {
+  // 票 15：类别来自预设，不是常量。没有预设时这一行写出「未施加预设」，不是什么都不显示。
+  const value = PANEL_MODEL()
+  value.workers = [
+    { sessionId: 'w-1', presetId: 'verifier', category: 'non-code', status: 'running', startedAt: 10, retries: 0 },
+    { sessionId: 'w-2', presetId: '', category: '', status: 'running', startedAt: 20, retries: 0 },
+  ]
+  const view = mountPanelBody({ value: { model: value, actions: { fixed: PANEL_ACTIONS().fixed, workers: [] } } })
+  await flush(14)
+  assert.equal(textOf(byTestId(view.tree, 'orchestrator-panel-category-w-1')).trim(), 'non-code')
+  assert.equal(textOf(byTestId(view.tree, 'orchestrator-panel-category-w-2')).trim(), 'dock.categoryUnset')
+  assert.ok(T.zh['dock.categoryUnset'].length > 0)
+  assert.ok(T.en['dock.categoryUnset'].length > 0)
   view.unmount()
 })
 

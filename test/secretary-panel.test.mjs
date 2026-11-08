@@ -1,11 +1,6 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises'
-import * as fsp from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
 import test from 'node:test'
 import {
-  DEFAULT_REPORTS_ROOT,
   SECRETARY_ENDPOINT,
   SECRETARY_METHOD,
   SECRETARY_SERVICE_KEY,
@@ -14,15 +9,13 @@ import {
   collectOrchestratorRows,
   composeViewState,
   emptyViewState,
-  listReportRows,
   notifyOnFrom,
 } from '../lib/secretary-panel.js'
 import { applyDraftTriggers, createDraftStore } from '../lib/secretary-nudge.js'
-import { renderPlanReport, renderReport } from '../lib/secretary-report.js'
 
-// Four config fields plus the three model routes, all read by the endpoint. The report root and the
-// view limit are constants of the reader, not policy: a field the endpoint never sends would be a
-// lie in the settings tab, and neither of them can be changed from there. Every route string is
+// Four config fields plus the three model routes, all read by the endpoint. The view limit is a
+// constant of the reader, not policy: a field the endpoint never sends would be a lie in the
+// settings tab, and it cannot be changed from there. Every route string is
 // empty here because empty is "not set" — a default model name would be a decision nobody made.
 const EMPTY_ROUTES = {
   main: { provider: '', model: '', effort: '' },
@@ -232,8 +225,6 @@ test('the policy segment carries the four config fields and the three routes, an
   assert.equal('reportsRoot' in custom, false)
   assert.equal('viewReportLimit' in custom, false)
   // The reader's own constants stay constants.
-  assert.equal(DEFAULT_REPORTS_ROOT, '.scratch/master-secretary/reports')
-  assert.equal(VIEW_REPORT_LIMIT, 50)
 })
 
 test('the policy segment hands over the three model routes as three string fields each', () => {
@@ -655,35 +646,19 @@ test('both draft transitions answer values that survive a JSON round trip unchan
   }
 })
 
-test('the switch off returns the empty payload and reads neither the host nor the archive', async () => {
-  // 会记录调用次数的假 fs：开关关闭时它必须一次都没被叫到。
-  const calls = []
-  const fakeFs = {
-    async readdir(path) {
-      calls.push(['readdir', path])
-      return []
-    },
-    async stat(path) {
-      calls.push(['stat', path])
-      return { size: 0, mtimeMs: 0 }
-    },
-    async readFile(path) {
-      calls.push(['readFile', path])
-      return '# 秘书规划\n'
-    },
-  }
+test('the switch off returns the empty payload and reads neither the host nor any archive', async () => {
+  // 开关关闭时 read 一次都不该被叫；票 15 之后也确实没有任何归档可读。
   let reads = 0
   const service = new SecretaryRemote({
     enabled: () => false,
     read: async () => {
       reads += 1
-      return { reports: await listReportRows({ fs: fakeFs, workspaces: ['w'] }) }
+      return { reports: [] }
     },
   })
 
   assert.deepEqual(await service.secretaryState(), emptyViewState())
   assert.equal(reads, 0, 'the switch off never calls read')
-  assert.deepEqual(calls, [], 'and therefore touches no directory')
 })
 
 test('the switch on calls read exactly once and composes its four segments', async () => {
@@ -721,226 +696,4 @@ test('a failing read reaches the caller instead of faking an empty view', async 
 
   const missing = new SecretaryRemote({ enabled: () => true })
   await assert.rejects(() => missing.secretaryState(), /no read function/)
-})
-
-test('a reports directory that was never written is an empty list, not a failure', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'secretary-panel-'))
-  try {
-    assert.deepEqual(await listReportRows({ fs: fsp, workspaces: [join(dir, 'never-written')] }), [])
-    assert.deepEqual(await listReportRows({ fs: fsp, workspaces: [] }), [])
-    assert.deepEqual(await listReportRows({ fs: fsp, workspaces: ['', '  '] }), [])
-    assert.deepEqual(await listReportRows({ fs: fsp }), [])
-    assert.deepEqual(await listReportRows({}), [])
-
-    // 目录存在但一份报告都没有，同样是空数组。
-    await mkdir(join(dir, ...DEFAULT_REPORTS_ROOT.split('/')), { recursive: true })
-    assert.deepEqual(await listReportRows({ fs: fsp, workspaces: [dir] }), [])
-  } finally {
-    await rm(dir, { recursive: true, force: true })
-  }
-})
-
-test('archived reports are listed newest first with what the history tab renders (why: the report sections are the groups now)', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'secretary-reports-'))
-  try {
-    const root = join(dir, '.scratch', 'master-secretary', 'reports')
-    const conversation = join(root, 'orch-1')
-    await mkdir(conversation, { recursive: true })
-
-    const planPath = join(conversation, '12-00.md')
-    await writeFile(
-      planPath,
-      renderPlanReport({
-        at: Date.UTC(2026, 0, 2, 3, 0),
-        session: 'orch-1',
-        plan: { steps: [{ index: 1, name: '修登录', detail: '让重试可用' }] },
-      }),
-      'utf8',
-    )
-    const deltaPath = join(conversation, '12-03.md')
-    const deltaText = renderReport({
-      kind: 'delta',
-      at: Date.UTC(2026, 0, 2, 3, 3),
-      session: 'orch-1',
-      orchestrator: { state: 'Working', summary: '在写报告' },
-      diff: { completed: [{ name: 'w-1', from: 'Working', to: 'Completed' }], blocked: ['w-2 等回话'], flipped: [] },
-    })
-    await writeFile(deltaPath, deltaText, 'utf8')
-    const summaryPath = join(root, '_summary.md')
-    await writeFile(summaryPath, '# 秘书汇总\n\n- 会话数：1\n', 'utf8')
-
-    // mtime 决定顺序，写成确定值，测试不依赖文件系统的写入时刻。
-    await utimes(planPath, new Date(Date.UTC(2026, 0, 2, 3, 0)), new Date(Date.UTC(2026, 0, 2, 3, 0)))
-    await utimes(deltaPath, new Date(Date.UTC(2026, 0, 2, 3, 3)), new Date(Date.UTC(2026, 0, 2, 3, 3)))
-    await utimes(summaryPath, new Date(Date.UTC(2026, 0, 1, 0, 0)), new Date(Date.UTC(2026, 0, 1, 0, 0)))
-
-    const rows = await listReportRows({ fs: fsp, workspaces: [dir] })
-    assert.deepEqual(
-      rows.map((row) => [row.sessionId, row.kind]),
-      [
-        ['orch-1', 'delta'],
-        ['orch-1', 'plan'],
-        ['', 'summary'],
-      ],
-    )
-    assert.equal(rows[0].path, deltaPath)
-    assert.equal(rows[0].at, Date.UTC(2026, 0, 2, 3, 3))
-    // Why changed (ticket 08): the report's ### 新完成 / ### 新卡住 / ### 状态翻转 sections
-    // are the grouping now, so the endpoint hands over the same three arrays
-    // lib/secretary-diff.js returns instead of one flat sentence list.
-    assert.deepEqual(rows[0].changes, {
-      completed: ['w-1：Working → Completed'],
-      blocked: ['w-2 等回话'],
-      flipped: [],
-    })
-    assert.equal(rows[0].bytes, (await readFile(deltaPath)).length)
-    assert.equal(rows[0].error, null)
-    // 规划首报没有差异段，所以三组都是空的——不是"没有变化"的编造值。
-    assert.deepEqual(rows[1].changes, { completed: [], blocked: [], flipped: [] })
-    assert.deepEqual(rows[2].changes, { completed: [], blocked: [], flipped: [] })
-  } finally {
-    await rm(dir, { recursive: true, force: true })
-  }
-})
-
-test('a report row carries its body so the timeline can unfold it (why: the row had no content to expand)', () => {
-  const body = '# 秘书汇报\n\n- 时间：2026-01-02 03:03\n- 会话：orch-1\n- 类型：增量\n\n## 差异\n'
-  const payload = composeViewState({ reports: [{ ...REPORT, content: body, contentTruncated: false }] })
-  assert.equal(payload.reports[0].contentTruncated, false)
-  assert.ok(payload.reports[0].content.includes('# 秘书汇报'), 'the first line of the body reaches the view')
-  assert.equal(payload.reports[0].content, body, 'the body is handed over verbatim')
-})
-
-test('the archive reader keeps the report body per row (why: fileRow read it and dropped it)', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'secretary-content-'))
-  try {
-    const conversation = join(dir, '.scratch', 'master-secretary', 'reports', 'orch-1')
-    await mkdir(conversation, { recursive: true })
-    const expected = renderReport({
-      kind: 'delta',
-      at: Date.UTC(2026, 0, 2, 3, 3),
-      session: 'orch-1',
-      orchestrator: { state: 'Working', summary: '在写报告' },
-      diff: { completed: [], blocked: [], flipped: [] },
-    })
-    await writeFile(join(conversation, '12-03.md'), expected, 'utf8')
-    const rows = await listReportRows({ fs: fsp, workspaces: [dir] })
-    assert.equal(rows.length, 1)
-    assert.equal(rows[0].content, expected, 'the whole body, not only its kind and diff')
-    assert.equal(rows[0].contentTruncated, false)
-
-    // The body reaches the endpoint payload through the same composition.
-    const payload = composeViewState({ reports: rows })
-    assert.ok(payload.reports[0].content.includes('# 秘书汇报'))
-  } finally {
-    await rm(dir, { recursive: true, force: true })
-  }
-})
-
-test('a report body over 8 KiB is cut to 8192 bytes and says so (why: one row must not pour a whole archive into the payload)', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'secretary-content-cap-'))
-  try {
-    const conversation = join(dir, '.scratch', 'master-secretary', 'reports', 'orch-1')
-    await mkdir(conversation, { recursive: true })
-    const huge = '# 秘书汇报\n\n' + 'x'.repeat(9000) + '\n'
-    await writeFile(join(conversation, '12-03.md'), huge, 'utf8')
-    const rows = await listReportRows({ fs: fsp, workspaces: [dir] })
-    assert.equal(rows.length, 1)
-    assert.equal(rows[0].contentTruncated, true, 'the view can tell the body is partial')
-    assert.equal(Buffer.byteLength(rows[0].content, 'utf8'), 8192, 'exactly the cap, not the whole file')
-    assert.ok(rows[0].content.startsWith('# 秘书汇报'), 'the cut keeps the head of the report')
-    assert.ok(rows[0].content.length < huge.length)
-  } finally {
-    await rm(dir, { recursive: true, force: true })
-  }
-})
-
-test('a report written before the sectioned diff keeps its flat list (why: older archives have no ### groups)', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'secretary-legacy-'))
-  try {
-    const conversation = join(dir, '.scratch', 'master-secretary', 'reports', 'orch-1')
-    await mkdir(conversation, { recursive: true })
-    const legacy = [
-      '# 秘书汇报',
-      '',
-      '- 时间：2026-01-02 03:03',
-      '- 会话：orch-1',
-      '- 类型：增量',
-      '',
-      '## 差异',
-      '',
-      '- w-1：Working → Completed',
-      '- w-2 等回话',
-      '',
-      '## 产出',
-      '',
-      '无',
-      '',
-    ].join('\n')
-    await writeFile(join(conversation, '12-03.md'), legacy, 'utf8')
-    const rows = await listReportRows({ fs: fsp, workspaces: [dir] })
-    assert.equal(rows.length, 1)
-    // The endpoint cannot tell which group an unlabeled bullet belongs to, so it keeps the
-    // old flat shape for the view's fallback instead of mislabeling it under "completed".
-    assert.deepEqual(rows[0].changes, ['w-1：Working → Completed', 'w-2 等回话'])
-  } finally {
-    await rm(dir, { recursive: true, force: true })
-  }
-})
-
-test('the report list is capped by VIEW_REPORT_LIMIT', async () => {
-  const root = join('w', '.scratch', 'master-secretary', 'reports')
-  const entries = Array.from({ length: VIEW_REPORT_LIMIT + 10 }, (_, index) => ({
-    name: String(index).padStart(2, '0') + '-00.md',
-    isDirectory: () => false,
-  }))
-  const io = {
-    async readdir(path) {
-      return path === root ? entries : []
-    },
-    async stat(path) {
-      return { size: 3, mtimeMs: Number(basename(path).slice(0, 2)) * 1000 }
-    },
-    async readFile() {
-      return '# 秘书规划\n'
-    },
-  }
-  const rows = await listReportRows({ fs: io, workspaces: ['w'] })
-  assert.equal(rows.length, VIEW_REPORT_LIMIT)
-  assert.equal(rows[0].at, (VIEW_REPORT_LIMIT + 9) * 1000, 'newest first')
-  assert.equal(rows[rows.length - 1].at, 10 * 1000)
-})
-
-test('a report that cannot be read keeps its row with the failure, it is not hidden', async () => {
-  const io = {
-    async readdir(path) {
-      if (path.endsWith('reports')) return [{ name: 'orch-1', isDirectory: () => true }]
-      return [{ name: '12-00.md', isDirectory: () => false }]
-    },
-    async stat() {
-      return { size: 10, mtimeMs: 5 }
-    },
-    async readFile() {
-      throw new Error('EACCES')
-    },
-  }
-  const rows = await listReportRows({ fs: io, workspaces: ['w'] })
-  assert.equal(rows.length, 1)
-  assert.equal(rows[0].sessionId, 'orch-1')
-  assert.equal(rows[0].kind, 'unknown')
-  assert.equal(rows[0].error, 'EACCES')
-
-  // 一个在两次调用之间消失的文件不是一行历史。
-  const vanishing = {
-    async readdir() {
-      return [{ name: '12-00.md', isDirectory: () => false }]
-    },
-    async stat() {
-      throw new Error('ENOENT')
-    },
-    async readFile() {
-      return ''
-    },
-  }
-  assert.deepEqual(await listReportRows({ fs: vanishing, workspaces: ['w'] }), [])
 })
