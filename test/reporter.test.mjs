@@ -53,7 +53,15 @@ test('a full report has one labelled line per required item, in order', () => {
     assert.ok(itemLines[index].includes(ITEM_LABELS[key]), `item ${index} must be ${key}`)
   })
   assert.match(text, /卡住 \/ 等批准\*\*：无/)
-  assert.match(text, /花费\*\*：0\.3 个/, 'a bare number renders as a count, not as 无')
+  assert.equal(itemLines[REQUIRED_ITEMS.indexOf('cost')], '- **花费**：0.3', 'an amount is a number, not a count')
+})
+
+test('counts take 个, an amount stays a plain number', () => {
+  const { text } = renderReport({ at: AT, snapshot: { running: 3, stuck: { count: 2 }, cost: 12 } })
+  assert.deepEqual(
+    text.split('\n').filter((line) => line.startsWith('- **')),
+    ['- **在跑**：3 个', '- **卡住 / 等批准**：2 个', '- **刚完成的产出与验证**：无', '- **花费**：12', '- **建议下一步**：无'],
+  )
 })
 
 test('a multi-line detail is collapsed into one line', () => {
@@ -93,6 +101,16 @@ test('stampOf accepts a Date, epoch ms and an ISO string', () => {
   assert.deepEqual(stampOf(new Date(2026, 0, 2, 3, 4, 5)), { day: '2026-01-02', time: '03-04' })
   assert.deepEqual(stampOf(new Date(2026, 0, 2, 3, 4, 5).getTime()), { day: '2026-01-02', time: '03-04' })
   assert.deepEqual(stampOf(new Date(2026, 0, 2, 3, 4, 5).toISOString()), { day: '2026-01-02', time: '03-04' })
+  assert.deepEqual(stampOf(0), stampOf(new Date(0)), 'epoch ms 0 is a real timestamp, not an error')
+})
+
+test('stampOf refuses the values Date silently coerces to the epoch', () => {
+  // new Date(null) 和 new Date(true) 都不报错，它们给出 epoch：照着归档，每份 at:null 的汇报
+  // 会全部落在同一个文件上互相覆盖。必须在构造之前先验类型。
+  for (const bad of [null, undefined, true, false, {}, [], '', '   ', Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(() => stampOf(bad), /valid Date/, `must refuse ${JSON.stringify(bad)}`)
+  }
+  assert.throws(() => archivePath({ cwd: 'D:/work', at: null }), /valid Date/)
 })
 
 test('the summary line never claims 无变化 while something is running', () => {
