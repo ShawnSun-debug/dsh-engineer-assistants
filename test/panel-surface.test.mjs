@@ -5,9 +5,12 @@ import { DEFAULT_TIMEOUT_MS } from '../lib/danger.js'
 import { STUCK_REASONS } from '../lib/inspector.js'
 import {
   ATTENTION_REASONS,
+  SUBAGENT_CHAT_ADDRESS,
+  SUBAGENT_CHAT_MODES,
   badgeOf,
   confirmationCardsOf,
   navigationTargetOf,
+  workerChatAddressOf,
 } from '../lib/panel-surface.js'
 
 const live = (sessionId, extra = {}) => ({ sessionId, presetId: 'implementer', category: 'code', status: 'running', startedAt: 1000, ...extra })
@@ -201,4 +204,46 @@ test('the cards refuse nonsense inputs rather than inventing a clock', () => {
   assert.throws(() => confirmationCardsOf({ pending: [], now: 1, timeoutMs: 0 }), /positive integer/)
   // 空数组是合法输入：没有待确认的事，就没有卡。
   assert.deepEqual(confirmationCardsOf({ pending: [], now: 1, timeoutMs: 10 }), [])
+})
+// 与宿主 dsh-client-ui-subagent 的 parseSubagentChatAddress 逐条对齐的本地副本：
+// 它认不出来的地址，点 worker 会静默无反应，所以这里按宿主的规则反向校验。
+function parseLikeHost(value) {
+  let url
+  try {
+    url = new URL(value)
+  } catch {
+    return undefined
+  }
+  if (url.protocol !== 'dsh-resource:' || url.hostname.toLowerCase() !== 'subagentchat') return undefined
+  const parts = url.pathname.split('/').filter(Boolean)
+  if (parts.length !== 2 || parts[0] !== 'session') return undefined
+  const parentSessionId = url.searchParams.get('parent')
+  const mode = url.searchParams.get('mode')
+  if (parentSessionId === null || parentSessionId === '' || !SUBAGENT_CHAT_MODES.includes(mode)) return undefined
+  return { parentSessionId, childSessionId: decodeURIComponent(parts[1]), mode }
+}
+
+const address = (childSessionId, extra = {}) => ({ parentSessionId: 'p-1', childSessionId, mode: 'continuable', ...extra })
+
+test('a worker chat address round-trips through the host parser rules', () => {
+  assert.equal(SUBAGENT_CHAT_ADDRESS, 'dsh-resource://subagentchat/session/')
+  const built = workerChatAddressOf({ address: address('child-1') })
+  assert.deepEqual(parseLikeHost(built), { parentSessionId: 'p-1', childSessionId: 'child-1', mode: 'continuable' })
+  // 三种 mode 宿主都认。
+  for (const mode of SUBAGENT_CHAT_MODES) {
+    assert.equal(parseLikeHost(workerChatAddressOf({ address: address('c', { mode }) })).mode, mode)
+  }
+})
+
+test('an id that needs escaping survives the trip', () => {
+  const odd = 'session/a b?c&d'
+  const parsed = parseLikeHost(workerChatAddressOf({ address: address(odd) }))
+  assert.equal(parsed.childSessionId, odd, 'the child id must survive encoding intact')
+})
+
+test('a worker chat address is refused rather than built wrong', () => {
+  assert.throws(() => workerChatAddressOf({}), /subagent address is required/)
+  assert.throws(() => workerChatAddressOf({ address: { childSessionId: 'c', mode: 'continuable' } }), /parentSessionId is required/)
+  // 宿主只认三种 mode：别的一律打不开，宁可抛错也不拼一个点了没反应的地址。
+  assert.throws(() => workerChatAddressOf({ address: address('c', { mode: 'once' }) }), /mode must be one of/)
 })
