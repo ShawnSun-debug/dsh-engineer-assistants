@@ -1396,6 +1396,9 @@ test('the dock endpoint answers with the three fixed entries and an honest empty
   assert.equal(payload.model.master.sessionId, null)
   assert.deepEqual(payload.actions.workers, [])
   assert.equal(payload.actions.fixed.find((row) => row.id === 'master').action.kind, 'designate-master')
+  // 汇报槽位跟着同一次查询走：还没有第一拍时是 null，不是一个缺失的键。
+  assert.equal('report' in payload, true)
+  assert.equal(payload.report, null)
 })
 
 test('the dock endpoint reports which children ended, because the browser cannot tell', async () => {
@@ -1819,7 +1822,7 @@ test('an off switch registers no secretary effect and subscribes to no session e
   )
 })
 
-test('a tracked dispatch writes one planning report, and a repeat dispatch does not rewrite it', async () => {
+test('a tracked dispatch starts the watch but writes no planning report (ticket 21 moved report production)', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'secretary-plan-'))
   try {
     const harness = start({ secretaryEnabled: true, secretaryOrchestrators: [trackedOrchestrator] })
@@ -1829,6 +1832,8 @@ test('a tracked dispatch writes one planning report, and a repeat dispatch does 
       harness.effects.some(({ label }) => label === 'orchestrator: secretary watch'),
       'the listener is owned by an effect, so an unload removes it',
     )
+    const migrationWarnings = () =>
+      harness.logs.warn.filter((message) => /lib\/reporter\.js \(ticket 21\)/.test(message)).length
 
     const session = { id: 'orch-1', header: { cwd: dir } }
     await listener(
@@ -1836,45 +1841,43 @@ test('a tracked dispatch writes one planning report, and a repeat dispatch does 
       dispatchEvent({ description: '修登录', prompt: '让重试可用', verify: 'node --test', doneDefinition: '测试全绿' }),
     )
 
-    // 票 04 的归档约定：与节拍报告同一套 `<HH-mm>.md`，不再另写 .plan.json。
-    const files = await readdir(planDir(dir))
-    assert.equal(files.length, 1)
-    assert.match(files[0], /^\d{2}-\d{2}\.md$/)
-    const written = await readFile(join(planDir(dir), files[0]), 'utf8')
-    assert.match(written, /^# 秘书规划$/m)
-    assert.match(written, /- 时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}/)
-    assert.match(written, /- 会话：orch-1/)
-    assert.match(written, /## 步骤\n\n1\. 修登录 — 让重试可用/)
-    assert.match(written, /## 验收点\n\n- 测试全绿\n- node --test/)
-    assert.match(written, /## 触发依据\n\n- 来源：dispatch/)
-    assert.match(written, /- 调用：call-1/)
+    // 票 21：规划首报停产。这里断言的是「不再有文件」，而不是把断言放宽成「可能有」。
+    await assert.rejects(readdir(planDir(dir)), { code: 'ENOENT' }, 'the planning report is no longer written')
+    assert.equal(migrationWarnings(), 1, 'the migration is announced once')
 
-    // 同一会话第二次 dispatch：不再起表，第一份文件原样留着。
+    // 同一会话第二次 dispatch：不再起第二块表，也不再写任何东西。
+    const warned = harness.logs.warn.length
     await listener(session, dispatchEvent({ description: '第二份' }, { callId: 'call-2', time: 2000 }))
-    assert.equal(await readFile(join(planDir(dir), files[0]), 'utf8'), written)
+    await assert.rejects(readdir(planDir(dir)), { code: 'ENOENT' }, 'a repeat dispatch writes nothing either')
+    assert.equal(harness.logs.warn.length, warned, 'and it does not announce the migration twice')
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
 })
 
-test('an untracked session writes nothing, and registering it takes effect on the next dispatch', async () => {
+test('an untracked session starts nothing, and registering it takes effect on the next dispatch', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'secretary-untracked-'))
   try {
     const harness = start({ secretaryEnabled: true })
     const listener = harness.handlers.get('session/event')
     const session = { id: 'orch-1', header: { cwd: dir } }
+    const migrationWarnings = () =>
+      harness.logs.warn.filter((message) => /lib\/reporter\.js \(ticket 21\)/.test(message)).length
 
     await listener(session, dispatchEvent({ description: '未登记' }))
     await assert.rejects(readdir(join(dir, '.scratch')), { code: 'ENOENT' })
+    assert.equal(migrationWarnings(), 0, 'an untracked session never starts the watch')
 
     // 非 dispatch 的工具调用也不算出发。
     harness.state.secretaryOrchestrators.push(trackedOrchestrator)
     await listener(session, { type: 'tool/call', time: 1, data: { callId: 'c', name: 'read', arguments: '{}' } })
     await assert.rejects(readdir(join(dir, '.scratch')), { code: 'ENOENT' })
+    assert.equal(migrationWarnings(), 0)
 
-    // 登记表是 volatile 的，下一次 dispatch 就用新名单。
+    // 登记表是 volatile 的，下一次 dispatch 就用新名单；报告仍然不写（票 21）。
     await listener(session, dispatchEvent({ description: '修登录' }))
-    assert.equal((await readdir(planDir(dir))).length, 1)
+    assert.equal(migrationWarnings(), 1, 'the watch reacted to the newly registered session')
+    await assert.rejects(readdir(join(dir, '.scratch')), { code: 'ENOENT' }, 'the retired path wrote nothing')
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -2128,9 +2131,9 @@ test('the secretary endpoint lists the archived reports of a registered workspac
     const service = harness.services.get('orchestratorSecretary')
     assert.deepEqual((await service.secretaryState()).reports, [], 'no archive yet is an empty list, not an error')
 
-    // 票 03 的 watch 写规划首报；端点从票 04 的归档目录把它读回来。
-    const listener = harness.handlers.get('session/event')
-    await listener(session, dispatchEvent({ description: '修登录', prompt: '让重试可用' }))
+    // 票 21 之后没有写入方了；这里直接落一份归档，测的是端点读归档这一侧（读路径没有变）。
+    await mkdir(planDir(dir), { recursive: true })
+    await writeFile(join(planDir(dir), '09-03.md'), '# 秘书规划\n\n- 时间：2026-11-08 12:05\n- 会话：修登录\n')
 
     const payload = await service.secretaryState()
     assert.equal(payload.reports.length, 1)
@@ -2573,4 +2576,24 @@ test('a deploy is let through without touching the approval channel', async () =
   assert.deepEqual(decision, { kind: 'allow' })
   assert.equal(next, 1)
   assert.equal(asked, 0, 'a reversible category is recorded, not asked')
+})
+
+test('the reporter beat is mounted with the plugin and owned by an effect', () => {
+  const harness = start()
+  const beat = harness.effects.find(({ label }) => label === 'orchestrator: reporter beat')
+  assert.ok(beat, 'without this effect the beat is never started, and nothing stops it on unload')
+  assert.equal(typeof beat.dispose, 'function')
+  assert.doesNotThrow(() => beat.dispose(), 'unload stops the beat instead of leaking it')
+})
+
+test('apply wires the reporter beat, and its latest report rides the one dock payload', async () => {
+  // 这一票的接线也只有几行：节拍器不接上就永远没有报告，端点不带 report 就永远看不到。
+  // 断言的是一行源码，不是内部调用顺序；旧路径不再写盘也在这里钉住（两张报告不能并存）。
+  const source = await readFile(new URL('../lib/index.js', import.meta.url), 'utf8')
+  assert.match(source, /const reporter = createReporter\(\{/)
+  assert.match(source, /assignments: \(\) => panelRegistry\.table\(\)/)
+  assert.match(source, /attention: \(\) => panelAttentionOf\(panelInspector\)/)
+  assert.match(source, /report: \(\) => reporter\.latest\(\)/)
+  assert.match(source, /reporter\.start\(\)/)
+  assert.equal(source.includes('writeReport('), false, 'the retired secretary path must not write report files any more')
 })

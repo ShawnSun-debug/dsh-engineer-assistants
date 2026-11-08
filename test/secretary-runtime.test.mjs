@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
 import { registerHooks } from 'node:module'
 import test from 'node:test'
-import * as fsp from 'node:fs/promises'
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { createReporter } from '../lib/reporter.js'
 import { createDraftStore } from '../lib/secretary-nudge.js'
 import { collectOrchestratorRows } from '../lib/secretary-panel.js'
 
@@ -136,7 +136,6 @@ function harness({
   maxRunSeconds = 7200,
   messaging,
   drafts,
-  fs,
   projectionStateOf,
 } = {}) {
   const timer = fakeClock(START)
@@ -215,7 +214,6 @@ function harness({
     schedule: timer.schedule,
     cancel: timer.cancel,
     ...(drafts === undefined ? {} : { drafts }),
-    ...(fs === undefined ? {} : { fs }),
     ...(messaging === undefined
       ? {
           messaging: {
@@ -229,7 +227,19 @@ function harness({
   })
 
   const reportDir = (sessionId) => join(dir, ...REPORT_ROOT, sessionId)
-  const files = async (sessionId) => (await readdir(reportDir(sessionId))).sort()
+  // 票 21 之后这里再也不会生成目录：读不到就是「一份都没写」，不是测试错误。
+  const files = async (sessionId) => {
+    try {
+      return (await readdir(reportDir(sessionId))).sort()
+    } catch (error) {
+      if (error?.code === 'ENOENT') return []
+      throw error
+    }
+  }
+
+  // 报告不再落盘之后，步骤语义仍然由视图端点使用同一份 todos 读法（createSecretaryViewRead）。
+  const readView = async () =>
+    mod.createSecretaryViewRead({ ctx, config, registration, beatStatus: secretary.beatStatus })()
 
   return {
     secretary,
@@ -237,6 +247,8 @@ function harness({
     messages,
     logs,
     effects,
+    readView,
+    readStep: async () => (await readView()).orchestrators[0]?.step ?? null,
     handlers,
     rows,
     drafts,
@@ -267,87 +279,105 @@ async function withDir(run) {
   }
 }
 
-test('a tracked dispatch starts the beat, and nine minutes produce three delta reports', async () => {
+test('a tracked dispatch starts the beat, and nine minutes produce three ticks with no report file', async () => {
   await withDir(async (dir) => {
     const h = harness({ dir })
     await h.dispatch()
-    assert.deepEqual(await h.files('orch-1'), ['09-00.md'], 'the planning report is the first file')
+    assert.deepEqual(await h.files('orch-1'), [], 'the planning report is retired (ticket 21)')
 
     h.timer.advance(9 * MINUTE)
     await h.secretary.settled()
 
-    assert.deepEqual(await h.files('orch-1'), ['09-00.md', '09-03.md', '09-06.md', '09-09.md'])
-    assert.match(await readFile(join(h.reportDir('orch-1'), '09-00.md'), 'utf8'), /^# 秘书规划$/m)
-    for (const name of ['09-03.md', '09-06.md', '09-09.md']) {
-      const body = await readFile(join(h.reportDir('orch-1'), name), 'utf8')
-      assert.match(body, /^# 秘书汇报$/m, name)
-      assert.match(body, /- 类型：增量/, name)
-      // 会话名与规划首报同一规则：标题优先，缺标题才退回会话 id。
-      assert.match(body, /- 会话：修登录/, name)
-      assert.match(body, /\| worker-1 \| Working \|/, name)
-    }
-    assert.match(await readFile(join(h.reportDir('orch-1'), '09-03.md'), 'utf8'), /已跑时长：3 分 00 秒/)
-    assert.match(await readFile(join(h.reportDir('orch-1'), '09-09.md'), 'utf8'), /已跑时长：9 分 00 秒/)
+    assert.deepEqual(await h.files('orch-1'), [], 'the delta reports moved to lib/reporter.js')
+    assert.equal(h.secretary.beatStatus('orch-1').tickIndex, 3, 'the beat still ticks: drafts and settle detection')
+    assert.equal(h.messages.length, 0, 'the retired path bubbles to nobody')
+    assert.equal(
+      h.logs.filter((message) => /lib\/reporter\.js \(ticket 21\)/.test(message)).length,
+      1,
+      'the migration is announced exactly once',
+    )
   })
 })
 
-test('a tick with no substantial change writes its report and delivers nothing', async () => {
+test('the retired archive and the new reporter never coexist: one stays empty while the other reports', async () => {
+  await withDir(async (dir) => {
+    const h = harness({ dir })
+    const reporter = createReporter({
+      assignments: () => ({}),
+      attention: () => ({}),
+      now: h.timer.now,
+      schedule: h.timer.schedule,
+      cancel: h.timer.cancel,
+    })
+    reporter.start()
+    await h.dispatch()
+
+    h.timer.advance(9 * MINUTE)
+    await h.secretary.settled()
+
+    assert.deepEqual(await h.files('orch-1'), [], 'the old path produces no report file')
+    assert.equal(h.messages.length, 0, 'and no bubble')
+    assert.equal(reporter.count(), 3, 'the new reporter produced its reports on the same clock')
+    assert.ok(reporter.latest() !== null, 'so there is exactly one report source, not two')
+    reporter.stop('test-end')
+  })
+})
+
+test('a tick writes no report and interrupts nobody', async () => {
   await withDir(async (dir) => {
     const h = harness({ dir })
     await h.dispatch()
 
-    // 第一拍没有上一份摘要，按投影的初始态（Idle、无 worker）比较，所以它是有变化的。
     h.timer.advance(BEAT)
     await h.secretary.settled()
-    assert.equal(h.messages.length, 1, 'the first delta is compared with the baseline')
+    assert.equal(h.messages.length, 0, 'the first tick used to bubble against the baseline; now it does not')
 
-    // 第二拍什么都不变：文件照写，一个人都不打扰。
-    h.messages.length = 0
     h.timer.advance(BEAT)
     await h.secretary.settled()
-    assert.equal(h.messages.length, 0, 'nothing changed, so nobody is interrupted')
-    assert.deepEqual(await h.files('orch-1'), ['09-00.md', '09-03.md', '09-06.md'])
+    assert.equal(h.messages.length, 0, 'nothing is delivered from the retired path at all')
+    assert.deepEqual(await h.files('orch-1'), [], 'and nothing is written either')
+    assert.equal(h.secretary.beatStatus('orch-1').tickIndex, 2)
   })
 })
 
-test('a state flip delivers exactly one bubble, and only to the Master', async () => {
+test('a state flip no longer bubbles: the report belongs to the dock now', async () => {
   await withDir(async (dir) => {
     const h = harness({ dir, orchestrators: [{ id: 'orch-1', state: 'Working' }] })
     await h.dispatch()
     h.timer.advance(BEAT)
     await h.secretary.settled()
-    h.messages.length = 0
 
     // worker 还在跑，所以"两次都收工"不成立；会话自己的六态从 Working 翻到 Idle。
     h.setState('orch-1', 'Idle')
     h.timer.advance(BEAT)
     await h.secretary.settled()
 
-    assert.equal(h.messages.length, 1, 'one flip, one bubble')
-    assert.equal(h.messages[0].to, 'master-1', 'the declared Master is the only receiver')
-    assert.match(h.messages[0].text, /^秘书：状态翻转/)
+    assert.equal(h.messages.length, 0, 'no bubble may come out of the retired path')
     assert.equal(h.timer.pendingCount(), 1, 'a worker is still running, so the beat keeps going')
   })
 })
 
-test('secretaryNotifyOn gates the bubble, not the file', async () => {
+test('the retired path ignores secretaryNotifyOn: there is neither a bubble nor a file to gate', async () => {
   await withDir(async (dir) => {
     const h = harness({ dir, notifyOn: ['blocked'] })
     await h.dispatch()
     h.timer.advance(BEAT)
     await h.secretary.settled()
 
-    assert.equal(h.messages.length, 0, 'a state flip is not one of the allowed kinds')
-    assert.deepEqual(await h.files('orch-1'), ['09-00.md', '09-03.md'], 'the report is written anyway')
+    assert.equal(h.messages.length, 0, 'nothing is delivered, whatever the switch says')
+    assert.deepEqual(await h.files('orch-1'), [], 'and nothing is written either')
+    assert.equal(h.secretary.beatStatus('orch-1').tickIndex, 1, 'the beat itself is unaffected by the switch')
   })
 })
 
-test('a failing delivery is only logged, and the report stays on disk', async () => {
+test('the retired path never calls the delivery channel', async () => {
   await withDir(async (dir) => {
+    let calls = 0
     const h = harness({
       dir,
       messaging: {
         async deliver() {
+          calls += 1
           throw new Error('the Master session is gone')
         },
       },
@@ -356,39 +386,39 @@ test('a failing delivery is only logged, and the report stays on disk', async ()
     h.timer.advance(BEAT)
     await h.secretary.settled()
 
-    assert.deepEqual(await h.files('orch-1'), ['09-00.md', '09-03.md'])
-    assert.ok(
-      h.logs.some((message) => /notice was not delivered/.test(message)),
-      'the failure is recorded in the log',
-    )
-    assert.equal(h.timer.pendingCount(), 1, 'a lost bubble does not stop the beat')
+    assert.equal(calls, 0, 'the report path no longer delivers anything, so a broken channel cannot matter')
+    assert.deepEqual(await h.files('orch-1'), [], 'nor does it write a file')
+    assert.equal(h.timer.pendingCount(), 1, 'the beat keeps going')
   })
 })
 
-test('two settled ticks stop the beat, and a stopped beat writes nothing more', async () => {
+test('two settled ticks stop the beat, and a stopped beat does nothing more', async () => {
   await withDir(async (dir) => {
     const h = harness({ dir, workers: [{ id: 'worker-1', parent: 'orch-1', state: 'Completed' }] })
     await h.dispatch()
 
     h.timer.advance(BEAT)
     await h.secretary.settled()
-    assert.equal((await h.files('orch-1')).length, 2)
+    assert.deepEqual(await h.files('orch-1'), [], 'the retired path writes no report')
 
     // 上一拍是 Working，这一拍是 Idle：还没连续两次收工，继续走。
     h.setState('orch-1', 'Idle')
     h.timer.advance(BEAT)
     await h.secretary.settled()
-    assert.equal((await h.files('orch-1')).length, 3)
+    assert.equal(h.secretary.beatStatus('orch-1').tickIndex, 2, 'one settled tick is not enough')
+    assert.equal(h.timer.pendingCount(), 1)
 
-    // 两次都是 Idle 且没有 worker 在跑：这一拍写完就停表。
+    // 两次都是 Idle 且没有 worker 在跑：这一拍就停表（不再有「这一拍写完」这一步）。
     h.timer.advance(BEAT)
     await h.secretary.settled()
-    assert.equal((await h.files('orch-1')).length, 4)
+    assert.equal(h.secretary.beatStatus('orch-1').tickIndex, 3)
+    assert.equal(h.secretary.beatStatus('orch-1').stopReason, 'finished')
     assert.equal(h.timer.pendingCount(), 0, 'a finished run leaves no timer')
 
     h.timer.advance(60 * MINUTE)
     await h.secretary.settled()
-    assert.equal((await h.files('orch-1')).length, 4, 'a stopped beat writes nothing')
+    assert.equal(h.secretary.beatStatus('orch-1').tickIndex, 3, 'a stopped beat does nothing more')
+    assert.deepEqual(await h.files('orch-1'), [], 'and it never wrote a file on the way out')
   })
 })
 
@@ -400,12 +430,13 @@ test('the run cap stops the beat by itself', async () => {
     h.timer.advance(12 * MINUTE)
     await h.secretary.settled()
 
-    assert.deepEqual(await h.files('orch-1'), ['09-00.md', '09-03.md', '09-06.md', '09-09.md'])
+    assert.equal(h.secretary.beatStatus('orch-1').tickIndex, 3)
     assert.equal(h.timer.pendingCount(), 0, 'the cap leaves no timer behind')
+    assert.deepEqual(await h.files('orch-1'), [], 'the capped beat wrote nothing either')
 
     h.timer.advance(60 * MINUTE)
     await h.secretary.settled()
-    assert.equal((await h.files('orch-1')).length, 4, 'past the cap nothing is written')
+    assert.equal(h.secretary.beatStatus('orch-1').tickIndex, 3, 'past the cap nothing more happens')
   })
 })
 
@@ -422,48 +453,31 @@ test('unloading the plugin stops every beat and leaves no timer', async () => {
     await h.dispatch('orch-1')
     await h.dispatch('orch-2')
     assert.equal(h.timer.pendingCount(), 2, 'one beat per tracked session')
-    assert.deepEqual(await h.files('orch-1'), ['09-00.md'])
-    assert.deepEqual(await h.files('orch-2'), ['09-00.md'])
+    assert.deepEqual(await h.files('orch-1'), [])
+    assert.deepEqual(await h.files('orch-2'), [])
 
     h.unload()
     assert.equal(h.timer.pendingCount(), 0, 'every beat is stopped on unload')
 
     h.timer.advance(60 * MINUTE)
     await h.secretary.settled()
-    assert.deepEqual(await h.files('orch-1'), ['09-00.md'], 'no report may be written after unload')
-    assert.deepEqual(await h.files('orch-2'), ['09-00.md'])
+    assert.deepEqual(await h.files('orch-1'), [], 'no report may be written after unload')
+    assert.deepEqual(await h.files('orch-2'), [])
   })
 })
 
-test('a planning report that fails to write spends no trigger, so the next dispatch retries', async () => {
+test('the planning report is retired: the first dispatch writes nothing and spends the trigger', async () => {
   await withDir(async (dir) => {
-    // The first write fails the way a full disk would; the retry must still be allowed.
-    let failures = 1
-    const flaky = {
-      async mkdir(...args) {
-        return fsp.mkdir(...args)
-      },
-      async writeFile(...args) {
-        if (failures > 0) {
-          failures -= 1
-          throw new Error('disk full')
-        }
-        return fsp.writeFile(...args)
-      },
-    }
-    const h = harness({ dir, fs: flaky })
+    const h = harness({ dir })
 
     await h.dispatch()
-    assert.deepEqual(await h.files('orch-1'), [], 'the failed write left no planning report')
-    assert.equal(h.secretary.triggerState.has('orch-1'), false, 'the trigger was not spent')
-    assert.ok(
-      h.logs.some((message) => /cannot write the planning report/.test(message)),
-      'the failure is recorded in the log',
-    )
+    assert.deepEqual(await h.files('orch-1'), [], 'no planning report is written any more (ticket 21)')
+    assert.equal(h.secretary.triggerState.has('orch-1'), true, 'the trigger is spent at once; no write gates it')
+    assert.equal(h.timer.pendingCount(), 1, 'the beat still starts')
 
     await h.dispatch()
-    assert.deepEqual(await h.files('orch-1'), ['09-00.md'], 'the second dispatch writes the planning report')
-    assert.equal(h.secretary.triggerState.has('orch-1'), true, 'and now the trigger is spent')
+    assert.equal(h.timer.pendingCount(), 1, 'a second dispatch must not stack a second beat')
+    assert.deepEqual(await h.files('orch-1'), [], 'and still nothing is written')
   })
 })
 
@@ -473,6 +487,8 @@ test('the beat drafts the blocker each tick, and a decided draft does not block 
     const h = harness({ dir, orchestrators: [{ id: 'orch-1', state: 'Needs input' }], workers: [], drafts })
 
     await h.dispatch()
+    // 挂载初始化是异步的；dispatch 不再等一次写盘，所以这里显式等它落定。
+    await h.secretary.ready
     assert.equal(drafts.list().length, 1, 'the mount initialization drafts the current blocker')
     assert.equal(drafts.list()[0].status, 'pending')
 
@@ -520,9 +536,7 @@ test('the view beats follow the real beat: count grows per tick and capped after
 // 语义钉死在这里：total = 列表长度；index = 第一个 status 为 in_progress 的条目
 // 1-based 下标；没有 in_progress 时 index = 已 completed 条数（不超过 total）；
 // 空列表 / null / undefined / 抛错 / 非数组一律保持 step: null。
-// 报告里的「## 步骤」段是这条语义唯一的可观察出口，所以断言落在落盘的文件上。
-
-const STEPS_LINE = /## 步骤\n\n([^\n]*)/
+// 报告停产之后，视图端点行上的 step 是这条语义的出口，所以断言落在 readStep 上。
 
 test('the step is the first in_progress todo, over the whole list length (why: the six-state projection hardcoded step: null)', async () => {
   await withDir(async (dir) => {
@@ -536,12 +550,10 @@ test('the step is the first in_progress todo, over the whole list length (why: t
     h.timer.advance(BEAT)
     await h.secretary.settled()
 
-    const body = await readFile(join(h.reportDir('orch-1'), '09-03.md'), 'utf8')
-    assert.equal(STEPS_LINE.exec(body)[1], '第 2 步 / 共 3 步', 'total 是列表长度，index 是 in_progress 的 1-based 下标')
-    // 第一拍没有上一份，空基线 → 这一步就是一次真实的步骤推进。
-    assert.equal(h.messages.length, 1)
-    assert.match(h.messages[0].text, /步骤推进/)
-    assert.match(h.messages[0].text, /第 2 步 \/ 共 3 步/)
+    // 报告不再落盘；步骤的出口只剩视图端点，读法与 todos 投影都没有变。
+    assert.deepEqual(await h.files('orch-1'), [], 'the retired path writes no report')
+    assert.deepEqual(await h.readStep(), { index: 2, total: 3 }, 'total 是列表长度，index 是 in_progress 的 1-based 下标')
+    assert.equal(h.messages.length, 0, 'and nothing bubbles any more')
   })
 })
 
@@ -557,12 +569,12 @@ test('with no in_progress entry the step index is the completed count', async ()
     h.timer.advance(BEAT)
     await h.secretary.settled()
 
-    const body = await readFile(join(h.reportDir('orch-1'), '09-03.md'), 'utf8')
-    assert.equal(STEPS_LINE.exec(body)[1], '第 3 步 / 共 3 步', '全 completed：index = 已完成的条数，不超过 total')
+    assert.deepEqual(await h.files('orch-1'), [], 'the retired path writes no report')
+    assert.deepEqual(await h.readStep(), { index: 3, total: 3 }, '全 completed：index = 已完成的条数，不超过 total')
   })
 })
 
-test('a null todos state keeps the step empty and still writes the report', async () => {
+test('a null todos state keeps the step empty without writing a report', async () => {
   await withDir(async (dir) => {
     // 宿主对没写过的 todos 投影返回 null（init 值）。
     const h = harness({ dir, projectionStateOf: () => null })
@@ -570,9 +582,8 @@ test('a null todos state keeps the step empty and still writes the report', asyn
     h.timer.advance(BEAT)
     await h.secretary.settled()
 
-    const body = await readFile(join(h.reportDir('orch-1'), '09-03.md'), 'utf8')
-    assert.equal(STEPS_LINE.exec(body)[1], '未提供', 'null 不能变成一个编出来的步骤')
-    assert.deepEqual(await h.files('orch-1'), ['09-00.md', '09-03.md'], '投影缺一份可选字段，这一拍照旧落盘')
+    assert.equal(await h.readStep(), null, 'null 不能变成一个编出来的步骤')
+    assert.deepEqual(await h.files('orch-1'), [], '投影缺一份可选字段，旧路径也不再落盘')
   })
 })
 
@@ -584,13 +595,12 @@ test('an undefined todos state keeps the step empty', async () => {
     h.timer.advance(BEAT)
     await h.secretary.settled()
 
-    const body = await readFile(join(h.reportDir('orch-1'), '09-03.md'), 'utf8')
-    assert.equal(STEPS_LINE.exec(body)[1], '未提供')
-    assert.deepEqual(await h.files('orch-1'), ['09-00.md', '09-03.md'])
+    assert.equal(await h.readStep(), null)
+    assert.deepEqual(await h.files('orch-1'), [])
   })
 })
 
-test('a throwing todos read never fails the tick: the step is empty and the report lands', async () => {
+test('a throwing todos read never fails the tick: the step is empty and no report file appears', async () => {
   await withDir(async (dir) => {
     const h = harness({
       dir,
@@ -602,9 +612,8 @@ test('a throwing todos read never fails the tick: the step is empty and the repo
     h.timer.advance(BEAT)
     await h.secretary.settled()
 
-    const body = await readFile(join(h.reportDir('orch-1'), '09-03.md'), 'utf8')
-    assert.equal(STEPS_LINE.exec(body)[1], '未提供', '抛错也退回 null，不硬塞步骤')
-    assert.deepEqual(await h.files('orch-1'), ['09-00.md', '09-03.md'], '读不到 todos 不能让整拍失败')
+    assert.equal(await h.readStep(), null, '抛错也退回 null，不硬塞步骤')
+    assert.deepEqual(await h.files('orch-1'), [], '读不到 todos 也不会有报告文件')
     assert.ok(
       h.logs.some((message) => /todos/.test(message)),
       '降级读法进日志，下一次协议坏了能看见',

@@ -8,10 +8,12 @@ import {
   PANEL_ENDED_LIMIT,
   PANEL_METHOD,
   PANEL_PENDING_LIMIT,
+  PANEL_REPORT_TEXT_LIMIT,
   PANEL_SERVICE_KEY,
   PanelRemote,
   panelPayloadOf,
 } from '../lib/panel-remote.js'
+import { REQUIRED_ITEMS } from '../lib/reporter.js'
 
 const parent = 'session-master-1'
 const address = (childSessionId, extra = {}) => ({ parentSessionId: parent, childSessionId, mode: 'continuable', ...extra })
@@ -213,4 +215,76 @@ test('a long command is cut at the limit, and junk pending is empty rather than 
     const empty = await panelPayloadOf({ assignments: {}, pending })
     assert.deepEqual(empty.pending, [], JSON.stringify(pending))
   }
+})
+// ---- 汇报的落座（票 21）：同一次 panelState 里带上最近一份报告 ------------------------------
+//
+// 客户端只发这一条查询；报告不是第二个端点、也不是第二条读。这里断言的是「能直接画」：
+// 序号、时间、文本、五项齐全，坏输入只读到 null。
+
+const report = {
+  seq: 2,
+  at: 1_700_000_000_000,
+  stamp: '2026-11-08 12:05',
+  text: '# 汇报 2026-11-08 12:05\n\n- **在跑**：1 个在跑（w-1）',
+  oneLine: false,
+  items: [
+    { key: 'running', label: '在跑', text: '1 个在跑（w-1）' },
+    { key: 'stuck', label: '卡住 / 等批准', text: '无' },
+    { key: 'finished', label: '刚完成的产出与验证', text: '无' },
+    { key: 'cost', label: '花费', text: '未提供（没有可读的用量统计）' },
+    { key: 'next', label: '建议下一步', text: '还有 1 个 worker 在跑，等它们结束' },
+  ],
+}
+
+test('the latest report lands in the same payload as the model, actions and attention', async () => {
+  const remote = new PanelRemote({ assignments: () => ({}), report: () => report })
+  const payload = await remote.panelState()
+
+  assert.equal(payload.report.seq, 2)
+  assert.equal(payload.report.at, report.at)
+  assert.equal(payload.report.stamp, '2026-11-08 12:05')
+  assert.match(payload.report.text, /^# 汇报/)
+  assert.equal(payload.report.oneLine, false)
+  assert.deepEqual(payload.report.items.map((item) => item.key), [...REQUIRED_ITEMS])
+  assert.equal(payload.report.items[0].text, '1 个在跑（w-1）')
+  // 五项标签跟着同一份顺序走：客户端不必自己再维护一张键表。
+  assert.deepEqual(payload.report.items.map((item) => item.label), ['在跑', '卡住 / 等批准', '刚完成的产出与验证', '花费', '建议下一步'])
+})
+
+test('a missing or broken report reads as null, never as a thrown panel', async () => {
+  for (const value of [undefined, null, 'nope', 7, [], {}, { text: '' }]) {
+    const payload = await panelPayloadOf({ assignments: {}, report: value })
+    assert.equal(payload.report, null, JSON.stringify(value))
+  }
+  const throwing = new PanelRemote({
+    assignments: () => ({}),
+    report: () => {
+      throw new Error('the reporter is down')
+    },
+  })
+  assert.equal((await throwing.panelState()).report, null, 'a broken reporter must not take the whole panel with it')
+})
+
+test('a partial item list is completed to the five in order, never left short', async () => {
+  const payload = await panelPayloadOf({
+    assignments: {},
+    report: {
+      seq: 1,
+      at: 1,
+      stamp: '2026-11-08 12:05',
+      text: 'x',
+      items: [{ key: 'cost', text: ' 1.20 ' }, { key: 'not-a-key', text: 'x' }, null],
+    },
+  })
+  assert.deepEqual(payload.report.items.map((item) => item.key), [...REQUIRED_ITEMS])
+  assert.equal(payload.report.items[3].text, '1.20', 'the one item that was present survives normalization')
+  for (const [index, item] of payload.report.items.entries()) {
+    if (index !== 3) assert.equal(item.text, '未提供', 'a missing item names itself instead of being blank')
+  }
+})
+
+test('a runaway report text is cut at the panel limit', async () => {
+  const long = 'x'.repeat(PANEL_REPORT_TEXT_LIMIT * 3)
+  const payload = await panelPayloadOf({ assignments: {}, report: { ...report, text: long } })
+  assert.equal(payload.report.text.length, PANEL_REPORT_TEXT_LIMIT)
 })
