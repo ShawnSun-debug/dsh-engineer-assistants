@@ -129,3 +129,35 @@ test('the module exposes no way to change, stop or send to a worker', () => {
     assert.equal(typeof inspector[forbidden], 'undefined', `inspector must not expose ${forbidden}`)
   }
 })
+
+test('a reused child id can light again after the worker comes back', () => {
+  // 宿主的 durable child id 跨 activation epoch 复用。end() 是永久墓碑；没有 rearm，这个 id
+  // 第一次结束之后就再也不会被标出来——续跑后又卡住的 worker 在面板上永远不亮。
+  const inspector = createInspector({ now: () => 1000 })
+  assert.equal(inspector.observe({ workerId: 'w-1', retrying: true })?.workerId, 'w-1')
+  assert.deepEqual(inspector.activeAll(), { 'w-1': ['retrying'] })
+
+  inspector.end('w-1')
+  assert.deepEqual(inspector.activeAll(), {}, 'a tombstone silences the id')
+  assert.equal(inspector.observe({ workerId: 'w-1', retrying: true }), null, 'and observe stays silent')
+
+  inspector.rearm('w-1')
+  assert.deepEqual(inspector.activeReasons('w-1'), [], 'rearm clears the old reasons, it does not resurrect them')
+  assert.equal(inspector.observe({ workerId: 'w-1', retrying: true })?.workerId, 'w-1', 'the new epoch can light again')
+  assert.deepEqual(inspector.activeAll(), { 'w-1': ['retrying'] })
+})
+
+test('rearming a child nobody ever saw is harmless, and a blank id is refused', () => {
+  const inspector = createInspector()
+  assert.doesNotThrow(() => inspector.rearm('never-seen'))
+  assert.deepEqual(inspector.activeAll(), {})
+  assert.throws(() => inspector.rearm('   '), /a workerId is required/)
+})
+
+test('activeAll lists only ids that still carry a reason', () => {
+  const inspector = createInspector({ now: () => 1000 })
+  inspector.observe({ workerId: 'w-1', retrying: true })
+  inspector.observe({ workerId: 'w-2', lastToolAt: 0, now: 1000 })
+  inspector.end('w-2')
+  assert.deepEqual(inspector.activeAll(), { 'w-1': ['retrying'] })
+})
