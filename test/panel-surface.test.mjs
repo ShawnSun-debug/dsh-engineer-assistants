@@ -379,3 +379,10 @@ test('it composes with the real panel model, including the master trap', () => {
   // 固定入口就是模型里那三个，不多不少。
   assert.deepEqual(buildPanelModel({ assignments: empty, parentId: 'p' }).fixed.map((row) => row.id), [...FIXED_SECTIONS])
 })
+test('the badge needs workers only; the action table needs the fixed entries too', () => {
+  const workersOnly = { workers: [live('w1')] }
+  // 红点只数 worker：模型里没写 fixed 不该让它炸（这是 requireModel 收紧后的回归点）。
+  assert.equal(badgeOf({ model: workersOnly, attention: { w1: ['idle'] } }).count, 1)
+  // 动作表要遍历固定入口，缺 fixed 就说不清「传错了东西」，必须报错。
+  assert.throws(() => panelActionsOf({ model: workersOnly }), /no fixed array/)
+})
