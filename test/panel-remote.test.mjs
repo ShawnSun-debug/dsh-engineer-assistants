@@ -7,6 +7,7 @@ import {
   PANEL_ENDPOINT,
   PANEL_ENDED_LIMIT,
   PANEL_METHOD,
+  PANEL_PENDING_LIMIT,
   PANEL_SERVICE_KEY,
   PanelRemote,
   panelPayloadOf,
@@ -168,5 +169,48 @@ test('no attention map still reads as an object, never undefined', async () => {
   for (const attention of [undefined, null, 'nope', 7, []]) {
     const payload = await panelPayloadOf({ assignments: {}, attention })
     assert.deepEqual(payload.attention, {}, JSON.stringify(attention))
+  }
+})
+
+test('a pending approval reaches the payload with only the fields the panel draws', async () => {
+  const remote = new PanelRemote({
+    assignments: () => ({}),
+    pending: () => [
+      {
+        id: 'd-1',
+        workerId: 'w-1',
+        toolName: 'bash',
+        categories: ['file-destruction', 'file-destruction'],
+        command: 'rm -rf build',
+        at: 5,
+        secret: 'never serialized',
+      },
+      { id: '', workerId: 'w-2', command: 'no id, no card' },
+      null,
+      'junk',
+    ],
+  })
+  const payload = await remote.panelState()
+  assert.deepEqual(payload.pending, [
+    {
+      id: 'd-1',
+      workerId: 'w-1',
+      toolName: 'bash',
+      categories: ['file-destruction'],
+      command: 'rm -rf build',
+      at: 5,
+    },
+  ])
+})
+
+test('a long command is cut at the limit, and junk pending is empty rather than missing', async () => {
+  const long = 'x'.repeat(PANEL_PENDING_LIMIT * 20)
+  const payload = await panelPayloadOf({ assignments: {}, pending: [{ id: 'd-1', command: long }] })
+  assert.equal(payload.pending[0].command.length, 500, 'the panel never gets an unbounded command')
+  assert.equal(payload.pending[0].workerId, '')
+  assert.equal(payload.pending[0].at, 0)
+  for (const pending of [undefined, null, 'x', {}, [null]]) {
+    const empty = await panelPayloadOf({ assignments: {}, pending })
+    assert.deepEqual(empty.pending, [], JSON.stringify(pending))
   }
 })

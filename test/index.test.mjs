@@ -302,6 +302,8 @@ function fakeAgent({ id = 'agent-1', depth, header = {}, hidden = [] } = {}) {
   const restricted = []
   const guards = []
   const registered = []
+  // 这台 agent 自己上下文上注册的事件（票 20 的危险闸门走这条）。
+  const listeners = []
   // 当前生效的遮罩（安装时加入、disposer 执行时移除）：restricted 是历史，判断"现在被藏
   // 起来了什么"必须看这一个，否则取消再认领之后历史里的 read 会一直留在数组里。
   const masked = new Set()
@@ -310,6 +312,13 @@ function fakeAgent({ id = 'agent-1', depth, header = {}, hidden = [] } = {}) {
     options: { provider: 'p', model: 'm', ...(depth === undefined ? {} : { subagentDepth: depth }) },
     session: { header },
     ctx: {
+      on(name, fn) {
+        listeners.push([name, fn])
+        return () => {
+          const at = listeners.findIndex((entry) => entry[1] === fn)
+          if (at !== -1) listeners.splice(at, 1)
+        }
+      },
       tools: {
         restrict({ deny }) {
           restricted.push(deny[0])
@@ -334,7 +343,7 @@ function fakeAgent({ id = 'agent-1', depth, header = {}, hidden = [] } = {}) {
       },
     },
   }
-  return { agent, restricted, guards, registered, masked: () => [...masked] }
+  return { agent, restricted, guards, registered, listeners, masked: () => [...masked] }
 }
 
 /** Start the plugin and hand back its `agent/created` handler. */
@@ -2469,4 +2478,99 @@ test('a host without the webserver service still loads, and says the design rout
     harness.logs.warn.some((line) => line.includes('webServer')),
     'the missing service is reported, not silently ignored',
   )
+})
+
+// ---- 票 20：危险闸门接进 worker 的工具调用路径 --------------------------------------------
+
+test('every worker gets the danger gate on its own context, and a main agent gets none', () => {
+  const { created } = start()
+  const worker = fakeAgent({ id: 'w-1', depth: 1 })
+  created({ agent: worker.agent, source: 'resume' })
+  assert.deepEqual(worker.listeners.map(([name]) => name), ['tools/pre-execute'])
+  const main = fakeAgent({ id: 'main-1' })
+  created({ agent: main.agent, source: 'create' })
+  assert.deepEqual(main.listeners, [], 'the main agent keeps its own gate only')
+})
+
+test('a worker call waits for the approval channel, and the card is in the panel payload meanwhile', async () => {
+  const harness = start()
+  const { created, services, ctx } = harness
+  const { agent, listeners } = fakeAgent({ id: 'w-1', depth: 1 })
+  let resolveApproval
+  ctx.approval = {
+    request: () =>
+      new Promise((resolve) => {
+        resolveApproval = resolve
+      }),
+  }
+  created({ agent, source: 'resume' })
+  const handler = listeners.find(([name]) => name === 'tools/pre-execute')[1]
+  let next = 0
+  const pendingCall = handler(
+    { name: 'bash', arguments: { command: 'rm -rf build' }, agent, callId: 'c-1' },
+    async () => {
+      next += 1
+      return { kind: 'allow' }
+    },
+  )
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  const panel = services.get('orchestratorPanel')
+  const during = await panel.panelState()
+  assert.equal(during.pending.length, 1, 'the pending card is in the one payload')
+  assert.equal(during.pending[0].workerId, 'w-1')
+  assert.equal(during.pending[0].command, 'rm -rf build')
+  assert.deepEqual(during.pending[0].categories, ['file-destruction'])
+  assert.equal(next, 0, 'the body has not run yet')
+  resolveApproval('allowed-once')
+  assert.deepEqual(await pendingCall, { kind: 'allow' })
+  assert.equal(next, 1)
+  const after = await panel.panelState()
+  assert.deepEqual(after.pending, [])
+})
+
+test('a refused dangerous call never reaches the body, and the reason names the category', async () => {
+  const harness = start()
+  const { created, ctx } = harness
+  const { agent, listeners } = fakeAgent({ id: 'w-1', depth: 1 })
+  ctx.approval = { request: async () => 'rejected' }
+  created({ agent, source: 'resume' })
+  const handler = listeners.find(([name]) => name === 'tools/pre-execute')[1]
+  let next = 0
+  const decision = await handler(
+    { name: 'bash', arguments: { command: 'git push --force' }, agent, callId: 'c-2' },
+    async () => {
+      next += 1
+      return { kind: 'allow' }
+    },
+  )
+  assert.equal(next, 0, 'the command never ran')
+  assert.equal(decision.kind, 'deny')
+  assert.match(decision.reason, /history-rewrite/)
+  assert.match(decision.reason, /git push --force/)
+})
+
+test('a deploy is let through without touching the approval channel', async () => {
+  const harness = start()
+  const { created, ctx } = harness
+  const { agent, listeners } = fakeAgent({ id: 'w-1', depth: 1 })
+  let asked = 0
+  ctx.approval = {
+    request: async () => {
+      asked += 1
+      return 'allowed-once'
+    },
+  }
+  created({ agent, source: 'resume' })
+  const handler = listeners.find(([name]) => name === 'tools/pre-execute')[1]
+  let next = 0
+  const decision = await handler(
+    { name: 'bash', arguments: { command: 'kubectl apply -f app.yaml' }, agent },
+    async () => {
+      next += 1
+      return { kind: 'allow' }
+    },
+  )
+  assert.deepEqual(decision, { kind: 'allow' })
+  assert.equal(next, 1)
+  assert.equal(asked, 0, 'a reversible category is recorded, not asked')
 })
