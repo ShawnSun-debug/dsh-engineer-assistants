@@ -1347,6 +1347,25 @@ test('the dock endpoint reports the effective master, including a generated resi
   assert.equal((await service.panelState()).model.master.sessionId, null)
 })
 
+test('the dock attention map is the inspector state, filtered only on the drawing side', () => {
+  // 读的这侧只交事实：监工说谁卡着就交谁。哪一行真的画出来由客户端求交集，两处各过滤一遍
+  // 只会分叉（先前按登记表过滤，结果登记表没有写入方，红点永远为空）。
+  const inspector = { activeAll: () => ({ 'w-1': ['retrying'], 'w-2': ['idle', 'waiting-approval'] }) }
+  assert.deepEqual(mod.panelAttentionOf(inspector), { 'w-1': ['retrying'], 'w-2': ['idle', 'waiting-approval'] })
+
+  // 监工坏了、形状不对：都读作「没人卡着」，不抛。
+  const broken = { activeAll: () => { throw new Error('inspector is down') } }
+  assert.deepEqual(mod.panelAttentionOf(broken), {})
+  assert.deepEqual(mod.panelAttentionOf({ activeAll: () => 'nope' }), {})
+  for (const bad of [null, undefined, {}, 'inspector', 7]) assert.deepEqual(mod.panelAttentionOf(bad), {})
+})
+
+test('the dock endpoint always answers an attention map, empty when nobody is stuck', async () => {
+  const harness = start()
+  const payload = await harness.services.get('orchestratorPanel').panelState()
+  assert.deepEqual(payload.attention, {}, 'nothing is stuck in a fresh host')
+})
+
 test('a host without a usable storage domain degrades explicitly and injects nothing', async () => {
   const missing = start({ memoryEnabled: true })
   await settle()

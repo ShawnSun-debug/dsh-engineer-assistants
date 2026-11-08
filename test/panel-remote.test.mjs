@@ -146,3 +146,27 @@ test('no end-of-worker record reads as an empty list, never undefined', async ()
     assert.deepEqual(payload.ended, [], JSON.stringify(ended))
   }
 })
+
+test('the payload carries an attention map with only real ids and real reasons', async () => {
+  const remote = new PanelRemote({
+    assignments: () => ({}),
+    attention: () => ({
+      ' w-1 ': ['retrying', ' retrying ', ''],
+      'w-2': [],
+      'w-3': 'nope',
+      '   ': ['idle'],
+      42: ['idle'],
+    }),
+  })
+  const payload = await remote.panelState()
+  // 客户端直接按这张表数点：空 id、空理由、空数组都不该进得去。数字一样写法的键是合法的
+  // 字符串 id（对象键本来就是字符串），所以 '42' 留下。
+  assert.deepEqual(payload.attention, { 'w-1': ['retrying'], '42': ['idle'] })
+})
+
+test('no attention map still reads as an object, never undefined', async () => {
+  for (const attention of [undefined, null, 'nope', 7, []]) {
+    const payload = await panelPayloadOf({ assignments: {}, attention })
+    assert.deepEqual(payload.attention, {}, JSON.stringify(attention))
+  }
+})
