@@ -1015,6 +1015,20 @@ test('the registry writer turns a dispatch into exactly one live row, and a sett
   assert.equal(Object.keys(registry.table()).length, 1, 'still one row')
 })
 
+test('the row category comes from the preset, and stays empty when none was applied', () => {
+  // 票 15：面板行上的类别不再是常量 'code'。派发方把预设的类别交进来（lib/presets.js 的
+  // category 字段），没有预设就留空——空是「未施加预设」这个事实，不是缺省成 code。
+  const registry = mod.createPanelRegistry()
+  registry.dispatched('with-preset', { parentId: 'p', presetId: 'verifier', category: 'non-code' })
+  registry.dispatched('no-preset', { parentId: 'p' })
+  registry.dispatched('junk-category', { parentId: 'p', category: 'not-a-category' })
+  const rows = registry.table()
+  assert.equal(rows['with-preset'].category, 'non-code')
+  assert.equal(rows['with-preset'].presetId, 'verifier', 'the preset id travels with its category')
+  assert.equal(rows['no-preset'].category, '', 'no preset means no category, never the old constant')
+  assert.equal(rows['junk-category'].category, '', 'an unknown category is not written as code either')
+})
+
 test('rows carry the dispatch time, so the panel order is dispatch order', () => {
   // startedAt 缺省会落成 0，面板排序就退化成按 id 排——「先派的在上面」变成假话。
   const registry = mod.createPanelRegistry()
@@ -1999,14 +2013,15 @@ test('with no todos projection answer the row still carries step, as null (why: 
   assert.equal(payload.orchestrators[0].step, null)
 })
 
-test('a row registered without a workspace reads its reports from the session cwd (why: the history stayed blank forever)', async () => {
+test('a row registered without a workspace resolves it from the session cwd, and reads no archive', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'secretary-noworkspace-'))
   try {
+    // 票 15 起端点不读归档；落一份在磁盘上也不能被列出来。
     await mkdir(planDir(dir), { recursive: true })
     const reportPath = join(planDir(dir), '05-07.md')
     await writeFile(reportPath, '# 秘书汇报\n\n- 类型：增量\n')
     // The settings page registers a session id and nothing else, so the ledger row's workspace is
-    // the empty string. The report is really under that session's header.cwd.
+    // the empty string. The row still resolves the workspace from that session's header.cwd.
     const session = { id: 'orch-1', title: '修登录', header: { id: 'orch-1', cwd: dir } }
     const harness = start({
       secretaryEnabled: true,
@@ -2022,9 +2037,8 @@ test('a row registered without a workspace reads its reports from the session cw
     assert.deepEqual(payload.registry.orchestrators, [
       { sessionId: 'orch-1', workspace: dir, workspaceMissing: false, title: '', trackedAt: 1 },
     ])
-    assert.equal(payload.reports.length, 1, 'the archived report is listed once the workspace is known')
-    assert.equal(payload.reports[0].path, reportPath)
-    assert.equal(payload.reports[0].kind, 'delta')
+    assert.deepEqual(payload.reports, [], 'the file on disk is not listed: the archive read path is gone')
+    assert.ok(reportPath.startsWith(dir), 'the fixture really wrote under the row workspace')
 
     // A session the host cannot resolve is flagged, not pointed at a guessed directory: the
     // report root of an empty or borrowed workspace is never read.
@@ -2118,7 +2132,8 @@ test('the view read is a pure snapshot: two reads never draft a nudge (why: the 
   assert.equal(first.orchestrators[0].state, 'Needs input', 'and it still reports the state it read')
 })
 
-test('the secretary endpoint lists the archived reports of a registered workspace', async () => {
+test('the secretary endpoint never lists archived reports, even when one is on disk', async () => {
+  // 票 15：归档汇报停产，端点只留空的 reports 段（形状不变），不再碰任何报告目录。
   const dir = await mkdtemp(join(tmpdir(), 'secretary-view-'))
   try {
     const session = { id: 'orch-1', title: '修登录', header: { id: 'orch-1', cwd: dir } }
@@ -2131,24 +2146,12 @@ test('the secretary endpoint lists the archived reports of a registered workspac
     const service = harness.services.get('orchestratorSecretary')
     assert.deepEqual((await service.secretaryState()).reports, [], 'no archive yet is an empty list, not an error')
 
-    // 票 21 之后没有写入方了；这里直接落一份归档，测的是端点读归档这一侧（读路径没有变）。
     await mkdir(planDir(dir), { recursive: true })
     await writeFile(join(planDir(dir), '09-03.md'), '# 秘书规划\n\n- 时间：2026-11-08 12:05\n- 会话：修登录\n')
 
     const payload = await service.secretaryState()
-    assert.equal(payload.reports.length, 1)
-    assert.equal(payload.reports[0].sessionId, 'orch-1')
-    assert.equal(payload.reports[0].kind, 'plan')
-    assert.match(payload.reports[0].path, /\.scratch[\\/]master-secretary[\\/]reports[\\/]orch-1[\\/]\d{2}-\d{2}\.md$/)
-    // Ticket 08: the report's diff is the structured shape (here all three groups empty).
-    assert.deepEqual(payload.reports[0].changes, { completed: [], blocked: [], flipped: [] })
-    assert.equal(payload.reports[0].error, null)
-    assert.ok(payload.reports[0].bytes > 0)
-    assert.deepEqual(payload.orchestrators[0].lastReport, {
-      path: payload.reports[0].path,
-      at: payload.reports[0].at,
-      kind: 'plan',
-    })
+    assert.deepEqual(payload.reports, [], 'a file on disk is not listed any more')
+    assert.equal(payload.orchestrators[0].lastReport, null, 'no report row means no lastReport either')
     assert.equal(payload.orchestrators[0].live, false, 'no live agent means not live, not an error')
   } finally {
     await rm(dir, { recursive: true, force: true })
