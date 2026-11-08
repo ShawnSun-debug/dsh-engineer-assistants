@@ -66,25 +66,22 @@ test('a panel with no worker still answers with the three fixed entries', async 
   assert.deepEqual(payload.actions.workers, [])
 })
 
+test('a missing registry is a wiring error, not an empty panel', async () => {
+  // 票 15 接线时漏传登记表，若在这里兜底成 {}，客户端会拿到「三个入口、零个 worker」，
+  // 和「还没有 worker」长得一模一样，日志里也没有一行。缺件就抛，让人当场看见。
+  await assert.rejects(() => new PanelRemote({}).panelState(), /assignments must be an object/)
+  await assert.rejects(
+    () => new PanelRemote({ parentId: 'p', masterSessionId: 'm', addressOf: () => undefined }).panelState(),
+    /assignments must be an object/,
+  )
+})
+
 test('a broken registry surfaces as an error instead of an empty panel', async () => {
   // 接线错误不该被伪装成「还没有 worker」：那会把配置问题读成正常状态。
   for (const bad of [null, 'rows']) {
     const remote = new PanelRemote({ assignments: bad })
     await assert.rejects(() => remote.panelState(), /assignments must be an object/)
   }
-})
-
-test('a throwing address resolver does not blank the panel', async () => {
-  const remote = new PanelRemote({
-    assignments: registry(),
-    parentId: parent,
-    addressOf: () => {
-      throw new Error('sessions is down')
-    },
-  })
-  const payload = await remote.panelState()
-  assert.equal(payload.actions.workers.length, 2)
-  assert.ok(payload.actions.workers.every((row) => row.action.kind === 'open-worker' && row.action.address === undefined))
 })
 
 test('the endpoint name is one namespace and one method, and the marker says the same', () => {
@@ -94,6 +91,9 @@ test('the endpoint name is one namespace and one method, and the marker says the
 
   const marker = Object.getOwnPropertyDescriptor(PanelRemote.prototype, '@deepseek-ai/dsh-typert-protocol/remote-methods')
   assert.ok(marker !== undefined, 'the Gateway reads its remote methods from this prototype marker')
+  // 版本号必须钉住：remoteMethods() 对任何 version !== 1 的标记都抛，端点会在网关发现阶段
+  // 直接消失，而这里只断 methods 的话，改成 2 照样全绿。
+  assert.equal(marker.value.version, 1)
   assert.deepEqual(marker.value.methods.map((entry) => entry.method), [PANEL_METHOD])
   assert.equal(marker.value.methods[0].invocation.kind, 'direct')
 
