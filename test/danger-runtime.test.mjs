@@ -120,6 +120,19 @@ test('one command on two different tools is two different things', async () => {
   assert.equal(asked, 2, 'the key includes the intent, so these do not merge')
 })
 
+test('the context carries the session id, because the panel rows are keyed by it', async () => {
+  let seen
+  const policy = createDangerPolicy({
+    check: async (plan, context) => {
+      seen = context
+      return declined
+    },
+  })
+  const agent = { id: 'agent-9', session: { id: 'session-9' } }
+  await run(policy, { args: { command: 'rm -rf build' }, agent })
+  assert.equal(seen.workerId, 'session-9', 'the session id, not the agent id')
+})
+
 test('junk arguments are not a command, so nothing is asked', async () => {
   const asked = []
   const policy = createDangerPolicy({
