@@ -96,3 +96,22 @@ test('bad input is refused', () => {
   assert.throws(() => closeTab(model, ''), /session id is required/)
   assert.throws(() => endWorker(model, ''), /session id is required/)
 })
+test('only worker rows reach the list, not the inspector or reporter under the same parent', () => {
+  let rows = reserveChildId({}, { id: 'w1', parentId: parent, now: 1000 })
+  rows = assignSession(rows, { sessionId: 'w1', kind: 'worker', parentId: parent, status: 'running', startedAt: 1000 })
+  rows = reserveChildId(rows, { id: 'watch-1', parentId: parent, kind: 'inspector', now: 2000 })
+  rows = assignSession(rows, { sessionId: 'watch-1', kind: 'inspector', parentId: parent, status: 'running', startedAt: 2000 })
+  const model = buildPanelModel({ assignments: rows, parentId: parent })
+  // 下段是 worker 列表：巡检行也挂在同一个 parent 下面，但它不是 worker。
+  assert.deepEqual(model.workers.map((row) => row.sessionId), ['w1'])
+})
+
+test('a retried worker carries its retry count, and a fresh one reads zero', () => {
+  let rows = reserveChildId({}, { id: 'w1', parentId: parent, now: 1000 })
+  rows = assignSession(rows, { sessionId: 'w1', kind: 'worker', parentId: parent, status: 'running', startedAt: 1000, retries: 1 })
+  assert.equal(buildPanelModel({ assignments: rows, parentId: parent }).workers[0].retries, 1)
+
+  const fresh = reserveChildId({}, { id: 'w2', parentId: parent, now: 1000 })
+  // 没有重试记录读作 0，不是 undefined：面板不该显示「undefined 次」。
+  assert.equal(buildPanelModel({ assignments: fresh, parentId: parent }).workers[0].retries, 0)
+})
