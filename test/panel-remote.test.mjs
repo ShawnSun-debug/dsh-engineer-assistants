@@ -3,7 +3,14 @@ import test from 'node:test'
 
 import { assignSession, reserveChildId } from '../lib/assignments.js'
 import { FIXED_SECTIONS } from '../lib/panel-model.js'
-import { PANEL_ENDPOINT, PANEL_METHOD, PANEL_SERVICE_KEY, PanelRemote, panelPayloadOf } from '../lib/panel-remote.js'
+import {
+  PANEL_ENDPOINT,
+  PANEL_ENDED_LIMIT,
+  PANEL_METHOD,
+  PANEL_SERVICE_KEY,
+  PanelRemote,
+  panelPayloadOf,
+} from '../lib/panel-remote.js'
 
 const parent = 'session-master-1'
 const address = (childSessionId, extra = {}) => ({ parentSessionId: parent, childSessionId, mode: 'continuable', ...extra })
@@ -111,4 +118,31 @@ test('the payload function is usable without the Service, for tests and other ca
   const payload = panelPayloadOf({ assignments: registry(), parentId: parent })
   assert.deepEqual(payload.model.workers.map((row) => row.sessionId), ['w1', 'w2'])
   assert.deepEqual(payload.actions.workers.map((row) => row.action.kind), ['open-worker', 'open-worker'])
+})
+
+test('the payload carries the end-of-worker record the client sweeps on', async () => {
+  // 浏览器自己判不出「谁结束了」：开着的页签会把自己那个子会话 retain 住。所以这条是服务端职责。
+  const remote = new PanelRemote({
+    assignments: () => ({}),
+    ended: () => ['w-1', '  w-2  ', '', 'w-1', 42, null],
+  })
+  const payload = await remote.panelState()
+  assert.deepEqual(payload.ended, ['w-1', 'w-2'], 'blank, non-string and duplicate ids are dropped')
+})
+
+test('the end-of-worker record is a ring: the oldest ids fall off', async () => {
+  const many = []
+  for (let index = 0; index < PANEL_ENDED_LIMIT + 7; index += 1) many.push('w-' + index)
+  const remote = new PanelRemote({ assignments: () => ({}), ended: () => many })
+  const payload = await remote.panelState()
+  assert.equal(payload.ended.length, PANEL_ENDED_LIMIT)
+  assert.equal(payload.ended[payload.ended.length - 1], 'w-' + (many.length - 1), 'the newest survive')
+  assert.equal(payload.ended.includes('w-0'), false, 'the oldest are dropped')
+})
+
+test('no end-of-worker record reads as an empty list, never undefined', async () => {
+  for (const ended of [undefined, null, 'nope', 7, {}]) {
+    const payload = await panelPayloadOf({ assignments: {}, ended })
+    assert.deepEqual(payload.ended, [], JSON.stringify(ended))
+  }
 })
