@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { registerHooks } from 'node:module'
 import test from 'node:test'
+import { assignSession, findAssignment, finishSession, reserveChildId } from '../lib/assignments.js'
 import { allowGuard } from '../lib/gate.js'
 import { MAX_MESSAGE_BYTES, MAX_MESSAGE_QUEUE, checkInbound, composeMessage, deliverMessage } from '../lib/master-messaging.js'
 import { MEMORY_DOMAIN_NAME, MEMORY_INDEX_SECTION, MEMORY_SECTION_ORDER } from '../lib/memory.js'
@@ -980,6 +981,91 @@ test('a refresh without agents.roots, or a broken registry, is not fatal', () =>
 
 // ---- Automatic retry of a child that died without a closing message ---------------------
 
+test('the registry writer turns a dispatch into exactly one live row, and a settle into a terminal one', () => {
+  // 面板上的行只来自这里。写成独立工厂，是因为「有没有东西可画」全押在它上面。
+  const registry = mod.createPanelRegistry()
+  assert.deepEqual(registry.table(), {})
+
+  assert.equal(registry.dispatched('child-1', { parentId: 'parent-1', label: '慢活' }), true)
+  const rows = registry.table()
+  assert.deepEqual(Object.keys(rows), ['child-1'])
+  assert.equal(rows['child-1'].status, 'running')
+  assert.equal(rows['child-1'].parentId, 'parent-1')
+  assert.equal(rows['child-1'].kind, 'worker')
+
+  // 同一次派发再来一次（冷恢复、或事件重放）：还是一条，不产生第二行。
+  assert.equal(registry.dispatched('child-1', { parentId: 'parent-1' }), true)
+  assert.equal(Object.keys(registry.table()).length, 1)
+
+  assert.equal(registry.settled('child-1', { ok: true }), true)
+  assert.equal(registry.table()['child-1'].status, 'done', 'a terminal row is what makes the panel drop it')
+
+  // 冷恢复：同一个 durable id 又活过来。assignSession 拒绝写终态行，重开走 reopenSession。
+  assert.equal(registry.dispatched('child-1', { parentId: 'parent-1' }), true)
+  assert.equal(registry.table()['child-1'].status, 'running', 'a resumed worker comes back on the panel')
+  assert.equal(Object.keys(registry.table()).length, 1, 'still one row')
+})
+
+test('rows carry the dispatch time, so the panel order is dispatch order', () => {
+  // startedAt 缺省会落成 0，面板排序就退化成按 id 排——「先派的在上面」变成假话。
+  const registry = mod.createPanelRegistry()
+  registry.dispatched('zeta', { parentId: 'p' })
+  registry.dispatched('alpha', { parentId: 'p' })
+  const rows = Object.values(registry.table())
+  assert.equal(rows.length, 2)
+  assert.ok(rows.every((row) => typeof row.startedAt === 'number' && row.startedAt > 0), 'a real timestamp, not 0')
+})
+
+test('the registry writer refuses what it cannot record, and never throws at the dispatch', () => {
+  const warnings = []
+  const registry = mod.createPanelRegistry({ warn: (message) => warnings.push(message) })
+  // 没有父会话、空 id：都不记，也不抛。
+  assert.equal(registry.dispatched('child-1', {}), false)
+  assert.equal(registry.dispatched('   ', { parentId: 'p' }), false)
+  assert.deepEqual(registry.table(), {})
+  // 没登记过的 id 结算：finishSession 自己忽略，不算错。
+  assert.equal(registry.settled('ghost', { ok: false }), true)
+  // 写日志本身抛错也不能影响调用方。
+  const crashing = mod.createPanelRegistry({ warn: () => { throw new Error('logger is gone') } })
+  assert.equal(crashing.dispatched('child-1', { parentId: 'p' }), true)
+  assert.equal(crashing.table()['child-1'].status, 'running')
+})
+
+test('a dispatched worker lands in the registry as one live row, and settles to a terminal one', () => {
+  // 面板的行只能来自这里：插件确定「这个子会话是我派的」的那一拍。写成可测的纯簿记，
+  // 是因为登记表决定面板上有没有东西可画。
+  let table = {}
+  const hooks = mod.createSupervisionHooks(
+    { track() {}, forget() {}, has: () => false },
+    {
+      panel: {
+        dispatched: (childId, info) => {
+          if (findAssignment(table, childId) === undefined) {
+            table = reserveChildId(table, { id: childId, parentId: info.parentId, kind: 'worker', category: 'code' })
+          }
+          table = assignSession(table, { sessionId: childId, kind: 'worker', parentId: info.parentId, status: 'running' })
+        },
+        settled: (childId, result) => {
+          table = finishSession(table, { sessionId: childId, status: result.ok === true ? 'done' : 'failed' })
+        },
+      },
+    },
+  )
+  let resolve
+  const receipt = new Promise((done) => {
+    resolve = done
+  })
+  hooks.onStarted({ id: 'parent-1' }, { childId: 'child-1', result: receipt }, { description: '慢活' })
+  assert.deepEqual(Object.keys(table), ['child-1'])
+  assert.equal(table['child-1'].status, 'running')
+  assert.equal(table['child-1'].parentId, 'parent-1')
+
+  resolve()
+  return receipt.then(() => {
+    assert.equal(table['child-1'].status, 'done', 'a settled dispatch leaves a terminal row, so the panel drops it')
+  })
+})
+
 test('onStarted hands the dispatched child to the retry policy, and only for a real dispatch', () => {
   const tracked = []
   const retry = {
@@ -1358,6 +1444,31 @@ test('the dock attention map is the inspector state, filtered only on the drawin
   assert.deepEqual(mod.panelAttentionOf(broken), {})
   assert.deepEqual(mod.panelAttentionOf({ activeAll: () => 'nope' }), {})
   for (const bad of [null, undefined, {}, 'inspector', 7]) assert.deepEqual(mod.panelAttentionOf(bad), {})
+})
+
+test('a dispatched worker shows up in the dock endpoint, and a settled one drops out', async () => {
+  // 全链一次：派发写登记表 → 端点按登记表建模型 → 面板有行。中间没有别的写入方。
+  const { PanelRemote } = await import('../lib/panel-remote.js')
+  const registry = mod.createPanelRegistry()
+  const remote = new PanelRemote({ assignments: () => registry.table(), parentId: 'parent-1' })
+
+  assert.deepEqual((await remote.panelState()).model.workers, [], 'an empty registry is an empty panel')
+
+  registry.dispatched('child-1', { parentId: 'parent-1' })
+  const live = await remote.panelState()
+  assert.deepEqual(live.model.workers.map((row) => row.sessionId), ['child-1'])
+  assert.equal(live.actions.workers[0].action.kind, 'open-worker', 'a live row is clickable')
+
+  registry.settled('child-1', { ok: true })
+  assert.deepEqual((await remote.panelState()).model.workers, [], 'only running and reserved rows are listed')
+})
+
+test('apply actually hands the registry to the supervision hooks', async () => {
+  // 运行期接线只有一行，删掉它所有测试都还绿——所以用源码断言钉住它，和客户端 bundle
+  // 那些静态断言同一个路数。
+  const source = await readFile(new URL('../lib/index.js', import.meta.url), 'utf8')
+  assert.match(source, /panel: \{ dispatched: panelRegistry\.dispatched, settled: panelRegistry\.settled \}/)
+  assert.match(source, /assignments: \(\) => panelRegistry\.table\(\)/)
 })
 
 test('the dock endpoint always answers an attention map, empty when nobody is stuck', async () => {
