@@ -769,3 +769,38 @@ test('the worker variant drops the main-agent rule and keeps the same contract',
   assert.equal(definition.parameters.items.required, true)
   assert.match(definition.parameters.provider.description, /only when the user explicitly names/)
 })
+
+test('a batch reports every child it starts to the same seam the single dispatch uses', async () => {
+  // 面板上的行只来自这里：批次不从这条缝上报，从批次派出去的 worker 就不存在，
+  // 而单发的会出现——少报一半比整片空白更难发现。
+  const { subagents } = trackedSubagents(async () => textResult('done'))
+  const started = []
+  const definition = createOrchestrateTool({
+    defineTool: (value) => value,
+    subagents,
+    config: cfg(),
+    onStarted: (parent, handle, args) => started.push({ parent: parent?.id, childId: handle.childId, label: args?.description }),
+  })
+  const result = await definition.execute(
+    { items: ['a', 'b'], stages: [{ name: 'go', prompt: 'do it' }] },
+    exec(),
+  )
+  assert.ok(result !== undefined)
+  assert.deepEqual(started.map((row) => row.childId).sort(), ['child-1', 'child-2'])
+  assert.equal(started[0].parent, 'main')
+  assert.match(started[0].label, /orchestrate go/)
+})
+
+test('a throwing onStarted cannot stop a batch from running', async () => {
+  const { subagents } = trackedSubagents(async () => textResult('done'))
+  const definition = createOrchestrateTool({
+    defineTool: (value) => value,
+    subagents,
+    config: cfg(),
+    onStarted: () => {
+      throw new Error('the ledger is on fire')
+    },
+  })
+  const result = await definition.execute({ items: ['a'], stages: [{ name: 'go', prompt: 'do it' }] }, exec())
+  assert.ok(result !== undefined, 'the batch still ran')
+})

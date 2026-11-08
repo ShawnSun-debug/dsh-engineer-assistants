@@ -999,6 +999,21 @@ test('the registry writer turns a dispatch into exactly one live row, and a sett
 
   assert.equal(registry.settled('child-1', { ok: true }), true)
   assert.equal(registry.table()['child-1'].status, 'done', 'a terminal row is what makes the panel drop it')
+
+  // 冷恢复：同一个 durable id 又活过来。assignSession 拒绝写终态行，重开走 reopenSession。
+  assert.equal(registry.dispatched('child-1', { parentId: 'parent-1' }), true)
+  assert.equal(registry.table()['child-1'].status, 'running', 'a resumed worker comes back on the panel')
+  assert.equal(Object.keys(registry.table()).length, 1, 'still one row')
+})
+
+test('rows carry the dispatch time, so the panel order is dispatch order', () => {
+  // startedAt 缺省会落成 0，面板排序就退化成按 id 排——「先派的在上面」变成假话。
+  const registry = mod.createPanelRegistry()
+  registry.dispatched('zeta', { parentId: 'p' })
+  registry.dispatched('alpha', { parentId: 'p' })
+  const rows = Object.values(registry.table())
+  assert.equal(rows.length, 2)
+  assert.ok(rows.every((row) => typeof row.startedAt === 'number' && row.startedAt > 0), 'a real timestamp, not 0')
 })
 
 test('the registry writer refuses what it cannot record, and never throws at the dispatch', () => {
@@ -1446,6 +1461,14 @@ test('a dispatched worker shows up in the dock endpoint, and a settled one drops
 
   registry.settled('child-1', { ok: true })
   assert.deepEqual((await remote.panelState()).model.workers, [], 'only running and reserved rows are listed')
+})
+
+test('apply actually hands the registry to the supervision hooks', async () => {
+  // 运行期接线只有一行，删掉它所有测试都还绿——所以用源码断言钉住它，和客户端 bundle
+  // 那些静态断言同一个路数。
+  const source = await readFile(new URL('../lib/index.js', import.meta.url), 'utf8')
+  assert.match(source, /panel: \{ dispatched: panelRegistry\.dispatched, settled: panelRegistry\.settled \}/)
+  assert.match(source, /assignments: \(\) => panelRegistry\.table\(\)/)
 })
 
 test('the dock endpoint always answers an attention map, empty when nobody is stuck', async () => {
