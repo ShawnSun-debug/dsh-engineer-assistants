@@ -13,11 +13,14 @@ import {
   PANEL_ACTIONS,
   navigationTargetOf,
   panelActionsOf,
+  parseWorkerChatAddress,
   workerChatAddressOf,
+  workerChatTabsOf,
+  workerOpenStepsOf,
 } from '../lib/panel-surface.js'
 
 const live = (sessionId, extra = {}) => ({ sessionId, presetId: 'implementer', category: 'code', status: 'running', startedAt: 1000, ...extra })
-const modelOf = (...workers) => ({ fixed: [], workers, tabs: [], activeTab: null })
+const modelOf = (...workers) => ({ fixed: [], workers })
 
 test('the badge speaks the inspector vocabulary, not a second one', () => {
   // 红点的原因就是监工的卡点判据。抄一份的结果是 waitng/waiting 差一个字母，红点永不亮还不报错。
@@ -46,7 +49,7 @@ test('the badge counts workers that need a person, once each', () => {
 
 test('a duplicate row for one worker does not double the badge', () => {
   // 登记表按 id 存在，但面板行是从表里摊出来的；同一行被摊两次不该让红点变成 2。
-  const model = { fixed: [], workers: [live('w1'), live('w1'), null, live('w2')], tabs: [], activeTab: null }
+  const model = { fixed: [], workers: [live('w1'), live('w1'), null, live('w2')] }
   const badge = badgeOf({ model, attention: { w1: ['idle'] } })
   assert.equal(badge.count, 1)
   assert.deepEqual(badge.sessionIds, ['w1'])
@@ -271,8 +274,6 @@ const buildLike = ({ master = { sessionId: null }, workers = [], fixed = ['maste
   fixed: fixed.map((id) => ({ id, title: id })),
   master,
   workers,
-  tabs: [],
-  activeTab: null,
 })
 
 const kindsOf = (result) => [...result.fixed, ...result.workers].map((row) => row.action.kind)
@@ -385,4 +386,121 @@ test('the badge needs workers only; the action table needs the fixed entries too
   assert.equal(badgeOf({ model: workersOnly, attention: { w1: ['idle'] } }).count, 1)
   // 动作表要遍历固定入口，缺 fixed 就说不清「传错了东西」，必须报错。
   assert.throws(() => panelActionsOf({ model: workersOnly }), /no fixed array/)
+})
+
+test('the address parser is the host parser: a round trip returns the address it came from', () => {
+  // 页签里存的 contentId 就是这个地址；反查必须读得回原样，否则 worker 结束时找不到自己的页签。
+  for (const mode of SUBAGENT_CHAT_MODES) {
+    const original = address('child 1/2', { mode, parentSessionId: 'p-1' })
+    assert.deepEqual(parseWorkerChatAddress(workerChatAddressOf({ address: original })), original)
+  }
+})
+
+test('the parser refuses every shape the host would refuse', () => {
+  const parse = parseWorkerChatAddress
+  const cases = [
+    '', // 不是 URL
+    'dsh-resource://subagentchat/session/c', // 没有 parent 与 mode
+    'dsh-resource://subagentchat/session/c?parent=p&mode=once', // 宿主只认三种 mode
+    'dsh-resource://subagentchat/session/c?mode=continuable', // 没有 parent
+    'dsh-resource://subagentchat/session/c?parent=&mode=continuable', // parent 空
+    'dsh-resource://subagentchat/c?parent=p&mode=continuable', // 路径少了 session
+    'dsh-resource://subagentchat/session/a/b?parent=p&mode=continuable', // 路径多一段
+    'https://subagentchat/session/c?parent=p&mode=continuable', // 换了协议
+    'dsh-resource://elsewhere/session/c?parent=p&mode=continuable', // 换了 host
+    'dsh-resource://subagentchat/session/%E0%A4%A?parent=p&mode=continuable', // 编码是坏的
+    42,
+    null,
+    undefined,
+    {},
+    [],
+  ]
+  for (const value of cases) {
+    assert.equal(parse(value), undefined, `must not read ${JSON.stringify(value)} as an address`)
+  }
+})
+
+test('a blank child is not an address, deliberately stricter than the host', () => {
+  // 宿主到这里就返回了；空白 id 指不到任何会话，按 usableAddress 那把尺子判掉。
+  assert.equal(parseWorkerChatAddress('dsh-resource://subagentchat/session/%20%20?parent=p&mode=continuable'), undefined)
+})
+
+test('the open-tab lookup finds one worker across sessions, by parsing rather than by string match', () => {
+  const tabs = [
+    { sessionId: 's-1', tabId: 't1', kind: 'subagentchat', contentId: workerChatAddressOf({ address: address('w1') }) },
+    // 同一个 worker，换过一个 parent 与 mode：地址字符串不相等，但它还是这个 worker 的页签。
+    { sessionId: 's-2', tabId: 't2', kind: 'subagentchat', contentId: workerChatAddressOf({ address: address('w1', { parentSessionId: 'p-9', mode: 'one-shot' }) }) },
+    { sessionId: 's-1', tabId: 't3', kind: 'subagentchat', contentId: workerChatAddressOf({ address: address('w2') }) },
+    { sessionId: 's-1', tabId: 't4', kind: 'files', contentId: 'dsh-resource://files/session/x' },
+    { sessionId: 's-1', tabId: '', kind: 'subagentchat', contentId: workerChatAddressOf({ address: address('w1') }) },
+    { sessionId: 's-1', kind: 'subagentchat', contentId: workerChatAddressOf({ address: address('w1') }) },
+    null,
+    'garbage',
+  ]
+  assert.deepEqual(workerChatTabsOf({ tabs, sessionId: 'w1' }), [
+    { sessionId: 's-1', tabId: 't1' },
+    { sessionId: 's-2', tabId: 't2' },
+  ])
+  // 别把 worker 自己的 id 和别人的搞混：w2 只拿到属于它的那张。
+  assert.deepEqual(workerChatTabsOf({ tabs, sessionId: 'w2' }), [{ sessionId: 's-1', tabId: 't3' }])
+})
+
+test('a tab of another kind is left alone even when its address reads as a subagent chat', () => {
+  // 类型按地址 pattern 认领，glob 开得宽的 extension 档能接管同一串地址；关错页签比不关更糟。
+  const contentId = workerChatAddressOf({ address: address('w1') })
+  const tabs = [
+    { sessionId: 's-1', tabId: 't1', kind: 'subagentchat', contentId },
+    { sessionId: 's-1', tabId: 't2', kind: 'someExtensionChat', contentId },
+    { sessionId: 's-1', tabId: 't3', contentId },
+  ]
+  assert.deepEqual(workerChatTabsOf({ tabs, sessionId: 'w1' }), [{ sessionId: 's-1', tabId: 't1' }])
+})
+
+test('one worker with no open tab gives an empty list, not an undefined answer', () => {
+  assert.deepEqual(workerChatTabsOf({ tabs: [], sessionId: 'w1' }), [])
+  const unrelated = [{ sessionId: 's-1', tabId: 't1', kind: 'subagentchat', contentId: workerChatAddressOf({ address: address('other') }) }]
+  assert.deepEqual(workerChatTabsOf({ tabs: unrelated, sessionId: 'w1' }), [])
+})
+
+test('a duplicated inventory row does not turn into two close actions', () => {
+  const row = { sessionId: 's-1', tabId: 't1', kind: 'subagentchat', contentId: workerChatAddressOf({ address: address('w1') }) }
+  assert.deepEqual(workerChatTabsOf({ tabs: [row, { ...row }], sessionId: 'w1' }), [{ sessionId: 's-1', tabId: 't1' }])
+})
+
+test('the lookup refuses nonsense instead of inventing tabs', () => {
+  assert.throws(() => workerChatTabsOf({ sessionId: 'w1' }), /tabs must be an array/)
+  assert.throws(() => workerChatTabsOf({ tabs: null, sessionId: 'w1' }), /tabs must be an array/)
+  assert.throws(() => workerChatTabsOf({ tabs: [], sessionId: '  ' }), /session id is required/)
+})
+
+test('a click resolves both steps at click time: the resource to try, then the session to fall back to', () => {
+  const addr = address('w1')
+  const steps = workerOpenStepsOf({ sessionId: 'w1', addressOf: () => addr })
+  // 先试右栏：地址、页签类型、新开一格全是点击时才知道的东西。
+  assert.equal(steps.resource.address, workerChatAddressOf({ address: addr }))
+  assert.equal(steps.resource.kind, 'subagentchat')
+  assert.equal(steps.resource.preferNewPane, true)
+  // 退路是地址本身，不是裸 id：裸 id 对「列表里还没有」的子会话会抛 unknown session。
+  assert.deepEqual(steps.session, addr)
+})
+
+test('with no resolvable address the click still has a target, and no resource', () => {
+  for (const resolver of [undefined, () => undefined, () => ({}), () => { throw new Error('sessions is down') }]) {
+    const steps = workerOpenStepsOf({ sessionId: 'w1', addressOf: resolver })
+    assert.equal(steps.resource, undefined)
+    assert.equal(steps.session, 'w1', 'a bare id is a legal SessionTarget')
+  }
+})
+
+test('an address whose mode the chat view cannot open keeps the session fallback', () => {
+  // usableAddress 只要求 mode 非空，所以这种地址还是会走到这里；右栏开不了（workerChatAddressOf 会抛），
+  // 但地址本身仍指得到那条子会话，退回主栏时要递它。
+  const odd = address('w1', { mode: 'once' })
+  const steps = workerOpenStepsOf({ sessionId: 'w1', addressOf: () => odd })
+  assert.equal(steps.resource, undefined)
+  assert.deepEqual(steps.session, odd)
+})
+
+test('a blank worker id is refused rather than planned', () => {
+  assert.throws(() => workerOpenStepsOf({ sessionId: ' ' }), /session id is required/)
 })

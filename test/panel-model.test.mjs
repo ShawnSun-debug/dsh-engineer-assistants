@@ -2,13 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { assignSession, finishSession, reserveChildId } from '../lib/assignments.js'
-import {
-  FIXED_SECTIONS,
-  buildPanelModel,
-  closeTab,
-  endWorker,
-  openTab,
-} from '../lib/panel-model.js'
+import { FIXED_SECTIONS, buildPanelModel, endWorker } from '../lib/panel-model.js'
 
 const parent = 'session-master-1'
 
@@ -28,52 +22,25 @@ test('the model is two-part: three fixed assistants, then live workers by starte
   assert.deepEqual([...FIXED_SECTIONS], ['master', 'inspector', 'reporter'])
   assert.deepEqual(model.fixed.map((row) => row.id), ['master', 'inspector', 'reporter'])
   assert.deepEqual(model.workers.map((row) => row.sessionId), ['earlier', 'reserved-one'], 'finished workers drop off, the rest sort by start')
-  assert.deepEqual(model.tabs, [])
-  assert.equal(model.activeTab, null)
+})
+
+test('the model carries no tab facts: which tabs are open is the host\'s record', () => {
+  const model = buildPanelModel({ assignments: registry(), parentId: parent })
+  // 宿主自己就会开这类页签，也只在它那里能查（ctx.sidebarRight.openTabs），插件收不到关闭回调。
+  // 这里再存一份页签镜像，迟早与宿主不一致，所以模型里干脆没有这个字段。
+  assert.deepEqual(Object.keys(model).sort(), ['fixed', 'master', 'workers'])
 })
 
 test('an empty registry still shows the three fixed entries', () => {
   const model = buildPanelModel({ assignments: {}, parentId: parent })
   assert.deepEqual(model.fixed.map((row) => row.id), ['master', 'inspector', 'reporter'])
   assert.deepEqual(model.workers, [])
-  assert.equal(model.activeTab, null)
 })
 
-test('opening a tab occupies it; opening another switches the active one', () => {
+test('a worker ending removes its row', () => {
   let model = buildPanelModel({ assignments: registry(), parentId: parent })
-  model = openTab(model, 'earlier')
-  assert.deepEqual(model.tabs.map((row) => row.sessionId), ['earlier'])
-  assert.equal(model.activeTab, 'earlier')
-  model = openTab(model, 'reserved-one')
-  assert.deepEqual(model.tabs.map((row) => row.sessionId), ['earlier', 'reserved-one'])
-  assert.equal(model.activeTab, 'reserved-one')
-  // 重复打开只是切过去，不会多一个页签。
-  model = openTab(model, 'earlier')
-  assert.equal(model.tabs.length, 2)
-  assert.equal(model.activeTab, 'earlier')
-})
-
-test('a tab for a worker that is not in the list cannot be opened', () => {
-  const model = buildPanelModel({ assignments: registry(), parentId: parent })
-  assert.equal(openTab(model, 'later'), model, 'a finished worker has no row to open')
-  assert.equal(openTab(model, 'ghost'), model)
-})
-
-test('closing a tab keeps the worker in the list', () => {
-  let model = openTab(buildPanelModel({ assignments: registry(), parentId: parent }), 'earlier')
-  model = closeTab(model, 'earlier')
-  assert.deepEqual(model.tabs, [])
-  assert.equal(model.activeTab, null)
-  assert.deepEqual(model.workers.map((row) => row.sessionId), ['earlier', 'reserved-one'])
-  assert.equal(closeTab(model, 'earlier'), model, 'closing twice is a no-op')
-})
-
-test('a worker ending removes its row and closes its tab', () => {
-  let model = openTab(buildPanelModel({ assignments: registry(), parentId: parent }), 'earlier')
   model = endWorker(model, 'earlier')
   assert.deepEqual(model.workers.map((row) => row.sessionId), ['reserved-one'])
-  assert.deepEqual(model.tabs, [])
-  assert.equal(model.activeTab, null)
   assert.equal(endWorker(model, 'earlier'), model, 'ending twice is a no-op')
 })
 
@@ -85,16 +52,9 @@ test('the model only lists the given parent', () => {
   assert.equal(model.workers.some((row) => row.sessionId === 'other'), false)
 })
 
-test('tabs are rebuilt from the registry, so a stale tab does not survive', () => {
-  const model = buildPanelModel({ assignments: registry(), parentId: parent, openTabs: ['earlier', 'gone'] })
-  assert.deepEqual(model.tabs.map((row) => row.sessionId), ['earlier'])
-})
-
 test('bad input is refused', () => {
   assert.throws(() => buildPanelModel({ assignments: null }), /assignments must be an object/)
   const model = buildPanelModel({ assignments: registry(), parentId: parent })
-  assert.throws(() => openTab(model, ''), /session id is required/)
-  assert.throws(() => closeTab(model, ''), /session id is required/)
   assert.throws(() => endWorker(model, ''), /session id is required/)
 })
 test('only worker rows reach the list, not the inspector or reporter under the same parent', () => {
