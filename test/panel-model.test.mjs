@@ -22,18 +22,19 @@ function registry() {
   return rows
 }
 
-test('the model is two-part: two fixed entries, then live workers by startedAt', () => {
+test('the model is two-part: three fixed assistants, then live workers by startedAt', () => {
   const model = buildPanelModel({ assignments: registry(), parentId: parent })
-  assert.deepEqual([...FIXED_SECTIONS], ['inspector', 'reporter'])
-  assert.deepEqual(model.fixed.map((row) => row.id), ['inspector', 'reporter'])
+  // 三个常驻助手：master、监工、汇报。它们不是 worker，不随 worker 增减而变。
+  assert.deepEqual([...FIXED_SECTIONS], ['master', 'inspector', 'reporter'])
+  assert.deepEqual(model.fixed.map((row) => row.id), ['master', 'inspector', 'reporter'])
   assert.deepEqual(model.workers.map((row) => row.sessionId), ['earlier', 'reserved-one'], 'finished workers drop off, the rest sort by start')
   assert.deepEqual(model.tabs, [])
   assert.equal(model.activeTab, null)
 })
 
-test('an empty registry still shows the two fixed entries', () => {
+test('an empty registry still shows the three fixed entries', () => {
   const model = buildPanelModel({ assignments: {}, parentId: parent })
-  assert.deepEqual(model.fixed.map((row) => row.id), ['inspector', 'reporter'])
+  assert.deepEqual(model.fixed.map((row) => row.id), ['master', 'inspector', 'reporter'])
   assert.deepEqual(model.workers, [])
   assert.equal(model.activeTab, null)
 })
@@ -130,4 +131,15 @@ test('the retry count is normalised, not passed straight through', () => {
   }
   const model = buildPanelModel({ assignments: rows, parentId: parent })
   assert.deepEqual(model.workers.map((item) => item.retries), [0, 0, 0, 2], 'only a positive integer survives')
+})
+test('the master entry carries the configured session id, and still takes its place without one', () => {
+  const assigned = buildPanelModel({ assignments: {}, parentId: parent, masterSessionId: 'orchestrator-master' })
+  assert.equal(assigned.fixed.find((row) => row.id === 'master').sessionId, 'orchestrator-master')
+  // 没配也要占位：整项消失会让人以为这套没有 master。
+  const unset = buildPanelModel({ assignments: {}, parentId: parent })
+  assert.equal(unset.fixed.length, 3)
+  assert.equal(unset.fixed.find((row) => row.id === 'master').sessionId, null)
+  // 监工与汇报不是会话，没有 sessionId。
+  assert.equal(assigned.fixed.find((row) => row.id === 'inspector').sessionId, null)
+  assert.equal(assigned.fixed.find((row) => row.id === 'reporter').sessionId, null)
 })
