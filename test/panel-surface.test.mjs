@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { DEFAULT_TIMEOUT_MS } from '../lib/danger.js'
+import { FIXED_SECTIONS, buildPanelModel } from '../lib/panel-model.js'
 import { STUCK_REASONS } from '../lib/inspector.js'
 import {
   ATTENTION_REASONS,
@@ -274,47 +275,107 @@ const buildLike = ({ master = { sessionId: null }, workers = [], fixed = ['maste
   activeTab: null,
 })
 
-test('the panel offers exactly four things you can do to an entry', () => {
-  assert.deepEqual([...PANEL_ACTIONS], ['open-session', 'open-resource', 'designate-master', 'show-section'])
+const kindsOf = (result) => [...result.fixed, ...result.workers].map((row) => row.action.kind)
+const masterOf = (sessionId) => ({ sessionId })
+
+test('the four action kinds are the whole vocabulary, and every action uses it', () => {
+  assert.deepEqual([...PANEL_ACTIONS], ['open-session', 'open-worker', 'designate-master', 'show-section'])
+  const mixed = panelActionsOf({
+    model: buildLike({ master: masterOf('m-1'), workers: [live('w1'), live('w2')] }),
+    addressOf: (id) => (id === 'w1' ? address('w1') : undefined),
+  })
+  for (const kind of kindsOf(mixed)) assert.ok(PANEL_ACTIONS.includes(kind), `"${kind}" is in the table`)
 })
 
 test('the three fixed entries act differently on purpose', () => {
-  const designated = buildLike({ master: { sessionId: 'm-1' } })
-  assert.deepEqual(panelActionsOf({ model: designated }).fixed, [
+  const designated = panelActionsOf({ model: buildLike({ master: masterOf('m-1') }) })
+  assert.deepEqual(designated.fixed, [
     { id: 'master', action: { kind: 'open-session', sessionId: 'm-1' } },
     { id: 'inspector', action: { kind: 'show-section', section: 'inspector' } },
     { id: 'reporter', action: { kind: 'show-section', section: 'reporter' } },
   ])
   // 没指定时不是「点了没反应」，而是明确告诉客户端去指定。
-  const unset = buildLike({ master: { sessionId: null } })
-  assert.deepEqual(panelActionsOf({ model: unset }).fixed[0].action, { kind: 'designate-master' })
+  const unset = panelActionsOf({ model: buildLike({ master: masterOf(null) }) })
+  assert.deepEqual(unset.fixed[0].action, { kind: 'designate-master' })
 })
 
-test('a worker opens the host SidebarChat tab when its address resolves', () => {
+test('a fixed entry the module has never heard of is an error, not a section', () => {
+  // 否则任意 id 都会变成一段 show-section，包括空串。
+  for (const bad of ['', 'overview', 'worker']) {
+    assert.throws(() => panelActionsOf({ model: buildLike({ fixed: ['master', bad] }) }), /is not a fixed entry/)
+  }
+  assert.throws(() => panelActionsOf({ model: { fixed: [], master: masterOf(null) } }), /panel model is required/)
+})
+
+test('a worker carries the address built from the resolver, not from the row', () => {
+  // resolver 故意返回与行 id 不同的 child：照行 id 拼地址的实现会在这里露馅。
   const model = buildLike({ workers: [live('w1')] })
-  const { workers } = panelActionsOf({ model, addressOf: () => address('w1') })
-  assert.equal(workers.length, 1)
-  assert.equal(workers[0].action.kind, 'open-resource')
-  // 交给 sidebarRight.openResource 的必须是宿主解析器认得的地址。
-  assert.deepEqual(parseLikeHost(workers[0].action.address), { parentSessionId: 'p-1', childSessionId: 'w1', mode: 'continuable' })
+  const { workers } = panelActionsOf({ model, addressOf: () => address('the-real-child') })
+  assert.equal(workers[0].sessionId, 'w1')
+  assert.equal(workers[0].action.kind, 'open-worker')
+  assert.deepEqual(parseLikeHost(workers[0].action.address), {
+    parentSessionId: 'p-1',
+    childSessionId: 'the-real-child',
+    mode: 'continuable',
+  })
 })
 
-test('a worker with no resolvable address still opens, in the main column', () => {
+test('the resolver is asked about the row it belongs to', () => {
+  const asked = []
   const model = buildLike({ workers: [live('w1'), live('w2')] })
-  const throwing = (id) => {
+  panelActionsOf({ model, addressOf: (id) => { asked.push(id); return address(id) } })
+  assert.deepEqual(asked, ['w1', 'w2'], 'called once per worker, with that worker id')
+})
+
+test('a mode other than continuable reaches the address unchanged', () => {
+  const model = buildLike({ workers: [live('w1')] })
+  const oneShot = panelActionsOf({ model, addressOf: () => address('c', { mode: 'one-shot' }) })
+  assert.equal(parseLikeHost(oneShot.workers[0].action.address).mode, 'one-shot', 'mode must not be forced to continuable')
+  const unknown = panelActionsOf({ model, addressOf: () => address('c', { mode: 'unknown' }) })
+  assert.equal(parseLikeHost(unknown.workers[0].action.address).mode, 'unknown')
+})
+
+test('a worker with no usable address is still openable, resolved again at click time', () => {
+  const model = buildLike({ workers: [live('w1'), live('w2'), live('w3')] })
+  const messy = (id) => {
     if (id === 'w1') throw new Error('sessions domain not ready')
+    // 宿主类型之外的 mode：拼地址会抛，但不能让它带走整张表。
+    if (id === 'w2') return { parentSessionId: 'p-1', childSessionId: 'w2', mode: 'fork' }
+    // 异步解析器不是地址。
+    if (id === 'w3') return Promise.resolve(address('w3'))
     return undefined
   }
-  const { workers } = panelActionsOf({ model, addressOf: throwing })
-  // 冷恢复或刚派发的瞬间宿主可能还没解析出地址：点不动比开在主栏更糟。
+  const { workers, fixed } = panelActionsOf({ model, addressOf: messy })
+  // 三种情况都退回「只有 sessionId」的 open-worker：能不能开成，点击时再判。
   assert.deepEqual(workers.map((row) => row.action), [
-    { kind: 'open-session', sessionId: 'w1' },
-    { kind: 'open-session', sessionId: 'w2' },
+    { kind: 'open-worker', sessionId: 'w1' },
+    { kind: 'open-worker', sessionId: 'w2' },
+    { kind: 'open-worker', sessionId: 'w3' },
   ])
+  assert.equal(fixed.length, 3, 'one bad address must not take the fixed entries down with it')
 })
 
-test('rows without a usable session id are dropped, not turned into empty targets', () => {
-  const model = buildLike({ workers: [null, { sessionId: '   ' }, live('w1')] })
+test('duplicate rows for one worker give one action', () => {
+  const model = buildLike({ workers: [live('w1'), live('w1'), null, { sessionId: '   ' }] })
   assert.deepEqual(panelActionsOf({ model }).workers.map((row) => row.sessionId), ['w1'])
-  assert.throws(() => panelActionsOf({ model: {} }), /panel model is required/)
+})
+
+test('it composes with the real panel model, including the master trap', () => {
+  const empty = {}
+  // 没有 master、没有 worker：三个入口都在，worker 列表空。
+  const bare = panelActionsOf({ model: buildPanelModel({ assignments: empty, parentId: 'p' }) })
+  assert.deepEqual(bare.fixed.map((row) => row.action.kind), ['designate-master', 'show-section', 'show-section'])
+  assert.deepEqual(bare.workers, [])
+
+  // 传了生效的 master id：master 变成可以打开的会话。
+  const withMaster = panelActionsOf({ model: buildPanelModel({ assignments: empty, parentId: 'p', masterSessionId: 'orchestrator-master' }) })
+  assert.deepEqual(withMaster.fixed[0].action, { kind: 'open-session', sessionId: 'orchestrator-master' })
+
+  // 陷阱本身也钉住：只传原始配置（没指定）时，即使 master 实际上是活的，这里也只能说「未指定」。
+  // 所以接线时必须自己合成 config || (masterSessionEnabled ? MASTER_SESSION_ID : '')。
+  const rawConfig = panelActionsOf({ model: buildPanelModel({ assignments: empty, parentId: 'p', masterSessionId: '' }) })
+  assert.deepEqual(rawConfig.fixed[0].action, { kind: 'designate-master' })
+
+  // 固定入口就是模型里那三个，不多不少。
+  assert.deepEqual(buildPanelModel({ assignments: empty, parentId: 'p' }).fixed.map((row) => row.id), [...FIXED_SECTIONS])
 })
