@@ -3696,6 +3696,127 @@ test('the tab chip title and both dictionaries answer for the dock', () => {
   }
   assert.ok(Object.keys(T.zh).filter((entry) => entry.startsWith('dock.')).length >= 10)
 })
+
+// ---- 右栏红点（票 22） ----------------------------------------------------------------
+
+const attentionPayload = (attention) => ({ model: PANEL_MODEL(), actions: PANEL_ACTIONS(), attention })
+
+/** 红点上的数字：标题里还带着原因说明，这里只取可见的那个数。 */
+const badgeNumber = (node) => String(node.kids.join('')).trim()
+
+test('the client attention vocabulary is the inspector vocabulary, not a second one', () => {
+  // 客户端 bundle 不能 import 服务端模块，所以词表只能镜像；这条测试与 panel-surface 的断言互补。
+  assert.deepEqual(plain(T.ATTENTION_REASONS), [...panelSurface.ATTENTION_REASONS])
+})
+
+test('panelAttentionBadgeOf keeps only stuck, drawn workers and counts each one once', () => {
+  const badge = plain(
+    T.panelAttentionBadgeOf({
+      workers: PANEL_MODEL().workers,
+      attention: {
+        'w-1': ['idle', 'idle', 'retrying'],
+        'w-2': ['waiting-approval'],
+        // 已经结束的 worker 不在列表里：红点不该为它亮。
+        'w-9': ['idle'],
+        // 监工不认识的原因不是「需要人」的理由。
+        'w-3': ['slow'],
+        '': ['idle'],
+      },
+    }),
+  )
+  assert.equal(badge.count, 2)
+  assert.deepEqual(badge.sessionIds, ['w-1', 'w-2'])
+  assert.deepEqual(badge.byReason, { idle: 1, retrying: 1, 'waiting-approval': 1 })
+  assert.deepEqual(badge.reasonsOf, { 'w-1': ['idle', 'retrying'], 'w-2': ['waiting-approval'] })
+})
+
+test('the client badge agrees with the server badge for the same rows', () => {
+  // 两边各算一遍是为了「画出来的行」这一侧能独立过滤；结果必须逐项相同，否则服务端说卡着、
+  // 客户端不亮，而且不报错。
+  const model = PANEL_MODEL()
+  const attention = { 'w-1': ['idle', 'waiting-approval'], 'w-2': ['retrying'], gone: ['idle'] }
+  const server = plain(panelSurface.badgeOf({ model, attention }))
+  const client = plain(T.panelAttentionBadgeOf({ workers: model.workers, attention }))
+  assert.equal(client.count, server.count)
+  assert.deepEqual(client.sessionIds, server.sessionIds)
+  assert.deepEqual(client.byReason, server.byReason)
+})
+
+test('junk attention and junk rows are "no red dot", never a throw', () => {
+  // 端点失败另有 alert；红点这一侧只许安静地不亮——一个坏字段不能把整页面板打成错误。
+  const empty = { count: 0, sessionIds: [], byReason: { idle: 0, retrying: 0, 'waiting-approval': 0 }, reasonsOf: {} }
+  for (const attention of [undefined, null, 'w-1', [], 7, { 'w-1': 'idle' }, { 'w-1': [] }, { 'w-1': [{}] }]) {
+    assert.deepEqual(plain(T.panelAttentionBadgeOf({ workers: PANEL_MODEL().workers, attention })), empty)
+  }
+  assert.deepEqual(plain(T.panelAttentionBadgeOf({ workers: 'w-1', attention: { 'w-1': ['idle'] } })), empty)
+  assert.deepEqual(plain(T.panelAttentionBadgeOf()), empty)
+  // 同一行在列表里出现两次，也只算一个卡住的 worker。
+  const twice = plain(
+    T.panelAttentionBadgeOf({
+      workers: [PANEL_MODEL().workers[0], PANEL_MODEL().workers[0]],
+      attention: { 'w-1': ['idle'] },
+    }),
+  )
+  assert.equal(twice.count, 1)
+  assert.deepEqual(twice.sessionIds, ['w-1'])
+})
+
+test('the stuck row carries its number and the workers head carries the deduped total', async () => {
+  const view = mountPanelBody({
+    value: attentionPayload({ 'w-1': ['idle', 'retrying'], 'w-2': ['waiting-approval'], 'w-9': ['idle'] }),
+  })
+  await flush(14)
+  // 行上的数字 = 这一行卡在几处。
+  assert.equal(badgeNumber(byTestId(view.tree, 'orchestrator-panel-attention-w-1')), '2')
+  assert.equal(badgeNumber(byTestId(view.tree, 'orchestrator-panel-attention-w-2')), '1')
+  // 不在画出来的列表里的 id 一个都不亮。
+  assert.equal(byTestId(view.tree, 'orchestrator-panel-attention-w-9'), undefined)
+  // 同一 worker 命中多种原因，在总数上只算一次。
+  assert.equal(badgeNumber(byTestId(view.tree, 'orchestrator-panel-attention')), '2')
+  view.unmount()
+})
+
+test('clicking the number says where the stuck workers are stuck', async () => {
+  const view = mountPanelBody({ value: attentionPayload({ 'w-1': ['idle', 'retrying'], 'w-2': ['waiting-approval'] }) })
+  await flush(14)
+  assert.equal(byTestId(view.tree, 'orchestrator-panel-attention-detail'), undefined, '没点开时只有数字')
+  assert.equal(byTestId(view.tree, 'orchestrator-panel-attention').props['aria-expanded'], false)
+  byTestId(view.tree, 'orchestrator-panel-attention').props.onClick()
+  await flush(14)
+  assert.equal(byTestId(view.tree, 'orchestrator-panel-attention').props['aria-expanded'], true)
+  assert.ok(byTestId(view.tree, 'orchestrator-panel-attention-detail'), '点开是三种原因，不是一个总数')
+  for (const reason of ['idle', 'retrying', 'waiting-approval']) {
+    assert.ok(byTestId(view.tree, 'orchestrator-panel-attention-reason-' + reason), reason)
+  }
+  // 再点一次收起来。
+  byTestId(view.tree, 'orchestrator-panel-attention').props.onClick()
+  await flush(14)
+  assert.equal(byTestId(view.tree, 'orchestrator-panel-attention-detail'), undefined)
+  view.unmount()
+})
+
+test('a payload without attention, or with junk attention, shows no number and no error', async () => {
+  for (const value of [
+    { model: PANEL_MODEL(), actions: PANEL_ACTIONS() },
+    { model: PANEL_MODEL(), actions: PANEL_ACTIONS(), attention: null },
+    { model: PANEL_MODEL(), actions: PANEL_ACTIONS(), attention: 'w-1' },
+    { model: PANEL_MODEL(), actions: PANEL_ACTIONS(), attention: { 'w-1': ['slow'] } },
+  ]) {
+    const view = mountPanelBody({ value })
+    await flush(14)
+    assert.equal(byTestId(view.tree, 'orchestrator-panel-error'), undefined)
+    assert.equal(byTestId(view.tree, 'orchestrator-panel-attention'), undefined)
+    assert.equal(byTestId(view.tree, 'orchestrator-panel-attention-w-1'), undefined)
+    assert.ok(byTestId(view.tree, 'orchestrator-panel-worker-w-1'), 'the rows still draw')
+    view.unmount()
+  }
+})
+
+test('the red dot reads the attention the one payload already carries', () => {
+  // 接线那一行：红点不许开第二条查询，一次读回来的载荷里就有它。
+  assert.match(src, /attention: payload\.attention/)
+})
+
 /** apply 的最小宿主：只有右栏三个服务按开关提供，其余按秘书接线需要的最少形状。 */
 function fakeApplyCtx({ dock = false, registerThrows = false } = {}) {
   const slotNames = []
