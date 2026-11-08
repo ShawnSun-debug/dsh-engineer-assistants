@@ -22,18 +22,19 @@ function registry() {
   return rows
 }
 
-test('the model is two-part: two fixed entries, then live workers by startedAt', () => {
+test('the model is two-part: three fixed assistants, then live workers by startedAt', () => {
   const model = buildPanelModel({ assignments: registry(), parentId: parent })
-  assert.deepEqual([...FIXED_SECTIONS], ['inspector', 'reporter'])
-  assert.deepEqual(model.fixed.map((row) => row.id), ['inspector', 'reporter'])
+  // 三个常驻助手：master、监工、汇报。它们不是 worker，不随 worker 增减而变。
+  assert.deepEqual([...FIXED_SECTIONS], ['master', 'inspector', 'reporter'])
+  assert.deepEqual(model.fixed.map((row) => row.id), ['master', 'inspector', 'reporter'])
   assert.deepEqual(model.workers.map((row) => row.sessionId), ['earlier', 'reserved-one'], 'finished workers drop off, the rest sort by start')
   assert.deepEqual(model.tabs, [])
   assert.equal(model.activeTab, null)
 })
 
-test('an empty registry still shows the two fixed entries', () => {
+test('an empty registry still shows the three fixed entries', () => {
   const model = buildPanelModel({ assignments: {}, parentId: parent })
-  assert.deepEqual(model.fixed.map((row) => row.id), ['inspector', 'reporter'])
+  assert.deepEqual(model.fixed.map((row) => row.id), ['master', 'inspector', 'reporter'])
   assert.deepEqual(model.workers, [])
   assert.equal(model.activeTab, null)
 })
@@ -95,4 +96,63 @@ test('bad input is refused', () => {
   assert.throws(() => openTab(model, ''), /session id is required/)
   assert.throws(() => closeTab(model, ''), /session id is required/)
   assert.throws(() => endWorker(model, ''), /session id is required/)
+})
+test('only worker rows reach the list, not the inspector or reporter under the same parent', () => {
+  let rows = reserveChildId({}, { id: 'w1', parentId: parent, now: 1000 })
+  rows = assignSession(rows, { sessionId: 'w1', kind: 'worker', parentId: parent, status: 'running', startedAt: 1000 })
+  rows = reserveChildId(rows, { id: 'watch-1', parentId: parent, kind: 'inspector', now: 2000 })
+  rows = assignSession(rows, { sessionId: 'watch-1', kind: 'inspector', parentId: parent, status: 'running', startedAt: 2000 })
+  rows = reserveChildId(rows, { id: 'report-1', parentId: parent, kind: 'reporter', now: 3000 })
+  rows = assignSession(rows, { sessionId: 'report-1', kind: 'reporter', parentId: parent, status: 'running', startedAt: 3000 })
+  const model = buildPanelModel({ assignments: rows, parentId: parent })
+  // 下段是 worker 列表：巡检行和汇报行都挂在同一个 parent 下面，但它们不是 worker。
+  // 两种都放进来，「只留 worker」才不会被一个 !== 'inspector' 蒙混过去。
+  assert.deepEqual(model.workers.map((row) => row.sessionId), ['w1'])
+})
+
+test('a retried worker carries its retry count, and a fresh one reads zero', () => {
+  let rows = reserveChildId({}, { id: 'w1', parentId: parent, now: 1000 })
+  rows = assignSession(rows, { sessionId: 'w1', kind: 'worker', parentId: parent, status: 'running', startedAt: 1000, retries: 1 })
+  assert.equal(buildPanelModel({ assignments: rows, parentId: parent }).workers[0].retries, 1)
+
+  const fresh = reserveChildId({}, { id: 'w2', parentId: parent, now: 1000 })
+  // 没有重试记录读作 0，不是 undefined：面板不该显示「undefined 次」。
+  assert.equal(buildPanelModel({ assignments: fresh, parentId: parent }).workers[0].retries, 0)
+})
+
+test('the retry count is normalised, not passed straight through', () => {
+  // 登记表之外的输入也可能到这里，所以行上只留「正整数次重试」这一种形状。
+  const row = (sessionId, startedAt, retries) => ({ sessionId, kind: 'worker', parentId: parent, status: 'running', startedAt, retries })
+  const rows = {
+    a: row('a', 1, -1),
+    b: row('b', 2, '3'),
+    c: row('c', 3, 2.5),
+    d: row('d', 4, 2),
+  }
+  const model = buildPanelModel({ assignments: rows, parentId: parent })
+  assert.deepEqual(model.workers.map((item) => item.retries), [0, 0, 0, 2], 'only a positive integer survives')
+})
+test('the master slot is structural; which session it points at is one separate fact', () => {
+  const assigned = buildPanelModel({ assignments: {}, parentId: parent, masterSessionId: 'orchestrator-master' })
+  assert.equal(assigned.master.sessionId, 'orchestrator-master')
+
+  // 固定入口只是槽位：行上不带 session，免得「master 行的 sessionId 是 null」和
+  // 「inspector 行本来就不是会话」混成同一个 null。
+  for (const row of assigned.fixed) {
+    assert.deepEqual(Object.keys(row).sort(), ['id', 'title'], `${row.id} is a slot, not a session`)
+  }
+
+  // 没指定也要占位：整项消失会让人以为这套设计里没有 master。
+  const unset = buildPanelModel({ assignments: {}, parentId: parent })
+  assert.equal(unset.fixed.length, 3)
+  assert.equal(unset.master.sessionId, null)
+})
+
+test('only a non-blank string designates the master', () => {
+  const at = (masterSessionId) => buildPanelModel({ assignments: {}, parentId: parent, masterSessionId }).master.sessionId
+  assert.equal(at('m-1'), 'm-1')
+  // 空白串、非字符串、未给，一律读作「没指定」，不是把它当成一个 id 去打开。
+  for (const blank of ['', '   ', null, undefined, 0, false, {}, []]) {
+    assert.equal(at(blank), null, `must not treat ${JSON.stringify(blank)} as a session id`)
+  }
 })
