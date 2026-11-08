@@ -101,8 +101,11 @@ test('only worker rows reach the list, not the inspector or reporter under the s
   rows = assignSession(rows, { sessionId: 'w1', kind: 'worker', parentId: parent, status: 'running', startedAt: 1000 })
   rows = reserveChildId(rows, { id: 'watch-1', parentId: parent, kind: 'inspector', now: 2000 })
   rows = assignSession(rows, { sessionId: 'watch-1', kind: 'inspector', parentId: parent, status: 'running', startedAt: 2000 })
+  rows = reserveChildId(rows, { id: 'report-1', parentId: parent, kind: 'reporter', now: 3000 })
+  rows = assignSession(rows, { sessionId: 'report-1', kind: 'reporter', parentId: parent, status: 'running', startedAt: 3000 })
   const model = buildPanelModel({ assignments: rows, parentId: parent })
-  // 下段是 worker 列表：巡检行也挂在同一个 parent 下面，但它不是 worker。
+  // 下段是 worker 列表：巡检行和汇报行都挂在同一个 parent 下面，但它们不是 worker。
+  // 两种都放进来，「只留 worker」才不会被一个 !== 'inspector' 蒙混过去。
   assert.deepEqual(model.workers.map((row) => row.sessionId), ['w1'])
 })
 
@@ -114,4 +117,17 @@ test('a retried worker carries its retry count, and a fresh one reads zero', () 
   const fresh = reserveChildId({}, { id: 'w2', parentId: parent, now: 1000 })
   // 没有重试记录读作 0，不是 undefined：面板不该显示「undefined 次」。
   assert.equal(buildPanelModel({ assignments: fresh, parentId: parent }).workers[0].retries, 0)
+})
+
+test('the retry count is normalised, not passed straight through', () => {
+  // 登记表之外的输入也可能到这里，所以行上只留「正整数次重试」这一种形状。
+  const row = (sessionId, startedAt, retries) => ({ sessionId, kind: 'worker', parentId: parent, status: 'running', startedAt, retries })
+  const rows = {
+    a: row('a', 1, -1),
+    b: row('b', 2, '3'),
+    c: row('c', 3, 2.5),
+    d: row('d', 4, 2),
+  }
+  const model = buildPanelModel({ assignments: rows, parentId: parent })
+  assert.deepEqual(model.workers.map((item) => item.retries), [0, 0, 0, 2], 'only a positive integer survives')
 })
