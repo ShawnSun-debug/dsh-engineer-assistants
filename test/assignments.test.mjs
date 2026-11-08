@@ -75,6 +75,7 @@ test('reserve: writes a reserved row and keeps the id for later', () => {
     cwd: '',
     startedAt: 1000,
     status: 'reserved',
+    retries: 0,
   })
 })
 
@@ -145,6 +146,7 @@ test('assign: rewrites the same id in place rather than adding a row', () => {
     cwd: 'D:/work',
     startedAt: 1500,
     status: 'running',
+    retries: 0,
   })
 })
 
