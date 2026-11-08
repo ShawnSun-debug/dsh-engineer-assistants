@@ -1580,7 +1580,7 @@ test('the secretary contribution declares the two draft transitions with one dra
     ['secretaryState', 'confirmDraft', 'discardDraft', 'listCandidateSessions', 'createMasterSession'],
   )
   for (const descriptor of descriptors.filter((entry) => entry.method.endsWith('Draft'))) {
-    assert.equal(descriptor.id, 'dsh-orchestrator-secretary#orchestratorSecretary/' + descriptor.method)
+    assert.equal(descriptor.id, 'dsh-engineer-assistants-secretary#orchestratorSecretary/' + descriptor.method)
     assert.equal(descriptor.service, 'orchestratorSecretary')
     assert.equal(descriptor.namespace, 'orchestratorSecretary')
     assert.equal(descriptor.invocation.kind, 'direct')
@@ -1680,7 +1680,7 @@ test('the secretary contribution stays src-json with zero parameters', () => {
   const [descriptor] = T.SECRETARY_CONTRIBUTION.descriptors
   assert.deepEqual(plain(descriptor.result), { mode: 'src-json' })
   assert.deepEqual(plain(descriptor.parameters), [])
-  assert.equal(descriptor.id, 'dsh-orchestrator-secretary#orchestratorSecretary/secretaryState')
+  assert.equal(descriptor.id, 'dsh-engineer-assistants-secretary#orchestratorSecretary/secretaryState')
   assert.equal(descriptor.service, 'orchestratorSecretary')
   assert.equal(descriptor.namespace, 'orchestratorSecretary')
   assert.equal(descriptor.method, 'secretaryState')
@@ -3002,7 +3002,7 @@ test('loadSecretaryState reads through ctx.get and mounts the contribution once'
   assert.deepEqual(plain(await loadSecretaryState(ctx)), plain(value))
   assert.deepEqual(plain(await loadSecretaryState(ctx)), plain(value))
   assert.equal(ctx.mounts.length, 1, 'one mount serves every read')
-  assert.equal(ctx.mounts[0].descriptors[0].id, 'dsh-orchestrator-secretary#orchestratorSecretary/secretaryState')
+  assert.equal(ctx.mounts[0].descriptors[0].id, 'dsh-engineer-assistants-secretary#orchestratorSecretary/secretaryState')
 })
 
 test('the secretary namespace is also reachable through ctx.get("remote")', async () => {
