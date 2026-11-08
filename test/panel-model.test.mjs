@@ -132,14 +132,27 @@ test('the retry count is normalised, not passed straight through', () => {
   const model = buildPanelModel({ assignments: rows, parentId: parent })
   assert.deepEqual(model.workers.map((item) => item.retries), [0, 0, 0, 2], 'only a positive integer survives')
 })
-test('the master entry carries the configured session id, and still takes its place without one', () => {
+test('the master slot is structural; which session it points at is one separate fact', () => {
   const assigned = buildPanelModel({ assignments: {}, parentId: parent, masterSessionId: 'orchestrator-master' })
-  assert.equal(assigned.fixed.find((row) => row.id === 'master').sessionId, 'orchestrator-master')
-  // 没配也要占位：整项消失会让人以为这套没有 master。
+  assert.equal(assigned.master.sessionId, 'orchestrator-master')
+
+  // 固定入口只是槽位：行上不带 session，免得「master 行的 sessionId 是 null」和
+  // 「inspector 行本来就不是会话」混成同一个 null。
+  for (const row of assigned.fixed) {
+    assert.deepEqual(Object.keys(row).sort(), ['id', 'title'], `${row.id} is a slot, not a session`)
+  }
+
+  // 没指定也要占位：整项消失会让人以为这套设计里没有 master。
   const unset = buildPanelModel({ assignments: {}, parentId: parent })
   assert.equal(unset.fixed.length, 3)
-  assert.equal(unset.fixed.find((row) => row.id === 'master').sessionId, null)
-  // 监工与汇报不是会话，没有 sessionId。
-  assert.equal(assigned.fixed.find((row) => row.id === 'inspector').sessionId, null)
-  assert.equal(assigned.fixed.find((row) => row.id === 'reporter').sessionId, null)
+  assert.equal(unset.master.sessionId, null)
+})
+
+test('only a non-blank string designates the master', () => {
+  const at = (masterSessionId) => buildPanelModel({ assignments: {}, parentId: parent, masterSessionId }).master.sessionId
+  assert.equal(at('m-1'), 'm-1')
+  // 空白串、非字符串、未给，一律读作「没指定」，不是把它当成一个 id 去打开。
+  for (const blank of ['', '   ', null, undefined, 0, false, {}, []]) {
+    assert.equal(at(blank), null, `must not treat ${JSON.stringify(blank)} as a session id`)
+  }
 })

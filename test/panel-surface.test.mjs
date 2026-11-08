@@ -178,6 +178,20 @@ test('a plan that happens to carry a plan field is still a plan, not an envelope
   assert.deepEqual(cards[0].categories, ['files'])
 })
 
+test('an intent-only confirmation still produces a card', () => {
+  // classifyDanger({command:'', intent:'强推 main'}) 会给出非空类别、空命令。按命令判空会把它
+  // 静默丢掉——而这恰恰是最需要确认的那一类。
+  const cards = confirmationCardsOf({
+    now: 1_000,
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+    pending: [{ command: '', intent: '强推 main', categories: ['history-rewrite'] }],
+  })
+  assert.equal(cards.length, 1, 'no command, but a category and an intent: still a confirmation')
+  assert.equal(cards[0].command, '')
+  assert.deepEqual(cards[0].categories, ['history-rewrite'])
+  assert.equal(cards[0].intent, '强推 main')
+})
+
 test('an entry that describes no confirmation produces no card', () => {
   const cards = confirmationCardsOf({
     now: 1_000,
@@ -243,7 +257,10 @@ test('an id that needs escaping survives the trip', () => {
 
 test('a worker chat address is refused rather than built wrong', () => {
   assert.throws(() => workerChatAddressOf({}), /subagent address is required/)
-  assert.throws(() => workerChatAddressOf({ address: { childSessionId: 'c', mode: 'continuable' } }), /parentSessionId is required/)
+  // 与 navigationTargetOf 用同一把尺子：缺 parent 或缺 mode 都不是地址。
+  assert.throws(() => workerChatAddressOf({ address: { childSessionId: 'c', mode: 'continuable' } }), /subagent address is required/)
+  assert.throws(() => workerChatAddressOf({ address: { parentSessionId: 'p', childSessionId: 'c' } }), /subagent address is required/)
+  assert.throws(() => workerChatAddressOf({ address: { parentSessionId: 'p', childSessionId: '   ', mode: 'continuable' } }), /subagent address is required/)
   // 宿主只认三种 mode：别的一律打不开，宁可抛错也不拼一个点了没反应的地址。
   assert.throws(() => workerChatAddressOf({ address: address('c', { mode: 'once' }) }), /mode must be one of/)
 })
