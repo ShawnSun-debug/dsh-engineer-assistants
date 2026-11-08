@@ -17,7 +17,7 @@ import {
 } from '../lib/panel-surface.js'
 
 const live = (sessionId, extra = {}) => ({ sessionId, presetId: 'implementer', category: 'code', status: 'running', startedAt: 1000, ...extra })
-const modelOf = (...workers) => ({ fixed: [], workers, tabs: [], activeTab: null })
+const modelOf = (...workers) => ({ fixed: [], workers })
 
 test('the badge speaks the inspector vocabulary, not a second one', () => {
   // 红点的原因就是监工的卡点判据。抄一份的结果是 waitng/waiting 差一个字母，红点永不亮还不报错。
@@ -46,7 +46,7 @@ test('the badge counts workers that need a person, once each', () => {
 
 test('a duplicate row for one worker does not double the badge', () => {
   // 登记表按 id 存在，但面板行是从表里摊出来的；同一行被摊两次不该让红点变成 2。
-  const model = { fixed: [], workers: [live('w1'), live('w1'), null, live('w2')], tabs: [], activeTab: null }
+  const model = { fixed: [], workers: [live('w1'), live('w1'), null, live('w2')] }
   const badge = badgeOf({ model, attention: { w1: ['idle'] } })
   assert.equal(badge.count, 1)
   assert.deepEqual(badge.sessionIds, ['w1'])
@@ -271,8 +271,6 @@ const buildLike = ({ master = { sessionId: null }, workers = [], fixed = ['maste
   fixed: fixed.map((id) => ({ id, title: id })),
   master,
   workers,
-  tabs: [],
-  activeTab: null,
 })
 
 const kindsOf = (result) => [...result.fixed, ...result.workers].map((row) => row.action.kind)
