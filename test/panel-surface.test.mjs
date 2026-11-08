@@ -9,7 +9,9 @@ import {
   SUBAGENT_CHAT_MODES,
   badgeOf,
   confirmationCardsOf,
+  PANEL_ACTIONS,
   navigationTargetOf,
+  panelActionsOf,
   workerChatAddressOf,
 } from '../lib/panel-surface.js'
 
@@ -263,4 +265,56 @@ test('a worker chat address is refused rather than built wrong', () => {
   assert.throws(() => workerChatAddressOf({ address: { parentSessionId: 'p', childSessionId: '   ', mode: 'continuable' } }), /subagent address is required/)
   // 宿主只认三种 mode：别的一律打不开，宁可抛错也不拼一个点了没反应的地址。
   assert.throws(() => workerChatAddressOf({ address: address('c', { mode: 'once' }) }), /mode must be one of/)
+})
+const buildLike = ({ master = { sessionId: null }, workers = [], fixed = ['master', 'inspector', 'reporter'] } = {}) => ({
+  fixed: fixed.map((id) => ({ id, title: id })),
+  master,
+  workers,
+  tabs: [],
+  activeTab: null,
+})
+
+test('the panel offers exactly four things you can do to an entry', () => {
+  assert.deepEqual([...PANEL_ACTIONS], ['open-session', 'open-resource', 'designate-master', 'show-section'])
+})
+
+test('the three fixed entries act differently on purpose', () => {
+  const designated = buildLike({ master: { sessionId: 'm-1' } })
+  assert.deepEqual(panelActionsOf({ model: designated }).fixed, [
+    { id: 'master', action: { kind: 'open-session', sessionId: 'm-1' } },
+    { id: 'inspector', action: { kind: 'show-section', section: 'inspector' } },
+    { id: 'reporter', action: { kind: 'show-section', section: 'reporter' } },
+  ])
+  // 没指定时不是「点了没反应」，而是明确告诉客户端去指定。
+  const unset = buildLike({ master: { sessionId: null } })
+  assert.deepEqual(panelActionsOf({ model: unset }).fixed[0].action, { kind: 'designate-master' })
+})
+
+test('a worker opens the host SidebarChat tab when its address resolves', () => {
+  const model = buildLike({ workers: [live('w1')] })
+  const { workers } = panelActionsOf({ model, addressOf: () => address('w1') })
+  assert.equal(workers.length, 1)
+  assert.equal(workers[0].action.kind, 'open-resource')
+  // 交给 sidebarRight.openResource 的必须是宿主解析器认得的地址。
+  assert.deepEqual(parseLikeHost(workers[0].action.address), { parentSessionId: 'p-1', childSessionId: 'w1', mode: 'continuable' })
+})
+
+test('a worker with no resolvable address still opens, in the main column', () => {
+  const model = buildLike({ workers: [live('w1'), live('w2')] })
+  const throwing = (id) => {
+    if (id === 'w1') throw new Error('sessions domain not ready')
+    return undefined
+  }
+  const { workers } = panelActionsOf({ model, addressOf: throwing })
+  // 冷恢复或刚派发的瞬间宿主可能还没解析出地址：点不动比开在主栏更糟。
+  assert.deepEqual(workers.map((row) => row.action), [
+    { kind: 'open-session', sessionId: 'w1' },
+    { kind: 'open-session', sessionId: 'w2' },
+  ])
+})
+
+test('rows without a usable session id are dropped, not turned into empty targets', () => {
+  const model = buildLike({ workers: [null, { sessionId: '   ' }, live('w1')] })
+  assert.deepEqual(panelActionsOf({ model }).workers.map((row) => row.sessionId), ['w1'])
+  assert.throws(() => panelActionsOf({ model: {} }), /panel model is required/)
 })
