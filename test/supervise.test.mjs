@@ -135,13 +135,13 @@ const row = (overrides = {}) => ({
 test('composeNotice writes the required header, with and without a budget', () => {
   const capped = composeNotice([row()], { now: NOW, index: 2, max: 5 })
   assert.equal(
-    capped.startsWith('【插件巡检｜第 2/5 次】以下内容由 dsh-orchestrator 自动生成，不是用户消息。'),
+    capped.startsWith('【插件巡检｜第 2/5 次】以下内容由 dsh-engineer-assistants 自动生成，不是用户消息。'),
     true,
   )
 
   const unlimited = composeNotice([row()], { now: NOW, index: 2, max: 0 })
   assert.equal(
-    unlimited.startsWith('【插件巡检｜第 2 次】以下内容由 dsh-orchestrator 自动生成，不是用户消息。'),
+    unlimited.startsWith('【插件巡检｜第 2 次】以下内容由 dsh-engineer-assistants 自动生成，不是用户消息。'),
     true,
   )
   assert.equal(unlimited.includes('2/0'), false)

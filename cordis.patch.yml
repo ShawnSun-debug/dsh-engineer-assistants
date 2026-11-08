@@ -5,4 +5,4 @@
 # 的 dsh / dshGo 键里，别在这里复制一份，否则静态声明与运行时会有两份真相。
 - insert:
     - id: orchestrator
-      name: dsh-orchestrator
+      name: dsh-engineer-assistants
