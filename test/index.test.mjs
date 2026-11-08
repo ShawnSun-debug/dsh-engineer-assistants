@@ -1303,6 +1303,31 @@ test('the dock endpoint answers with the three fixed entries and an honest empty
   assert.equal(payload.actions.fixed.find((row) => row.id === 'master').action.kind, 'designate-master')
 })
 
+test('the dock endpoint reports which children ended, because the browser cannot tell', async () => {
+  // 死页签清扫靠这条：开着的页签会把自己那个子会话 retain 住，浏览器里 byId 一直有它，
+  // 父会话的 subagentCatalog 又只追加不清理。所以只能服务端记。
+  const harness = start()
+  const service = harness.services.get('orchestratorPanel')
+  assert.deepEqual((await service.panelState()).ended, [])
+
+  const end = harness.handlers.get('subagent/end')
+  assert.equal(typeof end, 'function', 'the plugin listens to the settlement edge')
+  end({ id: 'child-a', runId: 'r-1' })
+  end({ id: 'child-b', runId: 'r-2' })
+  assert.deepEqual((await service.panelState()).ended, ['child-a', 'child-b'])
+
+  // 同一条边不重复记：环形表只负责「结束过」，客户端关闭是幂等的。
+  end({ id: 'child-a', runId: 'r-1' })
+  assert.deepEqual((await service.panelState()).ended, ['child-a', 'child-b'])
+
+  // 复活就撤销：宿主每个 activation epoch 都发 start，续跑或重试的 worker 用的是同一个
+  // durable id。不清掉的话客户端会把它活着的页签反复关掉。
+  const resume = harness.handlers.get('subagent/start')
+  assert.equal(typeof resume, 'function', 'the plugin listens to the start edge too')
+  resume({ id: 'child-b', runId: 'r-9' })
+  assert.deepEqual((await service.panelState()).ended, ['child-a'], 'a resumed worker is not reported dead')
+})
+
 test('the dock endpoint reports the effective master, including a generated resident one', async () => {
   // 指定了就报指定的那个，且 master 行变成可打开。
   const harness = start()

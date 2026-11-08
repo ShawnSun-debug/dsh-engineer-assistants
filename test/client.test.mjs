@@ -154,6 +154,8 @@ function mountField(scope) {
 
 let mod
 const timers = []
+// 清扫的定时器走 setInterval；测试手动打一拍，别让真实时间参与。
+const intervals = []
 // A stand-in browser: the row measures its own box and the window height before it opens
 // the model list, and listens for scroll and resize while it is open.
 const fakeWindow = {
@@ -177,7 +179,8 @@ const fakeWindow = {
     fakeWindow.listeners = fakeWindow.listeners.filter((entry) => entry !== type)
   },
 }
-const fakeDocument = { listeners: [], addEventListener() {}, removeEventListener() {} }
+// hidden 是这个共享对象上的一个开关：bundle 读的是它，测试改的也是它。
+const fakeDocument = { listeners: [], hidden: false, addEventListener() {}, removeEventListener() {} }
 vm.runInNewContext(src, {
   window: fakeWindow,
   document: fakeDocument,
@@ -188,6 +191,15 @@ vm.runInNewContext(src, {
     return timer
   },
   clearTimeout: () => {},
+  setInterval: (fn, ms) => {
+    const timer = { fn, ms }
+    intervals.push(timer)
+    return timer
+  },
+  clearInterval: (timer) => {
+    const at = intervals.indexOf(timer)
+    if (at !== -1) intervals.splice(at, 1)
+  },
 })
 const T = mod.__test
 const t = (k) => k
@@ -3690,12 +3702,15 @@ function fakeApplyCtx({ dock = false, registerThrows = false } = {}) {
   const slots = []
   const types = []
   const openTabCalls = []
+  const disposers = []
   const ctx = {
     effect: (fn) => {
       const disposer = fn()
-      return () => {
+      const stop = () => {
         if (typeof disposer === 'function') disposer()
       }
+      disposers.push(stop)
+      return stop
     },
     locale: { register: () => () => {}, bind: () => (key) => key },
     slots: {
@@ -3740,7 +3755,7 @@ function fakeApplyCtx({ dock = false, registerThrows = false } = {}) {
       return undefined
     },
   }
-  return { ctx, slotNames, slots, types, openTabCalls }
+  return { ctx, slotNames, slots, types, openTabCalls, disposers }
 }
 
 test('apply wires the dock only when the host provides it, and loads without it', () => {
@@ -3794,4 +3809,345 @@ test('the panel still registers when only the tab registry exists', () => {
   onlyTabs.ctx.get = (name) => (name === 'sidebarRight' || name === 'uiWorkspace' ? undefined : get(name))
   assert.doesNotThrow(() => mod.apply(onlyTabs.ctx))
   assert.equal(onlyTabs.types.length, 1, 'the type is registered even without the dock services')
+})
+
+// ---- 死页签清扫（票 12） -------------------------------------------------------------------
+//
+// worker 结束以后它那个聊天页签还开着，里面是一条没人能再说话的会话。清扫靠两条触发点，
+// 安全规则压过覆盖率：宿主还列着的子会话一张都不许关。
+
+/** 一张宿主 chat 页签的行，形状就是 openTabs 平表里的那一项。 */
+const panelChatTab = (childId, overrides = {}) =>
+  Object.assign(
+    {
+      sessionId: 'parent-1',
+      tabId: 'tab-' + childId,
+      kind: 'subagentchat',
+      contentId:
+        'dsh-resource://subagentchat/session/' + encodeURIComponent(childId) + '?parent=parent-1&mode=continuable',
+    },
+    overrides,
+  )
+
+test('the client parses a worker chat address like the server module, and is stricter on three shapes', () => {
+  // 客户端读不进来服务端模块，只能照抄一份。两份在**可打印的正常形状**上必须一致；分歧只允许
+  // 出现在「客户端拒、服务端收」这个方向——那样最坏是漏关一张死页签，不会误关活的。
+  const inputs = [
+    'dsh-resource://subagentchat/session/child-1?parent=parent-1&mode=continuable',
+    'dsh-resource://subagentchat/session/child-1?parent=parent-1&mode=one-shot',
+    'dsh-resource://subagentchat/session/child-1?parent=parent-1&mode=unknown',
+    'dsh-resource://subagentchat/session/child%2F1%20a?parent=p%201&mode=continuable',
+    'dsh-resource://subagentchat/session/child-1?parent=parent-1&mode=continuable&extra=1',
+    'dsh-resource://subagentchat/session/child-1?parent=parent-1&mode=continuable#frag',
+    'dsh-resource://subagentchat/session/child-1/',
+    'dsh-resource://subagentchat/session//child-1?parent=p&mode=one-shot',
+    'dsh-resource://subagentchat/session/child%20?parent=p&mode=one-shot',
+    'dsh-resource://subagentchat/session/%20%20?parent=p&mode=one-shot',
+    'dsh-resource://subagentchat/session/child%zz?parent=p&mode=one-shot',
+    'dsh-resource://subagentchat/session/child-1',
+    'dsh-resource://subagentchat/session/child-1?parent=&mode=one-shot',
+    'dsh-resource://subagentchat/session/child-1?mode=continuable',
+    'dsh-resource://subagentchat/session/child-1?parent=p&mode=once',
+    'dsh-resource://subagentchat/session/child-1?parent=p&mode=continuable&parent=other',
+    'dsh-resource://subagentchat/chat/child-1?parent=p&mode=continuable',
+    'dsh-resource://subagentchat/session/child-1/child-2?parent=p&mode=continuable',
+    'dsh-resource://subagentchat',
+    'dsh-resource:///session/child-1?parent=p&mode=continuable',
+    'dsh-resource://otherhost/session/child-1?parent=p&mode=continuable',
+    'https://subagentchat/session/child-1?parent=p&mode=continuable',
+    'dsh-resource://subagentchat/session/Child-1?parent=p&mode=continuable',
+    'dsh-resource://subagentchat/Session/child-1?parent=p&mode=continuable',
+    'dsh-resource://subagentchat/session/child-1?parent=p&mode=undefined',
+    'not a url',
+    '',
+    undefined,
+    null,
+    42,
+  ]
+  for (const input of inputs) {
+    const server = panelSurface.parseWorkerChatAddress(input)
+    const expected = server === undefined ? undefined : server.childSessionId
+    assert.equal(T.panelChatChildOf(input), expected, 'the mirror disagrees on ' + String(input))
+  }
+  // 两边都解析失败的地方不能靠「两边都坏」蒙过去：抽两条钉住真值。
+  assert.equal(T.panelChatChildOf(inputs[0]), 'child-1')
+  assert.equal(T.panelChatChildOf(inputs[3]), 'child/1 a')
+  assert.equal(T.panelChatChildOf(inputs[11]), undefined, 'no query means no address')
+
+  // 记下来的三处分歧（都实测过）：WHATWG 的 URL 会把 userinfo、端口、点段规范化掉，所以服务端
+  // 解析器照收；客户端的解析器不走 URL，一律拒绝。方向安全，但要写成断言，别靠「大概没事」。
+  for (const odd of [
+    'dsh-resource://user@subagentchat/session/child-1?parent=p&mode=one-shot',
+    'dsh-resource://subagentchat:8080/session/child-1?parent=p&mode=one-shot',
+    'dsh-resource://subagentchat/./session/child-1?parent=p&mode=one-shot',
+  ]) {
+    assert.equal(typeof panelSurface.parseWorkerChatAddress(odd)?.childSessionId, 'string', 'the server takes ' + odd)
+    assert.equal(T.panelChatChildOf(odd), undefined, 'the client refuses ' + odd)
+  }
+})
+
+test('a tab is stale only when the server says its child ended, and it sits in the mounted session', () => {
+  const { panelStaleTabIdsOf } = T
+  const ended = ['dead-1']
+  const stale = panelStaleTabIdsOf({ tabs: [panelChatTab('dead-1')], mountedSessionId: 'parent-1', ended })
+  assert.deepEqual(plain(stale), ['tab-dead-1'])
+
+  // 服务端没说结束的，一张都不许关——哪怕浏览器里根本查不到这个子会话。
+  assert.deepEqual(plain(panelStaleTabIdsOf({ tabs: [panelChatTab('live-1')], mountedSessionId: 'parent-1', ended })), [])
+  // 别的会话里的页签不归这里管：close() 只作用于挂载会话。
+  assert.deepEqual(
+    plain(panelStaleTabIdsOf({ tabs: [panelChatTab('dead-1', { sessionId: 'other-1' })], mountedSessionId: 'parent-1', ended })),
+    [],
+  )
+  // contentId 里写着 subagentchat 不等于这张页签就是宿主的聊天页签：kind 也要对上。
+  for (const kind of ['files', 'terminal', 'subagentchat2', undefined]) {
+    assert.deepEqual(plain(panelStaleTabIdsOf({ tabs: [panelChatTab('dead-1', { kind })], mountedSessionId: 'parent-1', ended })), [])
+  }
+  // 垃圾行跳过；同一张页签出现两次只报一次；解析不出来的地址跳过。
+  const mixed = [
+    null,
+    'dead',
+    [],
+    42,
+    panelChatTab('dead-1'),
+    panelChatTab('dead-1'),
+    { sessionId: 'parent-1', tabId: 'tab-junk', kind: 'subagentchat', contentId: 'not an address' },
+    { sessionId: 'parent-1', tabId: '   ', kind: 'subagentchat', contentId: panelChatTab('dead-2').contentId },
+    panelChatTab('dead-3'),
+  ]
+  assert.deepEqual(plain(panelStaleTabIdsOf({ tabs: mixed, mountedSessionId: 'parent-1', ended: ['dead-1', 'dead-3'] })), [
+    'tab-dead-1',
+    'tab-dead-3',
+  ])
+  // 没有挂载会话就没有目标：宿主只按挂载会话关。
+  for (const mountedSessionId of [undefined, '', '   ', null]) {
+    assert.deepEqual(plain(panelStaleTabIdsOf({ tabs: [panelChatTab('dead-1')], mountedSessionId, ended })), [])
+  }
+  // 读不到结束名单就一张都不动：读不到真相时宁可留一张死页签。
+  for (const missing of [undefined, null, 'ended', {}, 7]) {
+    assert.deepEqual(plain(panelStaleTabIdsOf({ tabs: [panelChatTab('dead-1')], mountedSessionId: 'parent-1', ended: missing })), [])
+  }
+  // 空名单等于没人结束过。
+  assert.deepEqual(plain(panelStaleTabIdsOf({ tabs: [panelChatTab('dead-1')], mountedSessionId: 'parent-1', ended: [] })), [])
+  // 已经为它关过一次：用户重开来读的那张不许再被抽走。
+  assert.deepEqual(
+    plain(panelStaleTabIdsOf({ tabs: [panelChatTab('dead-1')], mountedSessionId: 'parent-1', ended, handled: ['dead-1'] })),
+    [],
+  )
+  assert.deepEqual(
+    plain(panelStaleTabIdsOf({ tabs: [panelChatTab('dead-1'), panelChatTab('dead-3')], mountedSessionId: 'parent-1', ended: ['dead-1', 'dead-3'], handled: ['dead-1'] })),
+    ['tab-dead-3'],
+  )
+})
+
+/** 一个能答「谁结束了」的宿主：右栏两个快照 store，加面板端点命名空间。 */
+function fakeSweepHost({ tabs = [], mounted = 'parent-1', ended = [], closeThrows = [], endpoint = 'ok' } = {}) {
+  const closes = []
+  const ctx = {
+    get(name) {
+      if (name === 'sidebarRight') {
+        return {
+          close: (tabId) => {
+            if (closeThrows.includes(tabId)) throw new Error('no session surface is mounted')
+            closes.push(tabId)
+          },
+          openTabs: { getSnapshot: () => tabs, subscribe: () => () => {} },
+          mounted: { getSnapshot: () => mounted, subscribe: () => () => {} },
+        }
+      }
+      if (name === 'remote.orchestratorPanel') {
+        if (endpoint === 'missing') return undefined
+        return {
+          panelState: async () => {
+            if (endpoint === 'fails') return { ok: false, error: { message: 'gateway is down' } }
+            return { ok: true, value: { model: { fixed: [], master: { sessionId: null }, workers: [] }, actions: { fixed: [], workers: [] }, ended } }
+          },
+        }
+      }
+      if (name === 'remote') return { $mount: async () => {} }
+      return undefined
+    },
+  }
+  return { ctx, closes }
+}
+
+test('sweepPanelTabs closes only what the server reported, and reports a close that throws', async () => {
+  const { sweepPanelTabs } = T
+  const host = fakeSweepHost({
+    tabs: [panelChatTab('dead-1'), panelChatTab('live-1'), panelChatTab('dead-2'), panelChatTab('dead-1', { sessionId: 'other' })],
+    ended: ['dead-1', 'dead-2'],
+    closeThrows: ['tab-dead-1'],
+  })
+  const result = await sweepPanelTabs(host.ctx, { schedule: (run) => run() })
+  assert.deepEqual(plain(result), {
+    asked: ['tab-dead-2'],
+    failed: [{ tabId: 'tab-dead-1', message: 'no session surface is mounted' }],
+  })
+  assert.deepEqual(host.closes, ['tab-dead-2'], 'a throwing close does not stop the rest')
+
+  // 同一个 ctx 再扫一次：已经关成功的子会话不再关（用户重开一张就留住）；关失败的那一张
+  // 仍然重试——它这一拍没落地，状态没变。
+  const again = await sweepPanelTabs(host.ctx, { schedule: (run) => run() })
+  assert.deepEqual(plain(again), {
+    asked: [],
+    failed: [{ tabId: 'tab-dead-1', message: 'no session surface is mounted' }],
+  })
+  assert.deepEqual(host.closes, ['tab-dead-2'], 'a deliberate reopen is not swept again')
+})
+
+test('sweepPanelTabs never closes anything when the endpoint cannot answer', async () => {
+  // 关页签是可选的清理：网关不在、端点没挂、载荷报错，都该安静地什么都不做。
+  const { sweepPanelTabs } = T
+  for (const endpoint of ['missing', 'fails']) {
+    const host = fakeSweepHost({ tabs: [panelChatTab('dead-1')], ended: ['dead-1'], endpoint })
+    assert.deepEqual(plain(await sweepPanelTabs(host.ctx, { schedule: (run) => run() })), { asked: [], failed: [] })
+    assert.deepEqual(host.closes, [], endpoint)
+  }
+})
+
+test('sweepPanelTabs asks nothing at all when no chat tab is on screen', async () => {
+  // 本地就能否决的请求不该发出去：没有聊天页签时端点一次都不该被调。
+  const { sweepPanelTabs } = T
+  let calls = 0
+  const host = fakeSweepHost({ tabs: [panelChatTab('dead-1', { sessionId: 'other-1' })], ended: ['dead-1'] })
+  const namespace = host.ctx.get('remote.orchestratorPanel')
+  const original = namespace.panelState
+  namespace.panelState = async () => {
+    calls += 1
+    return original()
+  }
+  assert.deepEqual(plain(await sweepPanelTabs(host.ctx, { schedule: (run) => run() })), { asked: [], failed: [] })
+  assert.equal(calls, 0, 'a tab in another session does not justify a round trip')
+})
+
+test('sweepPanelTabs defers past adoption, coalesces a burst, and survives a bare ctx', async () => {
+  const { sweepPanelTabs } = T
+  const host = fakeSweepHost({ tabs: [panelChatTab('dead-1')], ended: ['dead-1'] })
+  const before = timers.length
+  const first = sweepPanelTabs(host.ctx)
+  const second = sweepPanelTabs(host.ctx)
+  assert.equal(timers.length - before, 1, 'a burst schedules one sweep')
+  assert.deepEqual(host.closes, [], 'nothing closes synchronously: adoption has not happened yet')
+  timers[timers.length - 1].fn()
+  const result = await first
+  assert.equal(await second, result, 'the second call joined the first sweep instead of scheduling another')
+  assert.deepEqual(plain(result), { asked: ['tab-dead-1'], failed: [] })
+  assert.deepEqual(host.closes, ['tab-dead-1'])
+  // 扫完就松开：下一次触发要能再排一个，而不是并进已经扫过的那一次。
+  const later = timers.length
+  const third = sweepPanelTabs(host.ctx)
+  assert.equal(timers.length - later, 1, 'a finished sweep does not absorb the next trigger')
+  timers[timers.length - 1].fn()
+  await third
+
+  // 没有挂载会话：一次都不关，也不抛。
+  const unmounted = fakeSweepHost({ tabs: [panelChatTab('dead-1')], mounted: '', ended: ['dead-1'] })
+  assert.deepEqual(plain(await sweepPanelTabs(unmounted.ctx, { schedule: (run) => run() })), { asked: [], failed: [] })
+  assert.deepEqual(unmounted.closes, [])
+
+  // 服务缺了、ctx 是垃圾：照旧 resolve，不抛。
+  for (const ctx of [{}, { get: () => undefined }, { get: () => ({}) }, undefined, null]) {
+    assert.deepEqual(plain(await sweepPanelTabs(ctx, { schedule: (run) => run() })), { asked: [], failed: [] })
+  }
+})
+
+/** apply 的宿主：在 fakeApplyCtx 上补右栏两个快照 store 与面板端点。 */
+function fakeSweepApplyCtx({ tabs = [], mounted = 'parent-1', ended = [], dock = true } = {}) {
+  const base = fakeApplyCtx({ dock })
+  const closes = []
+  const mountedListeners = []
+  const mountedStore = {
+    getSnapshot: () => mounted,
+    subscribe(listener) {
+      mountedListeners.push(listener)
+      return () => {
+        const at = mountedListeners.indexOf(listener)
+        if (at !== -1) mountedListeners.splice(at, 1)
+      }
+    },
+  }
+  const openTabs = { getSnapshot: () => tabs, subscribe: () => () => {} }
+  const getService = base.ctx.get
+  base.ctx.get = (name) => {
+    if (name === 'remote.orchestratorPanel') {
+      return {
+        panelState: async () => ({
+          ok: true,
+          value: { model: { fixed: [], master: { sessionId: null }, workers: [] }, actions: { fixed: [], workers: [] }, ended },
+        }),
+      }
+    }
+    const value = getService(name)
+    if (name === 'sidebarRight' && value !== undefined && value !== null && dock) {
+      return Object.assign({}, value, {
+        mounted: mountedStore,
+        openTabs,
+        close: (tabId) => {
+          closes.push(tabId)
+        },
+      })
+    }
+    return value
+  }
+  return { ctx: base.ctx, closes, mountedListeners, slots: base.slots, types: base.types, disposers: base.disposers }
+}
+
+test('apply sweeps on a mounted change and on its own timer, once per burst', async () => {
+  const host = fakeSweepApplyCtx({ tabs: [panelChatTab('dead-1'), panelChatTab('live-1')], ended: ['dead-1'] })
+  const beforeIntervals = intervals.length
+  assert.doesNotThrow(() => mod.apply(host.ctx))
+  assert.equal(host.mountedListeners.length, 1, 'the mounted store is watched')
+  // 结束不会改变浏览器里任何 store，所以必须有自己的定时器；否则「你正看着它死」永远收不到。
+  assert.equal(intervals.length - beforeIntervals, 1, 'a sweep timer is registered')
+  assert.equal(intervals[intervals.length - 1].ms, T.PANEL_SWEEP_MS, 'the timer uses the documented cadence')
+
+  const before = timers.length
+  host.mountedListeners[0]()
+  host.mountedListeners[0]()
+  assert.equal(timers.length - before, 1, 'a burst schedules exactly one deferred sweep')
+  assert.deepEqual(host.closes, [], 'the sweep is deferred past adoption')
+  timers[timers.length - 1].fn()
+  await flush()
+  assert.deepEqual(host.closes, ['tab-dead-1'], 'only the tab the server reported is closed')
+
+  // 定时器那一拍也必须真的清扫一次（会排一次清扫），但它不再关同一个子会话的页签：
+  // 用户重开一张来读，不该每 5 秒被抽走一次。
+  const beforeTick = timers.length
+  intervals[intervals.length - 1].fn()
+  assert.equal(timers.length - beforeTick, 1, 'a timer tick schedules a sweep')
+  timers[timers.length - 1].fn()
+  await flush()
+  assert.deepEqual(host.closes, ['tab-dead-1'], 'the reopen rule keeps a deliberate reopen open')
+})
+
+test('unloading the plugin takes the sweep timer with it', () => {
+  const host = fakeSweepApplyCtx({ tabs: [panelChatTab('dead-1')], ended: ['dead-1'] })
+  const before = intervals.length
+  mod.apply(host.ctx)
+  assert.equal(intervals.length - before, 1, 'the timer is registered while the plugin lives')
+  for (const stop of [...host.disposers].reverse()) stop()
+  assert.equal(intervals.length, before, 'every effect teardown ran, including clearInterval')
+})
+
+test('a hidden page does not poll for dead tabs', () => {
+  const host = fakeSweepApplyCtx({ tabs: [panelChatTab('dead-1')], ended: ['dead-1'] })
+  mod.apply(host.ctx)
+  const tick = intervals[intervals.length - 1].fn
+  const before = timers.length
+  fakeDocument.hidden = true
+  try {
+    tick()
+  } finally {
+    fakeDocument.hidden = false
+  }
+  assert.equal(timers.length - before, 0, 'no sweep is scheduled while the page is hidden')
+  // 可见时那一拍照常排清扫：别把这个开关做成永久关闭。
+  tick()
+  assert.equal(timers.length - before, 1, 'a visible page still polls')
+})
+
+test('apply registers no sweep when the dock cannot close tabs', () => {
+  const host = fakeSweepApplyCtx({ dock: false })
+  assert.doesNotThrow(() => mod.apply(host.ctx))
+  assert.deepEqual(host.mountedListeners, [], 'no mounted subscription without a closable dock')
 })
