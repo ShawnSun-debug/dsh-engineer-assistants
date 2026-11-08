@@ -2,14 +2,19 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import test from 'node:test'
 
+import { assignSession, finishSession, reserveChildId } from '../lib/assignments.js'
+import { panelPayloadOf } from '../lib/panel-remote.js'
 import {
   CADENCE_MS,
   CAP_MS,
   ITEM_LABELS,
   REQUIRED_ITEMS,
   archivePath,
+  composeReport,
+  createReporter,
   renderReport,
   reportDue,
+  snapshotOf,
   stampOf,
   summaryLine,
   summaryPath,
@@ -122,4 +127,207 @@ test('the summary line never claims 无变化 while something is running', () =>
   assert.equal(working, '- 2026-11-08 12:05 · w1 跑了 12 分钟')
   assert.equal(summaryLine({ at: AT, snapshot: {} }), '- 2026-11-08 12:05 · 无变化')
   assert.equal(summaryLine({ at: AT, snapshot: { finished: '两个测试通过' } }), '- 2026-11-08 12:05 · 两个测试通过')
+})
+// ---- 票 21：节拍接线与落座 ---------------------------------------------------------------
+//
+// 这一半测的是「每三分钟一份、两小时自停、只保留最近一份」，时钟与定时器全部注入；
+// 没有一条测试等真实的三分钟。
+
+const MINUTE = 60_000
+
+/** 与 test/secretary-beat.test.mjs 同一份手推时钟：advance 只触发到点的定时器。 */
+function fakeTimer(startAt = 1_000_000) {
+  let current = startAt
+  let nextId = 1
+  const pending = new Map()
+  return {
+    now: () => current,
+    schedule(fn, ms) {
+      const id = nextId
+      nextId += 1
+      pending.set(id, { id, fn, dueAt: current + ms })
+      return id
+    },
+    cancel(id) {
+      pending.delete(id)
+    },
+    advance(ms) {
+      const target = current + ms
+      for (;;) {
+        let due
+        for (const timer of pending.values()) {
+          if (timer.dueAt <= target && (due === undefined || timer.dueAt < due.dueAt)) due = timer
+        }
+        if (due === undefined) break
+        pending.delete(due.id)
+        current = due.dueAt
+        due.fn()
+      }
+      current = target
+    },
+    pendingCount: () => pending.size,
+  }
+}
+
+test('the snapshot comes from the registry and the inspector, never from a guess', () => {
+  // 登记表：两个在跑、一个只预占、两个已结束。监工：两个卡着，理由不同。
+  let table = reserveChildId({}, { id: 'w-1', parentId: 'p', startedAt: 1000 })
+  table = assignSession(table, { sessionId: 'w-1', kind: 'worker', parentId: 'p', status: 'running', startedAt: 1000 })
+  table = reserveChildId(table, { id: 'w-2', parentId: 'p', startedAt: 2000 })
+  table = assignSession(table, { sessionId: 'w-2', kind: 'worker', parentId: 'p', status: 'running', startedAt: 2000 })
+  table = reserveChildId(table, { id: 'w-3', parentId: 'p', startedAt: 3000 })
+  table = assignSession(table, { sessionId: 'w-3', kind: 'worker', parentId: 'p', status: 'running', startedAt: 3000 })
+  table = finishSession(table, { sessionId: 'w-3', status: 'done' })
+  table = reserveChildId(table, { id: 'w-4', parentId: 'p', startedAt: 4000 })
+  table = assignSession(table, { sessionId: 'w-4', kind: 'worker', parentId: 'p', status: 'running', startedAt: 4000 })
+  table = finishSession(table, { sessionId: 'w-4', status: 'failed' })
+  table = reserveChildId(table, { id: 'w-5', parentId: 'p', startedAt: 5000 })
+
+  const snapshot = snapshotOf({
+    assignments: table,
+    attention: { 'w-1': ['retrying'], 'w-2': ['idle', 'waiting-approval'], 'w-9': [] },
+  })
+
+  assert.match(snapshot.running, /^3 个在跑/, 'running and reserved both count as live')
+  for (const id of ['w-1', 'w-2', 'w-5']) assert.ok(snapshot.running.includes(id), id)
+  assert.match(snapshot.stuck, /^2 个卡住/, 'only ids the inspector still flags')
+  assert.ok(snapshot.stuck.includes('重试中'))
+  assert.ok(snapshot.stuck.includes('空转'))
+  assert.ok(snapshot.stuck.includes('等批准'))
+  assert.match(snapshot.finished, /^已结束 2 个/)
+  assert.ok(snapshot.finished.includes('w-3 完成'))
+  assert.ok(snapshot.finished.includes('w-4 失败'))
+  // 花费没有可读的统计来源：写缺项，不编数字（这一项最容易顺手编一个 0.00）。
+  assert.match(snapshot.cost, /未提供/)
+  assert.equal(/\d/.test(snapshot.cost), false, 'no fabricated number stands in for a cost')
+  // 卡住优先于在跑：先处理卡住的，其余在跑的等着。
+  assert.match(snapshot.next, /^先处理 2 个卡住的 worker/)
+  assert.match(snapshotOf({ assignments: table, attention: {} }).next, /3 个 worker 在跑/)
+})
+
+test('an idle machine still has five items, with 无 where the fact is really zero', () => {
+  const snapshot = snapshotOf({ assignments: {}, attention: {} })
+  assert.equal(snapshot.running, '')
+  assert.equal(snapshot.stuck, '')
+  assert.equal(snapshot.finished, '')
+  assert.match(snapshot.cost, /未提供/)
+  assert.match(snapshot.next, /没有在跑的 worker/)
+
+  const { text } = renderReport({ at: AT, snapshot })
+  const itemLines = text.split('\n').filter((line) => line.startsWith('- **'))
+  assert.equal(itemLines.length, 5)
+  assert.ok(text.includes(`**${ITEM_LABELS.running}**：无`), 'an empty item is written out, not left blank')
+  assert.ok(text.includes('**花费**：未提供'), 'a missing data source names itself')
+})
+
+test('composeReport is the one drawable shape: sequence, time, text and five items', () => {
+  const report = composeReport({ seq: 4, at: AT, snapshot: { running: '1 个在跑（w-1）' } })
+  assert.equal(report.seq, 4)
+  assert.equal(report.at, AT.getTime())
+  assert.equal(report.stamp, '2026-11-08 12:05')
+  assert.match(report.text, /^# 汇报 2026-11-08 12:05/)
+  assert.equal(report.oneLine, false)
+  assert.deepEqual(report.items.map((item) => item.key), [...REQUIRED_ITEMS])
+  assert.equal(report.items[0].text, '1 个在跑（w-1）')
+  assert.equal(report.items[1].text, '无')
+})
+
+test('three minutes produce one report, and only the latest is kept', () => {
+  const timer = fakeTimer()
+  const reporter = createReporter({
+    assignments: () => ({}),
+    attention: () => ({}),
+    now: timer.now,
+    schedule: timer.schedule,
+    cancel: timer.cancel,
+  })
+  reporter.start()
+  assert.equal(timer.pendingCount(), 1, 'one timer, three minutes out')
+
+  timer.advance(3 * MINUTE)
+  assert.equal(reporter.count(), 1)
+  const first = reporter.latest()
+  assert.equal(first.seq, 1)
+  assert.equal(first.items.length, REQUIRED_ITEMS.length)
+
+  timer.advance(6 * MINUTE)
+  assert.equal(reporter.count(), 3)
+  assert.equal(reporter.latest().seq, 3)
+  assert.notEqual(reporter.latest(), first, 'reports are replaced, never accumulated')
+  assert.equal(reporter.status().tickIndex, 3)
+})
+
+test('the two-hour cap stops the beat by itself, and nothing is produced afterwards', () => {
+  const timer = fakeTimer()
+  const reporter = createReporter({
+    assignments: () => ({}),
+    attention: () => ({}),
+    now: timer.now,
+    schedule: timer.schedule,
+    cancel: timer.cancel,
+  })
+  reporter.start()
+  // 默认上限就是 CAP_MS：最后一张落在 2 小时前 3 分钟，2 小时那一拍被上限吃掉。
+  timer.advance(CAP_MS + 60 * MINUTE)
+  assert.equal(reporter.count(), Math.floor(CAP_MS / CADENCE_MS) - 1)
+  assert.equal(reporter.status().stopReason, 'max-run')
+  assert.equal(timer.pendingCount(), 0)
+})
+
+test('starting the same reporter twice does not stack a second beat', () => {
+  const timer = fakeTimer()
+  const reporter = createReporter({
+    assignments: () => ({}),
+    attention: () => ({}),
+    now: timer.now,
+    schedule: timer.schedule,
+    cancel: timer.cancel,
+  })
+  reporter.start()
+  reporter.start()
+  assert.equal(timer.pendingCount(), 1, 'one reporter, one table')
+  timer.advance(3 * MINUTE)
+  assert.equal(reporter.count(), 1, 'a duplicate start must not double the first tick')
+})
+
+test('a broken fact source is reported, and the next tick still runs', () => {
+  const timer = fakeTimer()
+  const errors = []
+  const reporter = createReporter({
+    assignments: () => {
+      throw new Error('registry down')
+    },
+    attention: () => ({}),
+    now: timer.now,
+    schedule: timer.schedule,
+    cancel: timer.cancel,
+    onError: (error) => errors.push(error.message),
+  })
+  reporter.start()
+  timer.advance(3 * MINUTE)
+
+  assert.deepEqual(errors, ['registry down'])
+  assert.equal(reporter.count(), 0, 'a tick that cannot read its facts produces no report')
+  assert.equal(timer.pendingCount(), 1, 'one bad tick does not stop the beat')
+})
+test('the report the beat produces is already the dock payload shape', async () => {
+  // 两半必须对得上：节拍产出的对象直接塞进端点，不能被端点改写成另一份（或读成 null）。
+  const timer = fakeTimer()
+  const reporter = createReporter({
+    assignments: () => ({}),
+    attention: () => ({}),
+    now: timer.now,
+    schedule: timer.schedule,
+    cancel: timer.cancel,
+  })
+  reporter.start()
+  timer.advance(3 * MINUTE)
+  const latest = reporter.latest()
+
+  const payload = await panelPayloadOf({ assignments: {}, report: latest })
+  assert.equal(payload.report.seq, latest.seq)
+  assert.equal(payload.report.stamp, latest.stamp)
+  assert.equal(payload.report.text, latest.text)
+  assert.deepEqual(payload.report.items, latest.items)
+  assert.deepEqual(payload.report.items.map((item) => item.key), [...REQUIRED_ITEMS])
 })
