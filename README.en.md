@@ -116,8 +116,8 @@ After installing, **fully quit and reopen DSH**: client plugins are composed at 
 
 This version removes the old "dispatch mode" settings page and the old report archive, and it does **no automatic migration**: after upgrading, the plugin does not rewrite your profile and never moves or deletes files on disk. Do these by hand:
 
-1. **The old settings entry is gone.** The plugin no longer takes a seat in the host settings dialog (the whole "Dispatch" section is removed). Everything still writable lives on the secretary view's **Settings** tab: the three model routes (main / worker / reviewer), the tracking switch, wake-on-blocked, the five notification switches, the cadence and the standing prompt.
-2. **Profile-only switches.** `enabled` (the dispatch-mode master switch), `allowedTools` (the main-agent tool whitelist) and `superviseEnabled` / `superviseIntervalSeconds` / `superviseMaxNoticesPerChild` / `superviseUnlimited` / `superviseNotifyOnNoProgress` (subagent supervision) no longer have any UI. Edit the plugin config in your profile directly; the fields are still volatile, so the next read picks them up.
+1. **The settings page is smaller and renamed.** The plugin still takes one seat in the host settings dialog, but it is called "Assistants" instead of "Dispatch" and holds three blocks only: the main-agent tool whitelist, subagent supervision, and the authority level. The old dispatch switch, the three model routes and the Master / registration picker are gone. The three model routes and the secretary switches remain on the secretary view's **Settings** tab.
+2. **Profile-only switch.** `enabled` (the dispatch-mode master switch) has no UI any more — the tool gate still reads it, so edit the plugin config in your profile; the field is volatile, so the next read picks it up. The whitelist and the five supervision keys (`allowedTools`, `superviseEnabled`, `superviseIntervalSeconds`, `superviseMaxNoticesPerChild`, `superviseUnlimited`, `superviseNotifyOnNoProgress`) are editable on the "Assistants" page.
 3. **The old report archive is neither read nor written.** Historical files under `<workspace>/.scratch/master-secretary/reports` are no longer listed and no new ones are produced; the plugin does not delete them, so cleaning them up is your call. Reports now come from the right dock every three minutes; the secretary view's "Diff & history" tab shows one line saying so.
 4. **A dock row's category now comes from its role preset.** A dispatch that applied a preset writes that preset's `category` instead of the fixed `code`; a worker dispatched without a preset says "No preset applied" on its row.
 5. **Unchanged:** the secretary registry (`secretaryMasterSessionId` / `secretaryOrchestrators`), the dock endpoint, dead-tab sweep and the new three-minute report beat. Existing registration rows need no migration.
@@ -126,12 +126,12 @@ This version removes the old "dispatch mode" settings page and the old report ar
 
 ## Configuration
 
-Every field is volatile: the host stores it and the plugin re-reads it on each use, so changing the configuration needs no restart — from the secretary view's Settings tab or the profile. The exception is the two install-time master switches (`masterMemoryEnabled`, `masterSessionEnabled`), which are read when the plugin mounts and therefore need a plugin reload.
+Every field is volatile: the host stores it and the plugin re-reads it on each use, so changing the configuration needs no restart — from the "Assistants" settings page, the secretary view's Settings tab, or the profile. The exception is the two install-time master switches (`masterMemoryEnabled`, `masterSessionEnabled`), which are read when the plugin mounts and therefore need a plugin reload.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | Master switch for dispatch mode. When off it revokes the hiding; the guard stays installed but lets calls through. **No UI since this version; edit it in the profile.** |
-| `allowedTools` | 11 built-ins | Whitelist-driven: the main agent may use only the tools listed here; every other host, MCP, or plugin tool is hidden and disabled automatically. Editing this key edits the whitelist, effective on the next message. **No UI since this version; edit it in the profile.** |
+| `allowedTools` | 11 built-ins | Whitelist-driven: the main agent may use only the tools listed here; every other host, MCP, or plugin tool is hidden and disabled automatically. Check a row under Allowed Tools on the "Assistants" page to edit this key; effective on the next message. |
 | `workerProvider` | `""` | Subagent provider; empty means unconfigured. |
 | `workerModel` | `""` | Subagent model; empty means unconfigured. |
 | `workerReasoningEffort` | `""` | Subagent reasoning effort; empty means it is not passed and the model resolves the default. |
@@ -142,7 +142,7 @@ Every field is volatile: the host stores it and the plugin re-reads it on each u
 | `superviseEnabled` | `true` | Master switch for supervision. |
 | `superviseIntervalSeconds` | `600` | Supervision interval in seconds, an integer 10–86400. |
 | `superviseMaxNoticesPerChild` | `3` | Most notices per subagent, an integer 0–20; `0` switches supervision off unless `superviseUnlimited` is on. |
-| `superviseUnlimited` | `false` | Ignores the notice cap and keeps supervising until the child stops, delivers or ends. **No UI since this version; edit it in the profile.** |
+| `superviseUnlimited` | `false` | Ignores the notice cap and keeps supervising until the child stops, delivers or ends; the "Unlimited checks" switch on the "Assistants" page writes this field. |
 | `superviseNotifyOnNoProgress` | `false` | Whether to also notify when the log has no new activity. |
 | `masterMemoryEnabled` | `false` | AI memory: opens the storage domain and injects the compact index. Read at mount, so changing it needs a plugin reload. |
 | `masterPanelEnabled` | `false` | Master status panel. When off the button is not rendered and the endpoint returns an empty projection. |

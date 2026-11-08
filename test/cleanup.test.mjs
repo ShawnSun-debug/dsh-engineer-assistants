@@ -42,23 +42,46 @@ test('no surviving source mentions the old report chain', () => {
   }
 })
 
-test('the old settings page and its registration slot are gone from the client bundle', () => {
+test('the old dispatch-mode page stays gone from the client bundle', () => {
+  // 票 15 第一版删掉整页；操作者随后要求保留一个最小设置页（见下一条）。这里钉的是
+  // 「旧调度语义不回来」：总开关、模型路由、Master/登记选择器、旧 section 名。
   const source = read('../lib/client.js')
   for (const symbol of [
-    'settings.section',
     'OrchestratorSettingsSection',
     'SessionPicker',
+    'pickerRowsOf',
+    "'section.title'",
+    "'section.enable'",
+    "'route.enable'",
+    "'route.enableNote'",
+    "'route.lastReview'",
+  ]) {
+    assert.equal(source.includes(symbol), false, 'lib/client.js still mentions ' + symbol)
+  }
+})
+
+test('the smaller settings page is registered and carries the restored controls', () => {
+  // 最小设置页存在：座位重新注册、标注新标题键，三块控件都能在源码里找到。
+  const source = read('../lib/client.js')
+  for (const symbol of [
+    "'settings.section'",
+    'AssistantSettingsSection',
     'AllowedToolsPanel',
     'EnableSwitch',
     'SuperviseIntervalField',
     'AuthorityPanel',
-    "'section.title'",
-    "'section.enable'",
+    "'assistant.settings.title'",
     "'allowed.title'",
     "'supervise.label'",
+    "'supervise.maxLabel'",
   ]) {
-    assert.equal(source.includes(symbol), false, 'lib/client.js still mentions ' + symbol)
+    assert.equal(source.includes(symbol), true, 'lib/client.js is missing ' + symbol)
   }
+  assert.equal(source.includes("'superviseIntervalSeconds'"), true, 'the interval field writes its config key')
+  assert.equal(source.includes("'superviseMaxNoticesPerChild'"), true, 'the max-notices field writes its config key')
+  assert.equal(source.includes("'superviseNotifyOnNoProgress'"), true, 'the no-progress switch writes its config key')
+  assert.equal(source.includes("'superviseEnabled'"), true, 'the supervision switch writes its config key')
+  assert.equal(source.includes("'superviseUnlimited'"), true, 'the unlimited switch writes its config key')
 })
 
 test('the secretary history tab says where reports went instead of reading an archive', () => {

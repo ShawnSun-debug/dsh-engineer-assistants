@@ -5,6 +5,7 @@ import vm from 'node:vm'
 import { z } from 'zod'
 import { WORKER_STATE } from '../lib/master-state.js'
 import { NOTIFY_SWITCHES } from '../lib/secretary-constants.js'
+import { DISPATCH_COMMAND } from '../lib/secretary-authority.js'
 import * as panelSurface from '../lib/panel-surface.js'
 
 const src = fs.readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
@@ -193,6 +194,30 @@ vm.runInNewContext(src, {
 })
 const T = mod.__test
 const t = (k) => k
+function mountField(scope) {
+  const view = mount(mod.__test.SuperviseIntervalField, { scope, t })
+  return {
+    view,
+    input: () => nodes(view.tree).find((node) => node.type === 'input'),
+    alert: () => nodes(view.tree).find((node) => node.props?.role === 'alert'),
+  }
+}
+
+/** 巡检「每次上限」字段：与间隔共用同一个组件，只是 setting / keys / testid 不同。 */
+function mountMaxNoticesField(scope) {
+  const view = mount(mod.__test.SuperviseIntervalField, {
+    scope,
+    t,
+    setting: mod.__test.MAX_NOTICES,
+    keys: { label: 'supervise.maxLabel', hint: 'supervise.maxHint', invalid: 'supervise.maxInvalid' },
+    testid: 'orchestrator-supervise-max',
+  })
+  return {
+    view,
+    input: () => nodes(view.tree).find((node) => node.type === 'input'),
+    alert: () => nodes(view.tree).find((node) => node.props?.role === 'alert'),
+  }
+}
 // Values built inside the vm context have another Object.prototype; compare them as plain JSON.
 const plain = (v) => JSON.parse(JSON.stringify(v))
 
@@ -341,7 +366,124 @@ test('saveRoute surfaces a rejected write and a write that did not land', async 
   assert.equal(await T.saveRoute(dropped, T.MAIN.fields, { provider: 'p', model: 'm', effort: '' }, t), 'route.saveFailed')
 })
 
-test('apply leaves only the plan toggle in the composer, drops the settings page, and keeps the secretary seats', () => {
+test('the supervision interval field shows the stored value, or 600 when it is absent or malformed', () => {
+  const cases = [
+    [{}, '600'],
+    [{ superviseIntervalSeconds: 1200 }, '1200'],
+    [{ superviseIntervalSeconds: 0 }, '600'],
+    [{ superviseIntervalSeconds: 'abc' }, '600'],
+    [{ superviseIntervalSeconds: null }, '600'],
+    [{ superviseIntervalSeconds: 12.5 }, '600'],
+  ]
+  for (const [initial, shown] of cases) {
+    const field = mountField(fakeScope({ initial }))
+    const input = field.input()
+    assert.equal(input.props.value, shown)
+    // Text plus a numeric keypad keeps "abc" observable; a number input would blank it.
+    assert.equal(input.props.type, 'text')
+    assert.equal(input.props.inputMode, 'numeric')
+    assert.equal(input.props.min, 10)
+    assert.equal(input.props.max, 86400)
+    assert.equal(input.props.step, 1)
+    assert.equal(input.props['aria-label'], 'supervise.label')
+    field.view.unmount()
+  }
+})
+
+test('invalid interval input is rejected, restored, and explained', async () => {
+  for (const bad of ['9', '86401', '12.5', '1e3', 'abc']) {
+    const scope = fakeScope({ initial: { superviseIntervalSeconds: 900 } })
+    const field = mountField(scope)
+    field.input().props.onChange({ target: { value: bad } })
+    await field.input().props.onBlur()
+    assert.equal(scope.calls.length, 0, bad)
+    assert.equal(field.input().props.value, '900', bad)
+    assert.equal(field.alert().kids[0], 'supervise.invalid', bad)
+    field.view.unmount()
+  }
+})
+
+test('a valid interval is written on blur with the snapshot revision', async () => {
+  const scope = fakeScope({ initial: { superviseIntervalSeconds: 600 } })
+  const field = mountField(scope)
+  field.input().props.onChange({ target: { value: ' 900 ' } })
+  await field.input().props.onBlur()
+  assert.equal(scope.calls.length, 1)
+  assert.deepEqual(plain(scope.calls[0].ops), [{ op: 'set', path: ['superviseIntervalSeconds'], value: 900 }])
+  assert.equal(scope.calls[0].expected, 1)
+  assert.equal(scope.getSnapshot().value.superviseIntervalSeconds, 900)
+  assert.equal(field.input().props.value, '900')
+  assert.equal(field.alert(), undefined)
+})
+
+test('Enter also commits a valid interval', async () => {
+  const scope = fakeScope({ initial: { superviseIntervalSeconds: 600 } })
+  const field = mountField(scope)
+  field.input().props.onChange({ target: { value: '1800' } })
+  await field.input().props.onKeyDown({ key: 'Enter', preventDefault() {} })
+  assert.deepEqual(plain(scope.calls[0].ops), [{ op: 'set', path: ['superviseIntervalSeconds'], value: 1800 }])
+})
+
+test('an empty interval writes the 600 default, since a number field cannot clear to an empty string', async () => {
+  const scope = fakeScope({ initial: { superviseIntervalSeconds: 1200 } })
+  const field = mountField(scope)
+  field.input().props.onChange({ target: { value: '   ' } })
+  await field.input().props.onBlur()
+  assert.equal(scope.calls.length, 1)
+  assert.deepEqual(plain(scope.calls[0].ops), [{ op: 'set', path: ['superviseIntervalSeconds'], value: 600 }])
+  assert.equal(field.input().props.value, '600')
+})
+
+test('an unchanged interval does not mutate the config', async () => {
+  const scope = fakeScope({ initial: { superviseIntervalSeconds: 600 } })
+  const field = mountField(scope)
+  field.input().props.onChange({ target: { value: ' 600 ' } })
+  await field.input().props.onBlur()
+  assert.equal(scope.calls.length, 0)
+  assert.equal(field.input().props.value, '600')
+  assert.equal(field.alert(), undefined)
+})
+
+test('Escape abandons the edit and restores the stored interval', () => {
+  const scope = fakeScope({ initial: { superviseIntervalSeconds: 600 } })
+  const field = mountField(scope)
+  field.input().props.onChange({ target: { value: '9000' } })
+  field.input().props.onKeyDown({ key: 'Escape', preventDefault() {} })
+  assert.equal(scope.calls.length, 0)
+  assert.equal(field.input().props.value, '600')
+  assert.equal(field.alert(), undefined)
+})
+
+test('a rejected interval write is caught and shown without crashing', async () => {
+  const scope = fakeScope({ reject: 'settings changed since it was read', initial: { superviseIntervalSeconds: 600 } })
+  const field = mountField(scope)
+  field.input().props.onChange({ target: { value: '900' } })
+  await field.input().props.onBlur()
+  assert.equal(scope.calls.length, 1)
+  assert.equal(field.alert().kids[0], 'supervise.saveFailed')
+  assert.equal(field.input().props.value, '600')
+})
+
+test('the invalid-input hint disappears when its timer fires', async () => {
+  const scope = fakeScope()
+  const field = mountField(scope)
+  field.input().props.onChange({ target: { value: '9' } })
+  await field.input().props.onBlur()
+  assert.ok(field.alert())
+  const timer = timers[timers.length - 1]
+  timer.fn()
+  assert.equal(field.alert(), undefined)
+})
+
+
+test('the interval field follows a value changed elsewhere', () => {
+  const scope = fakeScope({ initial: { superviseIntervalSeconds: 600 } })
+  const field = mountField(scope)
+  scope.externalSet({ superviseIntervalSeconds: 1200 })
+  assert.equal(field.input().props.value, '1200')
+})
+
+test('apply leaves only the plan toggle in the composer, registers the smaller settings page, and keeps the secretary seats', () => {
   const regs = []
   const ctx = {
     effect: (fn) => fn(),
@@ -358,7 +500,8 @@ test('apply leaves only the plan toggle in the composer, drops the settings page
   assert.deepEqual(regs.map((r) => [r.opts.name, r.opts.id, r.opts.order]), [
     // The composer keeps one plugin control: the plan toggle.
     ['conversation.input.left', 'orchestrator-plan-toggle', 20],
-    // 票 15：宿主设置对话框里不再有这个插件的座位（旧「调度模式」设置页整块删除）。
+    // 票 15：设置页座位保留（内容只剩白名单 / 巡检 / 权限），标题走新键。
+    ['settings.section', 'orchestrator', 30],
     // The secretary view: one keyless-identity registration into the main seat, then the sidebar
     // row that selects it by the same id.
     ['main', undefined, undefined],
@@ -370,9 +513,18 @@ test('apply leaves only the plan toggle in the composer, drops the settings page
     regs.filter((r) => r.opts.id === 'secretary' || r.opts.key === 'secretary').map((r) => r.opts.name),
     ['main', 'sidebar.panellist'],
   )
-  // No settings seat and no old registration slot: this is what the operator checks on a real host.
-  assert.equal(regs.some((r) => r.opts.name === 'settings.section'), false)
-  assert.equal(regs.some((r) => r.opts.id === 'orchestrator'), false)
+  // The settings seat is back, but its page is the smaller one: new title key, one config scope.
+  const settings = regs.find((r) => r.opts.name === 'settings.section')
+  assert.equal(settings.opts.id, 'orchestrator')
+  assert.equal(settings.opts.order, 30)
+  assert.equal(settings.opts.locale, 'orchestrator')
+  assert.equal(settings.opts.label(), 'assistant.settings.title')
+  assert.equal(settings.comp, T.AssistantSettingsSection)
+  assert.deepEqual(Object.keys(settings.opts.inject()), ['orch'])
+  // The old dispatch-mode page is still gone: no enable switch, no routes, no Master picker in it.
+  for (const symbol of ['section.title', 'route.enable', 'SessionPicker', 'OrchestratorSettingsSection']) {
+    assert.equal(src.includes(symbol), false, symbol + ' must stay deleted')
+  }
   // The composer's plugin controls are down to the plan toggle.
   const composer = regs.filter((r) => String(r.opts.name).startsWith('conversation.input.'))
   assert.deepEqual(
@@ -391,6 +543,550 @@ test('apply leaves only the plan toggle in the composer, drops the settings page
     'layout',
     'uiWorkspace',
   ])
+})
+
+// ---- Allowed tools ------------------------------------------------------------------
+
+// The panel cannot ask the host for a tool catalog (the session remote has no such
+// method), so it re-declares the shipped whitelist. Reading the host constant out of the
+// source keeps the two copies honest without loading the host entry, whose packages
+// this test process does not install.
+const hostSource = fs.readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+const hostListSource = /export const DEFAULT_ALLOWED_TOOLS = \[([\s\S]*?)\]/.exec(hostSource)
+// Strip `//` comments first: an apostrophe inside a comment ("the agent's surface")
+// would otherwise pair with a real string quote and skew the extraction.
+const hostListBody = hostListSource[1].replace(/\/\/[^\n]*/g, '')
+const HOST_DEFAULT_ALLOWED_TOOLS = [...hostListBody.matchAll(/'([^']+)'/g)].map((match) => match[1])
+
+test('the bundled copy of the shipped whitelist matches the host constant', () => {
+  assert.deepEqual(plain(T.DEFAULT_ALLOWED_TOOLS), HOST_DEFAULT_ALLOWED_TOOLS)
+  assert.equal(HOST_DEFAULT_ALLOWED_TOOLS.length, 11)
+  // The whitelist names the planning and delegation tools only: no file, search, shell or
+  // web tool may appear here, or the main agent could work on the repo by itself.
+  for (const name of ['dispatch', 'send_message', 'interrupt_agent', 'todo_write', 'ask_user_question', 'compress']) {
+    assert.equal(HOST_DEFAULT_ALLOWED_TOOLS.includes(name), true, name)
+  }
+  for (const name of ['read', 'edit', 'write', 'bash', 'subagent', 'workflow', 'ralph', 'decompress', 'search_context']) {
+    assert.equal(HOST_DEFAULT_ALLOWED_TOOLS.includes(name), false, name)
+  }
+})
+
+test('the rows start with the shipped whitelist, every box checked', () => {
+  const shown = plain(T.toolListOf({}))
+  assert.deepEqual(shown, HOST_DEFAULT_ALLOWED_TOOLS)
+  // A host tool the whitelist omits is not a row until the host catalog names it.
+  for (const name of ['read', 'edit', 'bash', 'subagent', 'workflow']) {
+    assert.equal(shown.includes(name), false, name)
+  }
+  const withCatalog = plain(T.toolListOf({ toolCatalog: ['edit', 'read'] }))
+  for (const name of ['edit', 'read']) assert.equal(withCatalog.includes(name), true, name)
+})
+
+test('config and catalog names join the rows as extras, after the shipped order and sorted', () => {
+  const shown = plain(T.toolListOf({ allowedTools: ['zeta', 'alpha'], toolCatalog: ['read'] }))
+  assert.deepEqual(shown.slice(0, HOST_DEFAULT_ALLOWED_TOOLS.length), HOST_DEFAULT_ALLOWED_TOOLS)
+  assert.deepEqual(shown.slice(-3), ['alpha', 'read', 'zeta'])
+  assert.equal(new Set(shown).size, shown.length)
+  // A name a profile checked is offered like any other, whatever it is called.
+  assert.equal(plain(T.toolListOf({ allowedTools: ['custom_tool'] })).includes('custom_tool'), true)
+})
+
+test('the live catalog from the host joins the rows, deduped and sorted after the shipped list', () => {
+  const shown = plain(T.toolListOf({ toolCatalog: ['zeta', 'mcp__github__create_issue', 'edit', 'read'] }))
+  // A catalog name the whitelist does not know becomes one extra row, once only.
+  assert.equal(shown.filter((name) => name === 'edit').length, 1)
+  assert.equal(shown.filter((name) => name === 'dispatch').length, 1)
+  assert.deepEqual(shown.slice(-4), ['edit', 'mcp__github__create_issue', 'read', 'zeta'])
+  // A delegation tool the catalog names is a row like any other, once only.
+  assert.equal(plain(T.toolListOf({ toolCatalog: ['delegate'] })).filter((name) => name === 'delegate').length, 1)
+})
+
+test('a tool the shipped whitelist never heard of is a row and defaults to disabled', () => {
+  const catalog = { toolCatalog: ['mcp__demo__ping', 'ops_new'] }
+  const shown = plain(T.toolListOf(catalog))
+  assert.ok(shown.includes('mcp__demo__ping'))
+  assert.ok(shown.includes('ops_new'))
+  // Unchecked, i.e. not allowed: a tool another plugin adds is blocked until the user
+  // checks it, which is what makes the whitelist a default-deny rule for new tools too.
+  const allowed = T.allowedSetOf(catalog)
+  assert.equal(allowed.has('mcp__demo__ping'), false)
+  assert.equal(allowed.has('ops_new'), false)
+  // Once checked, the panel writes the name and the row reads checked.
+  const checked = T.allowedSetOf({ ...catalog, allowedTools: [...HOST_DEFAULT_ALLOWED_TOOLS, 'mcp__demo__ping'] })
+  assert.equal(checked.has('mcp__demo__ping'), true)
+})
+
+test('an absent or empty catalog keeps the shipped rows', () => {
+  const shipped = HOST_DEFAULT_ALLOWED_TOOLS
+  assert.deepEqual(plain(T.toolListOf({ toolCatalog: [] })), shipped)
+  assert.deepEqual(plain(T.toolListOf({ toolCatalog: 'not-a-list' })), shipped)
+  assert.deepEqual(plain(T.toolListOf({})), shipped)
+  assert.deepEqual(plain(T.catalogOf({})), [])
+  // Junk entries are dropped instead of rendering as empty rows.
+  assert.deepEqual(plain(T.catalogOf({ toolCatalog: ['b', '', 7, 'a'] })), ['b', 'a'])
+  assert.equal(T.CATALOG_KEY, 'toolCatalog')
+  assert.equal(T.ALLOW_KEY, 'allowedTools')
+})
+
+test('the default whitelist is the shipped eleven, and nothing else is checked', () => {
+  const shipped = T.allowedSetOf({})
+  assert.equal(shipped.size, HOST_DEFAULT_ALLOWED_TOOLS.length)
+  for (const name of HOST_DEFAULT_ALLOWED_TOOLS) assert.equal(shipped.has(name), true, name)
+  // A tool outside the shipped list starts unchecked: a new plugin tool is disabled.
+  assert.equal(shipped.has('read'), false)
+  assert.equal(shipped.has('mcp__demo__ping'), false)
+
+  // A catalog name is not an allowance: only the stored whitelist decides.
+  const withCatalog = T.allowedSetOf({ toolCatalog: ['read', 'mcp__demo__ping'] })
+  assert.equal(withCatalog.has('read'), false)
+  assert.equal(withCatalog.size, HOST_DEFAULT_ALLOWED_TOOLS.length)
+})
+
+test('an explicit whitelist replaces the default, the empty array included', () => {
+  const narrowed = T.allowedSetOf({ allowedTools: ['delegate', 'orchestrate'] })
+  assert.deepEqual([...narrowed].sort(), ['delegate', 'orchestrate'])
+  assert.equal(narrowed.has('compress'), false)
+
+  // Unchecking every box must disable every tool; falling back on the default here would
+  // silently re-arm the main agent.
+  assert.equal(T.allowedSetOf({ allowedTools: [] }).size, 0)
+
+  // Junk entries are dropped rather than becoming a checked row nobody can see.
+  assert.deepEqual([...T.allowedSetOf({ allowedTools: ['delegate', '', 7] })], ['delegate'])
+  assert.equal(T.allowedSetOf({ allowedTools: 'not-a-list' }).size, HOST_DEFAULT_ALLOWED_TOOLS.length)
+})
+
+test('checking exactly the shipped eleven stores nothing, so the default applies again', () => {
+  // The stored value is only the difference from the shipped whitelist: a full default set
+  // is written as `unset`, so a later default change still reaches an untouched profile.
+  assert.deepEqual(plain(T.allowOps(HOST_DEFAULT_ALLOWED_TOOLS)), [{ op: 'unset', path: ['allowedTools'] }])
+  // Order and duplicates do not matter: the same set is the same default.
+  assert.deepEqual(plain(T.allowOps([...HOST_DEFAULT_ALLOWED_TOOLS].reverse())), [
+    { op: 'unset', path: ['allowedTools'] },
+  ])
+  assert.deepEqual(plain(T.allowOps([...HOST_DEFAULT_ALLOWED_TOOLS, 'dispatch'])), [
+    { op: 'unset', path: ['allowedTools'] },
+  ])
+})
+
+test('a narrowed or widened whitelist is stored as one explicit list, deduped', () => {
+  const narrowed = HOST_DEFAULT_ALLOWED_TOOLS.filter((name) => name !== 'compress')
+  assert.deepEqual(plain(T.allowOps(narrowed)), [{ op: 'set', path: ['allowedTools'], value: narrowed }])
+
+  // An added name joins the same list: there is no second key any more.
+  assert.deepEqual(plain(T.allowOps([...HOST_DEFAULT_ALLOWED_TOOLS, 'read'])), [
+    { op: 'set', path: ['allowedTools'], value: [...HOST_DEFAULT_ALLOWED_TOOLS, 'read'] },
+  ])
+  // Duplicates collapse, and the click order is what gets stored.
+  assert.deepEqual(plain(T.allowOps(['read', 'read', 'delegate'])), [
+    { op: 'set', path: ['allowedTools'], value: ['read', 'delegate'] },
+  ])
+  // Unchecking every box stores the empty list, which means "allow nothing at all".
+  assert.deepEqual(plain(T.allowOps([])), [{ op: 'set', path: ['allowedTools'], value: [] }])
+})
+
+test('reset unsets the one key, so the shipped whitelist applies again', () => {
+  assert.deepEqual(plain(T.resetAllowOps()), [{ op: 'unset', path: ['allowedTools'] }])
+})
+
+test('the search matches a case-insensitive substring of the tool name', () => {
+  const names = ['edit', 'read', 'ops_bash', 'web_search']
+  assert.deepEqual(plain(T.filterTools(names, '')), names)
+  assert.deepEqual(plain(T.filterTools(names, '  ED ')), ['edit'])
+  assert.deepEqual(plain(T.filterTools(names, 'ops')), ['ops_bash'])
+  assert.deepEqual(plain(T.filterTools(names, 'SEARCH')), ['web_search'])
+  assert.deepEqual(plain(T.filterTools(names, 'zzz')), [])
+})
+
+/** Mount the switch and expose the nodes the tests reach for. */
+function mountSwitch(props) {
+  const view = mount(T.EnableSwitch, {
+    checked: false,
+    disabled: false,
+    onChange: () => {},
+    label: 'route.enable',
+    ...props,
+  })
+  const input = () => nodes(view.tree).find((node) => node.type === 'input')
+  const track = () => nodes(view.tree).find((node) => node.props?.['data-switch'] !== undefined)
+  return { view, input, track }
+}
+
+test('the switch is a role=switch checkbox with a real aria-checked state', () => {
+  const off = mountSwitch({})
+  assert.equal(off.input().props.type, 'checkbox')
+  assert.equal(off.input().props.role, 'switch')
+  assert.equal(off.input().props['aria-checked'], 'false')
+  assert.equal(off.input().props.checked, false)
+  assert.equal(off.input().props['aria-label'], 'route.enable')
+  assert.equal(off.track().props['data-switch'], 'off')
+
+  const on = mountSwitch({ checked: true })
+  assert.equal(on.input().props['aria-checked'], 'true')
+  assert.equal(on.track().props['data-switch'], 'on')
+  // The on-track colour is fixed so it reads the same in both themes.
+  assert.equal(on.track().props.style.background, '#C6FFD5')
+  // The knob slides rather than jumping, and is ringed so white stays visible on it.
+  const knob = on.track().kids[0]
+  assert.equal(knob.props.style.transform, 'translateX(16px)')
+  assert.match(knob.props.style.transition, /transform/)
+  assert.match(knob.props.style.boxShadow, /rgba\(0, 0, 0/)
+  const offKnob = off.track().kids[0]
+  assert.equal(offKnob.props.style.transform, 'translateX(0)')
+  assert.match(off.track().props.style.transition, /background-color/)
+})
+
+test('the switch is grey when off and green when on, from theme tokens', () => {
+  const off = mountSwitch({})
+  assert.match(off.track().props.style.background, /--dsw-alias-border-l3/)
+  const on = mountSwitch({ checked: true })
+  assert.equal(on.track().props.style.background, '#C6FFD5')
+  assert.equal(mountSwitch({ checked: true, disabled: true }).track().props.style.opacity, 0.5)
+})
+
+test('Enter toggles the switch, and a disabled switch ignores it', () => {
+  const seen = []
+  const off = mountSwitch({ onChange: (next) => seen.push(next) })
+  off.input().props.onKeyDown({ key: 'Enter', preventDefault() {} })
+  const on = mountSwitch({ checked: true, onChange: (next) => seen.push(next) })
+  on.input().props.onKeyDown({ key: 'Enter', preventDefault() {} })
+  assert.deepEqual(seen, [true, false])
+  off.input().props.onKeyDown({ key: 'a', preventDefault() {} })
+  assert.deepEqual(seen, [true, false])
+  const locked = mountSwitch({ disabled: true, onChange: (next) => seen.push(next) })
+  locked.input().props.onKeyDown({ key: 'Enter', preventDefault() {} })
+  assert.deepEqual(seen, [true, false])
+  // The native checkbox change path is untouched.
+  off.input().props.onChange({ target: { checked: true } })
+  assert.deepEqual(seen, [true, false, true])
+})
+
+test('the switch draws a focus ring only while focused', () => {
+  const sw = mountSwitch({})
+  assert.equal(sw.track().props.style.boxShadow, 'none')
+  sw.input().props.onFocus()
+  assert.match(sw.track().props.style.boxShadow, /0 0 0 2px/)
+  sw.input().props.onBlur()
+  assert.equal(sw.track().props.style.boxShadow, 'none')
+})
+
+/** Mount the allowed-tools column and expose the nodes the tests reach for. */
+function mountAllowed(scope) {
+  const view = mount(T.AllowedToolsPanel, { scope, t })
+  const rows = () => nodes(view.tree).filter((node) => node.type === 'label')
+  const search = () => nodes(view.tree).find((node) => node.props?.['data-search'] === 'allowed-tools')
+  const button = () => nodes(view.tree).find((node) => node.type === 'button')
+  const text = () => nodes(view.tree).map((node) => node.kids?.[0]).filter((kid) => typeof kid === 'string')
+  return { view, rows, search, button, text }
+}
+
+test('the column is headed Allowed Tools and lists one checked row per shipped tool', () => {
+  const panel = mountAllowed(fakeScope())
+  assert.equal(panel.text().includes('allowed.title'), true)
+  // The heading is literally "Allowed Tools" in the dictionary.
+  const title = /'allowed\.title': '([^']+)'/.exec(src)?.[1]
+  assert.equal(title, 'Allowed Tools')
+  // The column is addressable, so a host layout can find it without guessing a class.
+  assert.equal(panel.view.tree.props['data-panel'], 'allowed-tools')
+
+  const rows = panel.rows()
+  assert.equal(rows.length, HOST_DEFAULT_ALLOWED_TOOLS.length)
+  const first = rows[0]
+  assert.equal(first.kids[0].type, 'input')
+  assert.equal(first.kids[1].type, 'span')
+  assert.equal(first.kids[0].props.type, 'checkbox')
+  // A checked box means "allowed for the main agent": the shipped eleven start checked.
+  assert.equal(first.kids[0].props.checked, true)
+  assert.equal(first.kids[0].props.disabled, false)
+  assert.deepEqual(rows.map((row) => row.props['data-tool']), HOST_DEFAULT_ALLOWED_TOOLS)
+
+  // A host tool the whitelist does not cover is a row too, unchecked: a new plugin or MCP
+  // tool is disabled by default instead of silently joining the main agent's kit.
+  const withCatalog = mountAllowed(fakeScope({ initial: { toolCatalog: ['read', 'edit', 'mcp__demo__ping'] } }))
+  const extra = withCatalog.rows().filter((row) => ['read', 'edit', 'mcp__demo__ping'].includes(row.props['data-tool']))
+  assert.equal(extra.length, 3)
+  for (const row of extra) {
+    assert.equal(row.kids[0].type, 'input')
+    assert.equal(row.kids[0].props.disabled, false)
+    assert.equal(row.kids[0].props.checked, false, row.props['data-tool'])
+  }
+  // The search box sits above the list.
+  assert.equal(panel.search().props.type, 'search')
+})
+
+test('every row leads with the checkbox so a long name cannot scroll it out of the column', () => {
+  const panel = mountAllowed(
+    fakeScope({ initial: { toolCatalog: ['mcp__a_very_long_server__a_very_long_tool_name_that_will_not_fit'] } }),
+  )
+  const rows = panel.rows()
+  assert.ok(rows.length > 0)
+  // The list is one column pinned to the container, not an `auto` track that a long name
+  // would widen (and scroll) sideways.
+  const list = nodes(panel.view.tree).find((node) => node.props?.role === 'group')
+  assert.equal(list.props.style.display, 'grid')
+  assert.equal(list.props.style.gridTemplateColumns, 'minmax(0, 1fr)')
+  for (const row of rows) {
+    // Checkbox first, name second: the reading order follows the visual order, so the box
+    // stays inside the 232px column however long the name is.
+    assert.equal(row.kids[0].type, 'input', row.props['data-tool'])
+    assert.equal(row.kids[0].props.type, 'checkbox', row.props['data-tool'])
+    assert.equal(row.kids[1].type, 'span', row.props['data-tool'])
+    assert.equal(row.kids[1].kids[0], row.props['data-tool'])
+    // The row cannot be widened past the column by its content, so nothing scrolls sideways.
+    assert.equal(row.props.style.minWidth, 0)
+    // The box never shrinks; the name absorbs the remaining width and truncates.
+    assert.equal(row.kids[0].props.style.flex, 'none')
+    assert.equal(row.kids[1].props.style.flex, '1 1 auto')
+    assert.equal(row.kids[1].props.style.minWidth, 0)
+    assert.equal(row.kids[1].props.style.overflow, 'hidden')
+    assert.equal(row.kids[1].props.style.textOverflow, 'ellipsis')
+  }
+  // The long name keeps its full value in the tooltip instead of being cut in the markup.
+  const long = rows.find((row) => row.props['data-tool'].startsWith('mcp__a_very_long'))
+  assert.equal(long.kids[1].props.title, 'mcp__a_very_long_server__a_very_long_tool_name_that_will_not_fit')
+})
+
+test('the search narrows the rows case-insensitively and explains an empty result', () => {
+  const panel = mountAllowed(
+    fakeScope({ initial: { toolCatalog: ['read', 'edit', 'ops_read_files', 'read_image', 'acp_read_original_image'] } }),
+  )
+  panel.search().props.onChange({ target: { value: 'READ' } })
+  assert.deepEqual(
+    panel.rows().map((row) => row.props['data-tool']),
+    // `session_event_read` is a shipped row, so it comes first; the catalog extras follow sorted.
+    ['session_event_read', 'acp_read_original_image', 'ops_read_files', 'read', 'read_image'],
+  )
+  panel.search().props.onChange({ target: { value: 'zzz' } })
+  assert.deepEqual(panel.rows(), [])
+  assert.equal(panel.text().includes('allowed.empty'), true)
+})
+
+test('a tool published by another plugin is listed, searchable and unchecked', async () => {
+  const scope = fakeScope({ initial: { toolCatalog: ['mcp__demo__ping', 'ops_new_tool'] } })
+  const panel = mountAllowed(scope)
+  panel.search().props.onChange({ target: { value: 'DEMO' } })
+  const rows = panel.rows()
+  assert.deepEqual(rows.map((row) => row.props['data-tool']), ['mcp__demo__ping'])
+  assert.equal(rows[0].kids[0].props.type, 'checkbox')
+  assert.equal(rows[0].kids[0].props.checked, false, 'a new tool starts disabled')
+
+  // Checking it writes the name into the whitelist, on top of the shipped eleven.
+  await rows[0].kids[0].props.onChange({ target: { checked: true } })
+  assert.deepEqual(plain(scope.calls[0].ops), [
+    { op: 'set', path: ['allowedTools'], value: [...HOST_DEFAULT_ALLOWED_TOOLS, 'mcp__demo__ping'] },
+  ])
+})
+
+test('unchecking a shipped name drops it from the stored whitelist', async () => {
+  const scope = fakeScope()
+  const panel = mountAllowed(scope)
+  const row = () => panel.rows().find((entry) => entry.props['data-tool'] === 'dispatch')
+  assert.equal(row().kids[0].props.checked, true)
+  await row().kids[0].props.onChange({ target: { checked: false } })
+  assert.equal(scope.calls.length, 1)
+  assert.deepEqual(plain(scope.calls[0].ops), [
+    { op: 'set', path: ['allowedTools'], value: HOST_DEFAULT_ALLOWED_TOOLS.filter((name) => name !== 'dispatch') },
+  ])
+  assert.equal(scope.calls[0].expected, 1)
+  assert.equal(row().kids[0].props.checked, false)
+})
+
+test('checking the last unchecked name restores the default instead of storing a list', async () => {
+  // Re-checking everything must go back to `unset`, so the profile follows the shipped
+  // whitelist again rather than pinning today's copy of it.
+  const scope = fakeScope({ initial: { allowedTools: HOST_DEFAULT_ALLOWED_TOOLS.filter((name) => name !== 'compress') } })
+  const panel = mountAllowed(scope)
+  const row = panel.rows().find((entry) => entry.props['data-tool'] === 'compress')
+  assert.equal(row.kids[0].props.checked, false)
+  await row.kids[0].props.onChange({ target: { checked: true } })
+  assert.deepEqual(plain(scope.calls[0].ops), [{ op: 'unset', path: ['allowedTools'] }])
+  assert.equal(panel.rows().find((entry) => entry.props['data-tool'] === 'compress').kids[0].props.checked, true)
+})
+
+test('a name a profile checked but the catalog does not list is still a row', async () => {
+  const scope = fakeScope({ initial: { allowedTools: [...HOST_DEFAULT_ALLOWED_TOOLS, 'custom_tool'] } })
+  const panel = mountAllowed(scope)
+  const row = panel.rows().find((entry) => entry.props['data-tool'] === 'custom_tool')
+  assert.ok(row, 'a checked name is listed even without a catalog entry')
+  assert.equal(row.kids[0].props.checked, true)
+  await row.kids[0].props.onChange({ target: { checked: false } })
+  assert.deepEqual(plain(scope.calls[0].ops), [{ op: 'unset', path: ['allowedTools'] }])
+})
+
+test('reset unsets the whitelist so the shipped eleven apply again', async () => {
+  const scope = fakeScope({ initial: { allowedTools: ['delegate'] } })
+  const panel = mountAllowed(scope)
+  assert.equal(panel.button().kids[0], 'allowed.reset')
+  // Only one tool was allowed, so every other shipped row starts unchecked.
+  assert.equal(panel.rows().find((entry) => entry.props['data-tool'] === 'compress').kids[0].props.checked, false)
+  await panel.button().props.onClick()
+  assert.deepEqual(plain(scope.calls[0].ops), plain(T.resetAllowOps()))
+  assert.deepEqual(plain(T.resetAllowOps()), [{ op: 'unset', path: ['allowedTools'] }])
+  assert.equal(panel.rows().find((entry) => entry.props['data-tool'] === 'compress').kids[0].props.checked, true)
+})
+
+test('a read-only scope disables the boxes and never writes', async () => {
+  const scope = fakeScope({ writable: false })
+  const panel = mountAllowed(scope)
+  const box = panel.rows().find((row) => row.props['data-tool'] === 'dispatch').kids[0]
+  assert.equal(box.props.disabled, true)
+  assert.equal(panel.button().props.disabled, true)
+  await panel.button().props.onClick()
+  assert.equal(scope.calls.length, 0)
+})
+
+test('a rejected write is reported without dropping the stored state', async () => {
+  const scope = fakeScope({ reject: 'settings changed since it was read' })
+  const panel = mountAllowed(scope)
+  const row = () => panel.rows().find((entry) => entry.props['data-tool'] === 'dispatch')
+  await row().kids[0].props.onChange({ target: { checked: false } })
+  const alert = nodes(panel.view.tree).find((node) => node.props?.role === 'alert')
+  assert.match(alert.kids[0], /settings changed/)
+  assert.equal(row().kids[0].props.checked, true)
+})
+
+test('the composer popover is gone, and the whitelist stands alone as a settings card', () => {
+  // The two-column popover, its trigger and its component are gone from the bundle.
+  assert.equal(src.includes('orchestrator-route-picker'), false)
+  assert.equal(src.includes('function RoutePicker'), false)
+  assert.equal('RoutePicker' in T, false, '__test still exports RoutePicker')
+  // The allowed-tools panel survives as a full-width card: no fixed column, no divider, one box.
+  const panel = mountAllowed(fakeScope())
+  assert.equal(panel.view.tree.props.style.width, undefined)
+  assert.equal(panel.view.tree.props.style.borderRight, undefined)
+  assert.match(panel.view.tree.props.style.border, /^1px solid/)
+  assert.equal(panel.rows().length, HOST_DEFAULT_ALLOWED_TOOLS.length)
+})
+
+
+// ---- The model list inside a clipped popover ------------------------------------------
+
+test('catalogFor keeps the last non-empty catalog, because an empty read is a write in flight', () => {
+  assert.deepEqual(plain(T.catalogFor({ toolCatalog: ['a', 'b'] }, ['stale'])), ['a', 'b'])
+  // The Loader commits the profile's raw value on every settings write; for an unset key
+  // that is [], and a real catalog is never empty.
+  assert.deepEqual(plain(T.catalogFor({ toolCatalog: [] }, ['kept'])), ['kept'])
+  assert.deepEqual(plain(T.catalogFor({}, ['kept'])), ['kept'])
+  assert.deepEqual(plain(T.catalogFor({}, undefined)), [])
+  // A remembered catalog never leaks into toolListOf on its own.
+  assert.deepEqual(plain(T.toolListOf({ toolCatalog: [] }, ['mcp__demo__ping'])).slice(-1), ['mcp__demo__ping'])
+})
+
+test('a catalog that reads empty mid-write does not collapse the panel to the shipped rows', () => {
+  const scope = fakeScope({ initial: { toolCatalog: ['mcp__demo__ping', 'read'] } })
+  const panel = mountAllowed(scope)
+  const names = () => panel.rows().map((row) => row.props['data-tool'])
+  assert.ok(names().includes('mcp__demo__ping'))
+
+  // The host's own settings write empties the field for an instant; the rows must survive it.
+  scope.externalSet({ toolCatalog: [] })
+  assert.ok(names().includes('mcp__demo__ping'))
+  assert.ok(names().includes('dispatch'))
+
+  // A genuinely different catalog still replaces the remembered one.
+  scope.externalSet({ toolCatalog: ['ops_new'] })
+  assert.ok(names().includes('ops_new'))
+  assert.equal(names().includes('mcp__demo__ping'), false)
+})
+
+// ---- 最小设置页（票 15 恢复） ------------------------------------------------------------
+
+test('the smaller settings page keeps three zones: whitelist, supervision, read-only authority', async () => {
+  const scope = fakeScope({
+    initial: { superviseEnabled: false, superviseUnlimited: true, superviseNotifyOnNoProgress: false },
+  })
+  const view = mount(T.AssistantSettingsSection, { t, orch: scope })
+  const tree = view.tree
+  assert.match(textOf(tree), /assistant\.settings\.title/)
+  const zones = nodes(tree)
+    .map((node) => node.props?.['data-zone'])
+    .filter((zone) => typeof zone === 'string')
+  assert.deepEqual(zones, ['allowed', 'supervise', 'permissions'])
+  assert.ok(nodes(tree).some((node) => node.type === T.AllowedToolsPanel), 'the whitelist panel is rendered')
+  assert.ok(nodes(tree).some((node) => node.type === T.AuthorityPanel), 'the read-only authority panel is rendered')
+
+  // 间隔与「每次上限」是同一个组件、两个 setting：键不同，写入目标就不同。
+  const fields = nodes(tree).filter((node) => node.type === T.SuperviseIntervalField)
+  assert.equal(fields.length, 2)
+  assert.deepEqual(
+    fields.map((node) => (node.props.setting ?? T.INTERVAL).key),
+    ['superviseIntervalSeconds', 'superviseMaxNoticesPerChild'],
+    'same component, two config keys',
+  )
+
+  // 三个巡检开关：每个只写自己那个配置键，且显示的是存储值。
+  const switches = [
+    ['orchestrator-supervise-enabled', 'superviseEnabled', false],
+    ['orchestrator-supervise-unlimited', 'superviseUnlimited', true],
+    ['orchestrator-supervise-no-progress', 'superviseNotifyOnNoProgress', false],
+  ]
+  for (const [testid, key, checked] of switches) {
+    const row = byTestId(tree, testid)
+    assert.ok(row, testid + ' is rendered')
+    const sw = nodes(row).find((node) => node.type === T.EnableSwitch)
+    assert.ok(sw, testid + ' renders the switch')
+    assert.equal(sw.props.checked, checked, testid + ' shows the stored value')
+    sw.props.onChange(!checked)
+  }
+  await flush()
+  assert.deepEqual(
+    plain(scope.calls.map((call) => call.ops[0].path[0])),
+    switches.map((entry) => entry[1]),
+  )
+  assert.deepEqual(
+    plain(scope.calls.map((call) => call.ops[0].value)),
+    switches.map((entry) => !entry[2]),
+  )
+  view.unmount()
+})
+
+test('the max-notices field writes superviseMaxNoticesPerChild and rejects out-of-range input', async () => {
+  const scope = fakeScope({ initial: { superviseMaxNoticesPerChild: 5 } })
+  const field = mountMaxNoticesField(scope)
+  assert.equal(field.input().props.value, '5')
+  assert.equal(field.input().props['data-testid'], 'orchestrator-supervise-max')
+
+  field.input().props.onChange({ target: { value: '21' } })
+  await field.input().props.onBlur()
+  assert.equal(scope.calls.length, 0, 'out of range writes nothing')
+  assert.match(field.alert().kids[0], /supervise\.maxInvalid/)
+
+  field.input().props.onChange({ target: { value: '7' } })
+  await field.input().props.onBlur()
+  assert.deepEqual(plain(scope.calls[0].ops), [{ op: 'set', path: ['superviseMaxNoticesPerChild'], value: 7 }])
+  assert.equal(scope.calls[0].expected, 1)
+  field.view.unmount()
+})
+
+test('the permissions zone names the dispatch-command level and its four read-only scopes', () => {
+  // 级别的 id 镜像在客户端 bundle 里（不能 import 服务端模块）；服务端常量是真源，两边必须一致。
+  assert.equal(T.SECRETARY_AUTHORITY_LEVEL, DISPATCH_COMMAND)
+  assert.deepEqual(plain(T.SECRETARY_AUTHORITY_SCOPE_KEYS), [
+    'secretary.permissions.scopeNoWrite',
+    'secretary.permissions.scopeNoConfig',
+    'secretary.permissions.scopeNoSessionEdit',
+    'secretary.permissions.scopeRegisteredOnly',
+  ])
+
+  const inner = mount(T.AuthorityPanel, { t: (key) => T.zh[key] ?? key })
+  const text = textOf(inner.tree)
+  assert.match(text, /调度指挥/)
+  assert.match(text, /dispatch-command/)
+  assert.match(text, /Master 会话只读/)
+  const list = nodes(inner.tree).find((node) => node.props?.['data-list'] === 'secretary-authority-scope')
+  assert.ok(list, 'the scope list must be rendered')
+  const scopeLines = nodes(list)
+    .filter((node) => node.type === 'li')
+    .map((node) => node.kids[0])
+  assert.deepEqual(scopeLines, [
+    T.zh['secretary.permissions.scopeNoWrite'],
+    T.zh['secretary.permissions.scopeNoConfig'],
+    T.zh['secretary.permissions.scopeNoSessionEdit'],
+    T.zh['secretary.permissions.scopeRegisteredOnly'],
+  ])
+  // 只读：没有输入、没有选择、没有按钮。
+  assert.equal(nodes(inner.tree).some((node) => ['input', 'select', 'button'].includes(node.type)), false)
+  inner.unmount()
 })
 
 test('filterGroups matches provider names wholesale and model ids or names otherwise', () => {
