@@ -6,6 +6,7 @@ import { z } from 'zod'
 import { WORKER_STATE } from '../lib/master-state.js'
 import { NOTIFY_SWITCHES } from '../lib/secretary-constants.js'
 import { DISPATCH_COMMAND } from '../lib/secretary-authority.js'
+import * as panelSurface from '../lib/panel-surface.js'
 
 const src = fs.readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
 
@@ -3358,4 +3359,439 @@ test('the settings tab links to the hosted design in a new tab', async () => {
   // mountSecretarySettings uses the identity translator, so the shown text is the key it uses.
   assert.equal(textOf(link).trim(), 'secretary.design')
   view.unmount()
+})
+
+// ---- 右栏面板（票 12：dock 接线） --------------------------------------------------------
+
+/**
+ * 端点一次交出的两半：模型（三个常驻入口 + master 指向 + worker 列表）与点击动作表。
+ * `plain()` 比较的是 JSON，所以这里只用可序列化的值。
+ */
+const PANEL_MODEL = () => ({
+  fixed: [
+    { id: 'master', title: 'master' },
+    { id: 'inspector', title: 'inspector' },
+    { id: 'reporter', title: 'reporter' },
+  ],
+  master: { sessionId: 'master-session' },
+  workers: [
+    { sessionId: 'w-1', presetId: 'worker-a', category: 'code', status: 'running', startedAt: 10, retries: 0 },
+    { sessionId: 'w-2', presetId: 'worker-b', category: 'review', status: 'reserved', startedAt: 20, retries: 2 },
+  ],
+})
+
+const PANEL_ACTIONS = () => ({
+  fixed: [
+    { id: 'master', action: { kind: 'open-session', sessionId: 'master-session' } },
+    { id: 'inspector', action: { kind: 'show-section', section: 'inspector' } },
+    { id: 'reporter', action: { kind: 'show-section', section: 'reporter' } },
+  ],
+  workers: [
+    { sessionId: 'w-1', action: { kind: 'open-worker', sessionId: 'w-1' } },
+    { sessionId: 'w-2', action: { kind: 'open-worker', sessionId: 'w-2', address: 'ignored' } },
+  ],
+})
+
+const panelPayload = () => ({ model: PANEL_MODEL(), actions: PANEL_ACTIONS() })
+
+/** 一个只认 panel 端点、只经 ctx.remote.$mount 暴露的宿主。 */
+function fakePanelCtx({ value = panelPayload(), result, failFirstMount = false } = {}) {
+  const mounts = []
+  const ctx = {
+    mounts,
+    get(name) {
+      if (name === 'remote.orchestratorPanel') return ctx.namespace
+      return undefined
+    },
+    remote: {
+      $mount(contribution) {
+        mounts.push(contribution)
+        if (failFirstMount === true && mounts.length === 1) {
+          return Promise.reject(new Error('the host is not ready yet'))
+        }
+        ctx.namespace = { panelState: async () => (result === undefined ? { ok: true, value } : result) }
+        return Promise.resolve(() => {})
+      },
+    },
+  }
+  return ctx
+}
+
+test('loadPanelState resolves the payload through one mount', async () => {
+  const { loadPanelState, PANEL_CONTRIBUTION, PANEL_TAB_ID, PANEL_TAB_KIND } = T
+  const ctx = fakePanelCtx()
+  assert.deepEqual(plain(await loadPanelState(ctx)), plain(panelPayload()))
+  assert.deepEqual(plain(await loadPanelState(ctx)), plain(panelPayload()))
+  assert.equal(ctx.mounts.length, 1, 'one mount serves every read')
+  assert.equal(ctx.mounts[0].package, 'dsh-engineer-assistants-panel')
+  assert.equal(ctx.mounts[0].descriptors.length, 1)
+  assert.equal(ctx.mounts[0].descriptors[0].id, 'dsh-engineer-assistants-panel#orchestratorPanel/panelState')
+  assert.equal(ctx.mounts[0].descriptors[0].service, 'orchestratorPanel')
+  assert.equal(ctx.mounts[0].descriptors[0].namespace, 'orchestratorPanel')
+  assert.equal(ctx.mounts[0].descriptors[0].method, 'panelState')
+  assert.deepEqual(plain(ctx.mounts[0].descriptors[0].parameters), [])
+  assert.deepEqual(plain(ctx.mounts[0].descriptors[0].result), { mode: 'src-json' })
+  assert.equal(PANEL_CONTRIBUTION.descriptors[0].id, 'dsh-engineer-assistants-panel#orchestratorPanel/panelState')
+  assert.equal(PANEL_TAB_KIND, 'engineer-assistants-panel')
+  assert.equal(PANEL_TAB_ID, 'dsh-engineer-assistants-panel')
+})
+
+test('an unavailable panel namespace and a failed result both reject with the host message', async () => {
+  const { loadPanelState } = T
+  const unavailable = { mounts: [], remote: { $mount: async () => {} }, get: () => undefined }
+  await assert.rejects(loadPanelState(unavailable), /orchestratorPanel\/panelState is unavailable/)
+  const failed = fakePanelCtx({ result: { ok: false, error: { message: 'assignments are not wired' } } })
+  await assert.rejects(loadPanelState(failed), /assignments are not wired/)
+})
+
+const PANEL_ADDRESS = () => ({ parentSessionId: 'parent-1', childSessionId: 'child-1', mode: 'continuable' })
+
+test('panelOpenStepsOf resolves the address and keeps the bare id as the fallback', () => {
+  const { panelOpenStepsOf, panelChatAddressOf } = T
+  const steps = panelOpenStepsOf('child-1', () => PANEL_ADDRESS())
+  assert.deepEqual(plain(steps.resource), {
+    address: 'dsh-resource://subagentchat/session/child-1?parent=parent-1&mode=continuable',
+    kind: 'subagentchat',
+    preferNewPane: true,
+  })
+  // 解析出地址时退路递的是地址不是裸 id：宿主的 SessionTarget 是 SessionId | SubagentAddress。
+  assert.deepEqual(plain(steps.session), PANEL_ADDRESS())
+  // 客户端与服务端各自拼一次地址，差一个字符宿主就认不出来，所以逐字比。
+  assert.equal(steps.resource.address, panelSurface.workerChatAddressOf({ address: PANEL_ADDRESS() }))
+  // 空白与不常见的值也必须逐字一致：URLSearchParams 编的是 form-urlencoded，不是 encodeURIComponent。
+  const odd = { parentSessionId: 'p 1', childSessionId: 'child/1 a', mode: 'unknown' }
+  assert.equal(
+    panelOpenStepsOf('child/1 a', () => odd).resource.address,
+    panelSurface.workerChatAddressOf({ address: odd }),
+  )
+  assert.equal(panelChatAddressOf(odd), panelSurface.workerChatAddressOf({ address: odd }))
+})
+
+test('panelOpenStepsOf treats nothing, junk and a throw as "no address"', () => {
+  const { panelOpenStepsOf } = T
+  for (const resolver of [
+    () => undefined,
+    () => null,
+    () => ({}),
+    () => ({ parentSessionId: 'p', childSessionId: 'c' }),
+    () => ({ parentSessionId: 'p', childSessionId: '   ', mode: 'continuable' }),
+    () => {
+      throw new Error('the sessions domain is gone')
+    },
+  ]) {
+    const bare = panelOpenStepsOf('child-1', resolver)
+    assert.equal(bare.resource, undefined)
+    assert.equal(bare.session, 'child-1')
+  }
+  // mode 不在宿主认的三种里：右栏开不了，但地址仍能当主栏目标。
+  const unknownMode = panelOpenStepsOf('child-1', () => ({ parentSessionId: 'p', childSessionId: 'c', mode: 'once' }))
+  assert.equal(unknownMode.resource, undefined)
+  assert.equal(unknownMode.session.childSessionId, 'c')
+  assert.equal(panelOpenStepsOf('   ', () => PANEL_ADDRESS()), undefined)
+  assert.equal(panelOpenStepsOf(undefined, () => PANEL_ADDRESS()), undefined)
+})
+
+test('the click runner tries the dock first, falls back to the main column, and never throws', () => {
+  const { panelOpenStepsOf, runPanelSteps } = T
+  const steps = panelOpenStepsOf('child-1', () => PANEL_ADDRESS())
+  const sessions = []
+
+  // 右栏抛（没挂载 / 没有类型认领）：仍然要把地址交给主栏。
+  const dockThrows = {
+    get(name) {
+      if (name === 'sidebarRight') return { openResource: () => { throw new Error('no registered tab type claims it') } }
+      if (name === 'uiWorkspace') return { openSession: (target) => sessions.push(plain(target)) }
+      return undefined
+    },
+  }
+  assert.deepEqual(plain(runPanelSteps(dockThrows, steps)), { resource: false, session: true })
+  assert.deepEqual(sessions[0], PANEL_ADDRESS())
+
+  // 右栏开成：主栏一次都不碰。
+  const dockCalls = []
+  const dockOpens = {
+    get(name) {
+      if (name === 'sidebarRight') return { openResource: (address, options) => dockCalls.push([address, plain(options)]) }
+      if (name === 'uiWorkspace') return { openSession: () => sessions.push('should not happen') }
+      return undefined
+    },
+  }
+  assert.deepEqual(plain(runPanelSteps(dockOpens, steps)), { resource: true, session: false })
+  assert.equal(sessions.length, 1)
+  assert.equal(dockCalls[0][0], steps.resource.address)
+  assert.deepEqual(dockCalls[0][1], { kind: 'subagentchat', preferNewPane: true })
+
+  // 两个服务都没有：报告什么也没开成，不抛。
+  assert.deepEqual(plain(runPanelSteps({ get: () => undefined }, steps)), { resource: false, session: false })
+  assert.deepEqual(plain(runPanelSteps(undefined, steps)), { resource: false, session: false })
+  assert.deepEqual(plain(runPanelSteps({ get: () => undefined }, undefined)), { resource: false, session: false })
+})
+
+test('openPanelAction dispatches by kind and marks designate-master instead of inventing navigation', () => {
+  const { openPanelAction } = T
+  const opened = []
+  const ctx = {
+    get(name) {
+      if (name === 'uiWorkspace') return { openSession: (id) => opened.push(id) }
+      return undefined
+    },
+  }
+  assert.deepEqual(plain(openPanelAction(ctx, { kind: 'open-session', sessionId: 'master-session' })), { landed: 'session' })
+  assert.deepEqual(opened, ['master-session'])
+  assert.deepEqual(plain(openPanelAction(ctx, { kind: 'designate-master' })), { landed: 'settings' })
+  assert.deepEqual(plain(openPanelAction(ctx, { kind: 'show-section', section: 'inspector' })), { landed: 'none' })
+  assert.deepEqual(plain(openPanelAction({ get: () => undefined }, { kind: 'open-session', sessionId: 'x' })), { landed: 'none' })
+  assert.deepEqual(plain(openPanelAction(ctx, undefined)), { landed: 'none' })
+  assert.equal(opened.length, 1, 'a marker or a no-op never opens anything')
+})
+
+/** 挂一次正文；`t` 是恒等翻译，断言的文本就是字典键本身。 */
+function mountPanelBody({ value = panelPayload(), loadState, openAction } = {}) {
+  return mount(T.OrchestratorPanelBody, {
+    t,
+    loadState: loadState ?? (async () => value),
+    addressOf: () => undefined,
+    openAction: openAction ?? (() => ({ landed: 'none' })),
+  })
+}
+
+/** 正文里的行，按渲染顺序。 */
+function panelRowIds(tree) {
+  return nodes(tree)
+    .map((node) => String(node.props?.['data-testid'] ?? ''))
+    .filter((id) => /^orchestrator-panel-(fixed|worker)-/.test(id))
+}
+
+test('the panel body lists the three fixed entries, then the workers in model order', async () => {
+  const view = mountPanelBody()
+  await flush(14)
+  assert.equal(byTestId(view.tree, 'orchestrator-panel-loading'), undefined)
+  assert.deepEqual(panelRowIds(view.tree), [
+    'orchestrator-panel-fixed-master',
+    'orchestrator-panel-fixed-inspector',
+    'orchestrator-panel-fixed-reporter',
+    'orchestrator-panel-worker-w-1',
+    'orchestrator-panel-worker-w-2',
+  ])
+  // master 行写它指向的会话 id；两个 worker 写 presetId / 状态 / 重试次数。
+  const master = byTestId(view.tree, 'orchestrator-panel-fixed-master')
+  assert.match(textOf(master), /master-session/)
+  const first = textOf(byTestId(view.tree, 'orchestrator-panel-worker-w-1'))
+  assert.match(first, /worker-a/)
+  assert.match(first, /running/)
+  assert.equal(byTestId(view.tree, 'orchestrator-panel-retries-w-1'), undefined, 'zero retries stay quiet')
+  const second = textOf(byTestId(view.tree, 'orchestrator-panel-worker-w-2'))
+  assert.match(second, /worker-b/)
+  assert.match(second, /reserved/)
+  assert.match(textOf(byTestId(view.tree, 'orchestrator-panel-retries-w-2')), /2/)
+  assert.equal(byTestId(view.tree, 'orchestrator-panel-empty'), undefined)
+  view.unmount()
+})
+
+test('the two section rows are text, not buttons that do nothing', async () => {
+  // inspector / reporter 指向 show-section：分段视图还没做，画成按钮就是「点了没反应」。
+  // master 有权动作，仍然是按钮。
+  const view = mountPanelBody()
+  await flush(14)
+  const master = byTestId(view.tree, 'orchestrator-panel-fixed-master')
+  const inspector = byTestId(view.tree, 'orchestrator-panel-fixed-inspector')
+  const reporter = byTestId(view.tree, 'orchestrator-panel-fixed-reporter')
+  assert.equal(master.type, 'button')
+  assert.equal(typeof master.props.onClick, 'function')
+  for (const [name, row] of [['inspector', inspector], ['reporter', reporter]]) {
+    assert.notEqual(row.type, 'button', name + ' must not pretend to be clickable')
+    assert.equal(row.props.onClick, undefined)
+    assert.equal(row.props['data-interactive'], 'false')
+  }
+  view.unmount()
+})
+
+test('an undesignated master and an empty worker list both say so', async () => {
+  const view = mountPanelBody({
+    value: {
+      model: { fixed: PANEL_MODEL().fixed, master: { sessionId: null }, workers: [] },
+      actions: { fixed: PANEL_ACTIONS().fixed, workers: [] },
+    },
+  })
+  await flush(14)
+  assert.match(textOf(byTestId(view.tree, 'orchestrator-panel-fixed-master')), new RegExp('dock\\.master\\.none'))
+  const empty = byTestId(view.tree, 'orchestrator-panel-empty')
+  assert.ok(empty, 'no workers is one explicit line, not a blank list')
+  assert.equal(textOf(empty).trim(), 'dock.empty')
+  assert.deepEqual(panelRowIds(view.tree), [
+    'orchestrator-panel-fixed-master',
+    'orchestrator-panel-fixed-inspector',
+    'orchestrator-panel-fixed-reporter',
+  ])
+  view.unmount()
+})
+
+test('a failed panel read is a visible alert that the retry button re-reads', async () => {
+  let calls = 0
+  const view = mountPanelBody({
+    loadState: async () => {
+      calls += 1
+      if (calls === 1) throw new Error('assignments are not wired')
+      return panelPayload()
+    },
+  })
+  await flush(14)
+  const alert = byTestId(view.tree, 'orchestrator-panel-error')
+  assert.ok(alert, 'a failed read is never a blank frame')
+  assert.equal(alert.props.role, 'alert')
+  assert.match(textOf(alert), /assignments are not wired/)
+  assert.equal(calls, 1)
+  byTestId(view.tree, 'orchestrator-panel-retry').props.onClick()
+  await flush(14)
+  assert.equal(calls, 2, 'the retry really re-reads')
+  assert.equal(byTestId(view.tree, 'orchestrator-panel-error'), undefined)
+  assert.ok(byTestId(view.tree, 'orchestrator-panel-fixed-master'))
+  view.unmount()
+})
+
+test('clicking a worker row hands the action to the runner, and designate-master shows the settings hint', async () => {
+  const seen = []
+  const view = mountPanelBody({
+    value: {
+      model: PANEL_MODEL(),
+      actions: {
+        fixed: [{ id: 'master', action: { kind: 'designate-master' } }, ...PANEL_ACTIONS().fixed.slice(1)],
+        workers: PANEL_ACTIONS().workers,
+      },
+    },
+    openAction: (action) => {
+      seen.push(plain(action))
+      return { landed: action.kind === 'designate-master' ? 'settings' : 'resource' }
+    },
+  })
+  await flush(14)
+  byTestId(view.tree, 'orchestrator-panel-worker-w-2').props.onClick()
+  assert.deepEqual(seen[0], { kind: 'open-worker', sessionId: 'w-2', address: 'ignored' })
+  assert.equal(byTestId(view.tree, 'orchestrator-panel-settings-hint'), undefined)
+  byTestId(view.tree, 'orchestrator-panel-fixed-master').props.onClick()
+  assert.deepEqual(seen[1], { kind: 'designate-master' })
+  assert.ok(byTestId(view.tree, 'orchestrator-panel-settings-hint'), 'the marker is rendered as a hint')
+  view.unmount()
+})
+
+test('the tab chip title and both dictionaries answer for the dock', () => {
+  const view = mount(T.OrchestratorPanelTitle, { t })
+  assert.equal(textOf(view.tree).trim(), 'dock.title')
+  for (const key of Object.keys(T.zh).filter((entry) => entry.startsWith('dock.'))) {
+    assert.equal(typeof T.en[key], 'string', 'the English table carries ' + key)
+    assert.ok(T.en[key].length > 0, key)
+    assert.ok(T.zh[key].length > 0, key)
+  }
+  assert.ok(Object.keys(T.zh).filter((entry) => entry.startsWith('dock.')).length >= 10)
+})
+/** apply 的最小宿主：只有右栏三个服务按开关提供，其余按秘书接线需要的最少形状。 */
+function fakeApplyCtx({ dock = false, registerThrows = false } = {}) {
+  const slotNames = []
+  const slots = []
+  const types = []
+  const openTabCalls = []
+  const ctx = {
+    effect: (fn) => {
+      const disposer = fn()
+      return () => {
+        if (typeof disposer === 'function') disposer()
+      }
+    },
+    locale: { register: () => () => {}, bind: () => (key) => key },
+    slots: {
+      inject: (name, build) => {
+        const disposer = build()
+        return typeof disposer === 'function' ? disposer : () => {}
+      },
+      register: (spec) => {
+        slotNames.push(spec.name)
+        slots.push(spec)
+        return () => {}
+      },
+    },
+    configForms: {
+      get: () => ({
+        getSnapshot: () => ({ status: 'ready', writable: true, revision: 1, value: {} }),
+        subscribe: () => () => {},
+        mutate: async () => {},
+      }),
+    },
+    remote: {},
+    get(name) {
+      if (dock !== true) return undefined
+      if (name === 'sidebarRightTabs') {
+        return {
+          register: (definition) => {
+            if (registerThrows) throw new Error('sidebarRight: tab id "dsh-engineer-assistants-panel" is already registered')
+            types.push(definition)
+            return () => {}
+          },
+        }
+      }
+      if (name === 'sidebarRight') {
+        return {
+          openResource: () => {},
+          openTab: (...args) => {
+            openTabCalls.push(args)
+          },
+        }
+      }
+      if (name === 'uiWorkspace') return { openSession: () => {} }
+      return undefined
+    },
+  }
+  return { ctx, slotNames, slots, types, openTabCalls }
+}
+
+test('apply wires the dock only when the host provides it, and loads without it', () => {
+  // 老宿主：三个服务一个都没有，apply 不许抛，也不许留下半个注册。
+  const absent = fakeApplyCtx()
+  assert.doesNotThrow(() => mod.apply(absent.ctx))
+  assert.equal(absent.types.length, 0)
+  assert.deepEqual(absent.slotNames.filter((name) => name.startsWith('sidebar.right.')), [])
+
+  const present = fakeApplyCtx({ dock: true })
+  assert.doesNotThrow(() => mod.apply(present.ctx))
+  assert.equal(present.types.length, 1)
+  assert.equal(present.types[0].id, 'dsh-engineer-assistants-panel')
+  assert.equal(present.types[0].kind, 'engineer-assistants-panel')
+  assert.equal(present.types[0].priority, 'extension')
+  assert.equal(present.types[0].patterns, undefined, 'a page type recognizes no address')
+  assert.equal(present.types[0].title(), 'dock.title', 'the chip reads the dictionary through the bound translator')
+  assert.deepEqual(plain(present.types[0].guide.map((entry) => entry.id)), ['panel'])
+  // 槽按定义 id 认领，不按 kind；三个都在，而且 key 就是那个 id——宿主按 entryKey 找 body，
+  // key 写错只会掉进「这个类型没有实现」的兜底，静默不报错。
+  assert.deepEqual(present.slotNames.filter((name) => name.startsWith('sidebar.right.')), [
+    'sidebar.right.tab.guide.entry',
+    'sidebar.right.pane.tab',
+    'sidebar.right.pane.tab.title',
+  ])
+  for (const spec of present.slots.filter((slot) => slot.name.startsWith('sidebar.right.'))) {
+    assert.equal(spec.key, present.types[0].id, spec.name + ' is keyed by the definition id, not the kind')
+  }
+
+  // 引导入口与宿主自己的入口同一种开法：replaceTab 不给的话引导页会留在面板旁边。
+  const guide = present.slots.find((slot) => slot.name === 'sidebar.right.tab.guide.entry')
+  guide.inject().open()
+  // 值来自 vm 上下文，原型不同，按 JSON 比。
+  assert.deepEqual(plain(present.openTabCalls), [['engineer-assistants-panel', { replaceTab: true }]])
+})
+
+test('a second registration of the same type does not take the whole boot down', () => {
+  // 同一档位重复注册时宿主会抛。让它冒出 apply 就是 web boot 失败——而这个类型已经在那里了，
+  // 效果一样，所以吞掉、留日志、继续。
+  const present = fakeApplyCtx({ dock: true, registerThrows: true })
+  assert.doesNotThrow(() => mod.apply(present.ctx))
+  assert.equal(present.types.length, 0)
+  // 类型没注册上，槽仍然注册：宿主找不到 body 时会画兜底，不会因为缺槽崩掉整页。
+  assert.equal(present.slots.filter((slot) => slot.name === 'sidebar.right.pane.tab').length, 1)
+})
+
+test('the panel still registers when only the tab registry exists', () => {
+  // 注册一个类型只要注册表与插槽；右栏/主栏是点击时才需要的东西。
+  const onlyTabs = fakeApplyCtx({ dock: true })
+  const get = onlyTabs.ctx.get
+  onlyTabs.ctx.get = (name) => (name === 'sidebarRight' || name === 'uiWorkspace' ? undefined : get(name))
+  assert.doesNotThrow(() => mod.apply(onlyTabs.ctx))
+  assert.equal(onlyTabs.types.length, 1, 'the type is registered even without the dock services')
 })
