@@ -3053,21 +3053,75 @@ test('the row shows the preset category, and says so when no preset was applied'
   view.unmount()
 })
 
-test('the two section rows are text, not buttons that do nothing', async () => {
-  // inspector / reporter 指向 show-section：分段视图还没做，画成按钮就是「点了没反应」。
-  // master 有权动作，仍然是按钮。
+const SAMPLE_REPORT = {
+  seq: 2,
+  at: 1700000000000,
+  stamp: '2026-11-08 15:30',
+  text: '# 汇报',
+  oneLine: false,
+  items: [
+    { key: 'running', label: '在跑', text: '1 个在跑' },
+    { key: 'stuck', label: '卡住 / 等批准', text: '无' },
+    { key: 'finished', label: '刚完成的产出与验证', text: '无' },
+    { key: 'cost', label: '花费', text: '未提供' },
+    { key: 'next', label: '建议下一步', text: '还有 1 个 worker 在跑' },
+  ],
+}
+
+test('the two section rows open their own panel from the same payload', async () => {
+  // 票 23：监工与汇报是真按钮，点开是这一次载荷里的事实，不另开查询。
+  const opened = []
+  const view = mountPanelBody({
+    value: {
+      model: PANEL_MODEL(),
+      actions: PANEL_ACTIONS(),
+      attention: { 'w-1': ['idle', 'retrying'] },
+      report: SAMPLE_REPORT,
+    },
+    openAction: (action) => {
+      opened.push(plain(action))
+      return { landed: 'none' }
+    },
+  })
+  await flush(14)
+  const inspector = () => byTestId(view.tree, 'orchestrator-panel-fixed-inspector')
+  const reporter = () => byTestId(view.tree, 'orchestrator-panel-fixed-reporter')
+  assert.equal(inspector().type, 'button')
+  assert.equal(inspector().props['aria-expanded'], false)
+  inspector().props.onClick()
+  await flush(14)
+  assert.equal(inspector().props['aria-expanded'], true)
+  assert.ok(byTestId(view.tree, 'orchestrator-panel-inspector-row-w-1'), 'the stuck worker is named')
+  assert.match(textOf(byTestId(view.tree, 'orchestrator-panel-inspector-row-w-1')), /idle/)
+  assert.match(textOf(byTestId(view.tree, 'orchestrator-panel-inspector-row-w-1')), /retrying/)
+  assert.deepEqual(opened, [], 'a section never navigates')
+  reporter().props.onClick()
+  await flush(14)
+  assert.equal(byTestId(view.tree, 'orchestrator-panel-inspector'), undefined, 'opening one closes the other')
+  assert.equal(textOf(byTestId(view.tree, 'orchestrator-panel-reporter-stamp')).trim(), SAMPLE_REPORT.stamp)
+  for (const key of ['running', 'stuck', 'finished', 'cost', 'next']) {
+    assert.ok(byTestId(view.tree, 'orchestrator-panel-report-item-' + key), key)
+  }
+  // 再点一次收起来。
+  reporter().props.onClick()
+  await flush(14)
+  assert.equal(byTestId(view.tree, 'orchestrator-panel-reporter'), undefined)
+  view.unmount()
+})
+
+test('a section with nothing to show says so instead of leaving a blank', async () => {
   const view = mountPanelBody()
   await flush(14)
-  const master = byTestId(view.tree, 'orchestrator-panel-fixed-master')
-  const inspector = byTestId(view.tree, 'orchestrator-panel-fixed-inspector')
-  const reporter = byTestId(view.tree, 'orchestrator-panel-fixed-reporter')
-  assert.equal(master.type, 'button')
-  assert.equal(typeof master.props.onClick, 'function')
-  for (const [name, row] of [['inspector', inspector], ['reporter', reporter]]) {
-    assert.notEqual(row.type, 'button', name + ' must not pretend to be clickable')
-    assert.equal(row.props.onClick, undefined)
-    assert.equal(row.props['data-interactive'], 'false')
-  }
+  byTestId(view.tree, 'orchestrator-panel-fixed-inspector').props.onClick()
+  await flush(14)
+  const inspectorEmpty = byTestId(view.tree, 'orchestrator-panel-inspector-empty')
+  assert.ok(inspectorEmpty, 'no stuck worker is one explicit line')
+  assert.equal(textOf(inspectorEmpty).trim(), 'dock.inspector.empty')
+  byTestId(view.tree, 'orchestrator-panel-fixed-reporter').props.onClick()
+  await flush(14)
+  const reporterEmpty = byTestId(view.tree, 'orchestrator-panel-reporter-empty')
+  assert.ok(reporterEmpty, 'no report is one explicit line')
+  assert.equal(textOf(reporterEmpty).trim(), 'dock.reporter.empty')
   view.unmount()
 })
 
