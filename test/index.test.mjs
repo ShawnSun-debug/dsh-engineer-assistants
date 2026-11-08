@@ -1286,6 +1286,42 @@ test('the master panel endpoint is provided and folds live sessions behind its s
   assert.deepEqual(off.workers, [])
 })
 
+test('the dock endpoint answers with the three fixed entries and an honest empty worker list', async () => {
+  // 客户端现在会真的调它：端点不提供，那个页签每次都只会是报错。登记表今天没有写入方，
+  // 所以正确答案就是「三个常驻入口、零个 worker」，不是错误、也不是占位数据。
+  const harness = start()
+  harness.config.secretaryMasterSessionId = { get: () => '' }
+  const service = harness.services.get('orchestratorPanel')
+  assert.ok(service, 'the dock endpoint is provided')
+  assert.equal(typeof service.panelState, 'function')
+
+  const payload = await service.panelState()
+  assert.deepEqual(payload.model.fixed.map((row) => row.id), ['master', 'inspector', 'reporter'])
+  assert.deepEqual(payload.model.workers, [])
+  assert.equal(payload.model.master.sessionId, null)
+  assert.deepEqual(payload.actions.workers, [])
+  assert.equal(payload.actions.fixed.find((row) => row.id === 'master').action.kind, 'designate-master')
+})
+
+test('the dock endpoint reports the effective master, including a generated resident one', async () => {
+  // 指定了就报指定的那个，且 master 行变成可打开。
+  const harness = start()
+  const service = harness.services.get('orchestratorPanel')
+  const picked = await service.panelState()
+  assert.equal(picked.model.master.sessionId, 'master-1')
+  assert.equal(picked.actions.fixed.find((row) => row.id === 'master').action.kind, 'open-session')
+
+  // masterSessionEnabled 打开时插件直接用固定 id，且不回写设置：端点必须报生效的那个 id，
+  // 不是配置里的空串——否则活着的常驻 master 会被画成「未指定」。
+  harness.config.secretaryMasterSessionId = { get: () => '' }
+  harness.config.masterSessionEnabled = { get: () => true }
+  assert.equal((await service.panelState()).model.master.sessionId, 'orchestrator-master')
+
+  // 两个都没有：如实报未指定。
+  harness.config.masterSessionEnabled = { get: () => false }
+  assert.equal((await service.panelState()).model.master.sessionId, null)
+})
+
 test('a host without a usable storage domain degrades explicitly and injects nothing', async () => {
   const missing = start({ memoryEnabled: true })
   await settle()
@@ -1683,9 +1719,9 @@ test('an untracked session writes nothing, and registering it takes effect on th
 // ---- Secretary view endpoint (secretary spec, ticket 06): read-only five-segment payload -----
 
 test('the secretary endpoint is provided only while its switch is on', async () => {
-  // 关闭：一个服务都不注册（master 面板的端点与这把开关无关，仍在）。
+  // 关闭：一个服务都不注册（master 面板与右栏面板的端点与这把开关无关，都在）。
   const off = start()
-  assert.deepEqual([...off.services.keys()], ['orchestratorMaster'])
+  assert.deepEqual([...off.services.keys()], ['orchestratorMaster', 'orchestratorPanel'])
   assert.equal(off.services.has('orchestratorSecretary'), false, 'a closed switch registers no secretary service')
 
   // Why changed: the fake session used to carry `title: '修登录'` and the endpoint read that field.
@@ -2279,4 +2315,3 @@ test('a host without the webserver service still loads, and says the design rout
     'the missing service is reported, not silently ignored',
   )
 })
-

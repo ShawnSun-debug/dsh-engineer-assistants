@@ -3588,6 +3588,24 @@ test('the panel body lists the three fixed entries, then the workers in model or
   view.unmount()
 })
 
+test('the two section rows are text, not buttons that do nothing', async () => {
+  // inspector / reporter 指向 show-section：分段视图还没做，画成按钮就是「点了没反应」。
+  // master 有权动作，仍然是按钮。
+  const view = mountPanelBody()
+  await flush(14)
+  const master = byTestId(view.tree, 'orchestrator-panel-fixed-master')
+  const inspector = byTestId(view.tree, 'orchestrator-panel-fixed-inspector')
+  const reporter = byTestId(view.tree, 'orchestrator-panel-fixed-reporter')
+  assert.equal(master.type, 'button')
+  assert.equal(typeof master.props.onClick, 'function')
+  for (const [name, row] of [['inspector', inspector], ['reporter', reporter]]) {
+    assert.notEqual(row.type, 'button', name + ' must not pretend to be clickable')
+    assert.equal(row.props.onClick, undefined)
+    assert.equal(row.props['data-interactive'], 'false')
+  }
+  view.unmount()
+})
+
 test('an undesignated master and an empty worker list both say so', async () => {
   const view = mountPanelBody({
     value: {
@@ -3667,9 +3685,11 @@ test('the tab chip title and both dictionaries answer for the dock', () => {
   assert.ok(Object.keys(T.zh).filter((entry) => entry.startsWith('dock.')).length >= 10)
 })
 /** apply 的最小宿主：只有右栏三个服务按开关提供，其余按秘书接线需要的最少形状。 */
-function fakeApplyCtx({ dock = false } = {}) {
+function fakeApplyCtx({ dock = false, registerThrows = false } = {}) {
   const slotNames = []
+  const slots = []
   const types = []
+  const openTabCalls = []
   const ctx = {
     effect: (fn) => {
       const disposer = fn()
@@ -3685,6 +3705,7 @@ function fakeApplyCtx({ dock = false } = {}) {
       },
       register: (spec) => {
         slotNames.push(spec.name)
+        slots.push(spec)
         return () => {}
       },
     },
@@ -3701,17 +3722,25 @@ function fakeApplyCtx({ dock = false } = {}) {
       if (name === 'sidebarRightTabs') {
         return {
           register: (definition) => {
+            if (registerThrows) throw new Error('sidebarRight: tab id "dsh-engineer-assistants-panel" is already registered')
             types.push(definition)
             return () => {}
           },
         }
       }
-      if (name === 'sidebarRight') return { openResource: () => {}, openTab: () => {} }
+      if (name === 'sidebarRight') {
+        return {
+          openResource: () => {},
+          openTab: (...args) => {
+            openTabCalls.push(args)
+          },
+        }
+      }
       if (name === 'uiWorkspace') return { openSession: () => {} }
       return undefined
     },
   }
-  return { ctx, slotNames, types }
+  return { ctx, slotNames, slots, types, openTabCalls }
 }
 
 test('apply wires the dock only when the host provides it, and loads without it', () => {
@@ -3730,10 +3759,39 @@ test('apply wires the dock only when the host provides it, and loads without it'
   assert.equal(present.types[0].patterns, undefined, 'a page type recognizes no address')
   assert.equal(present.types[0].title(), 'dock.title', 'the chip reads the dictionary through the bound translator')
   assert.deepEqual(plain(present.types[0].guide.map((entry) => entry.id)), ['panel'])
-  // 槽按定义 id 认领，不按 kind；三个都在。
+  // 槽按定义 id 认领，不按 kind；三个都在，而且 key 就是那个 id——宿主按 entryKey 找 body，
+  // key 写错只会掉进「这个类型没有实现」的兜底，静默不报错。
   assert.deepEqual(present.slotNames.filter((name) => name.startsWith('sidebar.right.')), [
     'sidebar.right.tab.guide.entry',
     'sidebar.right.pane.tab',
     'sidebar.right.pane.tab.title',
   ])
+  for (const spec of present.slots.filter((slot) => slot.name.startsWith('sidebar.right.'))) {
+    assert.equal(spec.key, present.types[0].id, spec.name + ' is keyed by the definition id, not the kind')
+  }
+
+  // 引导入口与宿主自己的入口同一种开法：replaceTab 不给的话引导页会留在面板旁边。
+  const guide = present.slots.find((slot) => slot.name === 'sidebar.right.tab.guide.entry')
+  guide.inject().open()
+  // 值来自 vm 上下文，原型不同，按 JSON 比。
+  assert.deepEqual(plain(present.openTabCalls), [['engineer-assistants-panel', { replaceTab: true }]])
+})
+
+test('a second registration of the same type does not take the whole boot down', () => {
+  // 同一档位重复注册时宿主会抛。让它冒出 apply 就是 web boot 失败——而这个类型已经在那里了，
+  // 效果一样，所以吞掉、留日志、继续。
+  const present = fakeApplyCtx({ dock: true, registerThrows: true })
+  assert.doesNotThrow(() => mod.apply(present.ctx))
+  assert.equal(present.types.length, 0)
+  // 类型没注册上，槽仍然注册：宿主找不到 body 时会画兜底，不会因为缺槽崩掉整页。
+  assert.equal(present.slots.filter((slot) => slot.name === 'sidebar.right.pane.tab').length, 1)
+})
+
+test('the panel still registers when only the tab registry exists', () => {
+  // 注册一个类型只要注册表与插槽；右栏/主栏是点击时才需要的东西。
+  const onlyTabs = fakeApplyCtx({ dock: true })
+  const get = onlyTabs.ctx.get
+  onlyTabs.ctx.get = (name) => (name === 'sidebarRight' || name === 'uiWorkspace' ? undefined : get(name))
+  assert.doesNotThrow(() => mod.apply(onlyTabs.ctx))
+  assert.equal(onlyTabs.types.length, 1, 'the type is registered even without the dock services')
 })
