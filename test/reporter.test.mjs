@@ -52,7 +52,8 @@ test('a full report has one labelled line per required item, in order', () => {
   REQUIRED_ITEMS.forEach((key, index) => {
     assert.ok(itemLines[index].includes(ITEM_LABELS[key]), `item ${index} must be ${key}`)
   })
-  assert.match(text, /卡住 \/ 等批准\*\*：无/)
+  // 从导出的标签表拼，不写死文案：改一处标签不该让另一处断言悄悄失配。
+  assert.ok(text.includes(`**${ITEM_LABELS.stuck}**：无`), 'an empty item reads 无 under its own label')
   assert.equal(itemLines[REQUIRED_ITEMS.indexOf('cost')], '- **花费**：0.3', 'an amount is a number, not a count')
 })
 
@@ -110,6 +111,9 @@ test('stampOf refuses the values Date silently coerces to the epoch', () => {
   for (const bad of [null, undefined, true, false, {}, [], '', '   ', Number.NaN, Number.POSITIVE_INFINITY]) {
     assert.throws(() => stampOf(bad), /valid Date/, `must refuse ${JSON.stringify(bad)}`)
   }
+  // 非法 Date 实例走的是另一道关：类型合法、值非法，靠构造后的 NaN 检查挡住。
+  // 少了这一条，那道检查被重构掉也不会有测试变红。
+  assert.throws(() => stampOf(new Date('nope')), /valid Date/, 'an invalid Date instance is refused after construction')
   assert.throws(() => archivePath({ cwd: 'D:/work', at: null }), /valid Date/)
 })
 
