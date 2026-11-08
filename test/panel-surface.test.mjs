@@ -445,6 +445,17 @@ test('the open-tab lookup finds one worker across sessions, by parsing rather th
   assert.deepEqual(workerChatTabsOf({ tabs, sessionId: 'w2' }), [{ sessionId: 's-1', tabId: 't3' }])
 })
 
+test('a tab of another kind is left alone even when its address reads as a subagent chat', () => {
+  // 类型按地址 pattern 认领，glob 开得宽的 extension 档能接管同一串地址；关错页签比不关更糟。
+  const contentId = workerChatAddressOf({ address: address('w1') })
+  const tabs = [
+    { sessionId: 's-1', tabId: 't1', kind: 'subagentchat', contentId },
+    { sessionId: 's-1', tabId: 't2', kind: 'someExtensionChat', contentId },
+    { sessionId: 's-1', tabId: 't3', contentId },
+  ]
+  assert.deepEqual(workerChatTabsOf({ tabs, sessionId: 'w1' }), [{ sessionId: 's-1', tabId: 't1' }])
+})
+
 test('one worker with no open tab gives an empty list, not an undefined answer', () => {
   assert.deepEqual(workerChatTabsOf({ tabs: [], sessionId: 'w1' }), [])
   const unrelated = [{ sessionId: 's-1', tabId: 't1', kind: 'subagentchat', contentId: workerChatAddressOf({ address: address('other') }) }]
